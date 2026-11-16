@@ -9,5 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 shared = { workspace = true }
+glam = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
+ctrlc = { workspace = true }
