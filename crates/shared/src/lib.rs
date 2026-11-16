@@ -5,6 +5,7 @@
 pub mod assets;
 pub mod bsplight;
 pub mod collision;
+pub mod collmesh;
 pub mod glb;
 pub mod settings;
 pub mod sim;

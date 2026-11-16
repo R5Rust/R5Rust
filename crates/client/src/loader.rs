@@ -5,6 +5,7 @@
 use rayon::prelude::*;
 use shared::assets::Config;
 use shared::collision::Collision;
+use shared::collmesh;
 use crate::lighting::{self, GpuLighting};
 use crate::texcache::{self, Kind};
 use shared::bsplight::BspLighting;
@@ -296,16 +297,25 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     progress.set(0.25);
     log::info!("glb: {} verts, {} tris, {} draws, {} materials, {} images in {:.1}s", world.vertices.len(), world.tri_count(), world.draws.len(), world.materials.len(), world.images.len(), t_glb);
 
-    // Collision runs alongside texture work (it only needs positions + non-blend indices).
+    // Collision runs alongside texture work. The game's own collision (collision.bin, see
+    // docs/collision.md) when it was exported, else world.glb's solid render triangles.
     let positions = std::mem::take(&mut world.positions);
-    let mut col_idx: Vec<u32> = Vec::new();
-    for d in &world.draws {
-        let m = &world.materials[d.material as usize];
-        if m.solid() {
-            col_idx.extend_from_slice(&world.indices[d.first_index as usize..(d.first_index + d.index_count) as usize]);
+    let bin = cfg.collision_bin();
+    let render_idx = collmesh::render_indices(&world);
+    let col_thread = std::thread::spawn(move || {
+        if bin.is_file() {
+            match collmesh::CollMesh::load(&bin) {
+                Ok(m) => {
+                    let idx = m.player_indices();
+                    log::info!("collision: game collision.bin, {} of {} triangles block players", idx.len() / 3, m.tris.len());
+                    return Collision::build(m.positions, &idx);
+                }
+                Err(e) => log::warn!("{e}"),
+            }
         }
-    }
-    let col_thread = std::thread::spawn(move || Collision::build(positions, &col_idx));
+        log::warn!("collision: no usable collision.bin, colliding with world.glb render triangles");
+        Collision::build(positions, &render_idx)
+    });
 
     // Baked lighting from the raw BSP lumps + one probe per static prop.
     let bsp = BspLighting::load(&cfg.bsp_dir())?;

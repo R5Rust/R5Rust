@@ -7,8 +7,7 @@ server `r5rust_ds`, like R5Flowstate's `r5apex.exe` / `r5apex_ds.exe`.
 ## Play (while code keeps changing)
 
 Double-click **`play.bat`** (or `.\play.ps1`). It runs your own copy in `play\current\`, so builds never
-fight with an open game. `tools\publish.ps1` builds and stages a new version in `play
-ext\`; the next time
+fight with an open game. `tools\publish.ps1` builds and stages a new version in `play\next\`; the next time
 you launch `play.bat` it swaps in automatically and prints what it updated to. `play\` is gitignored.
 
 ## Run (dev)
@@ -46,6 +45,8 @@ The window title shows fps, position and ground/air/FLY.
 Default root `D:\R5Rust\assets` (override with `R5RUST_ASSETS` or `assets_root` in `r5rust.toml`):
 
 - `maps\mp_rr_canyonlands_staging_mu1\world.glb` + `meta.json`, made by `C:\Code\apex\r5-web-client\tools\export-map`
+- `maps\mp_rr_canyonlands_staging_mu1\collision.bin`: the game's own collision, made by `tools\export-map --collision`
+  (see `docs/collision.md`). Without it the player collides with the render triangles and the log warns.
 - `images\ui\maps_mp_rr_canyonlands_staging_mu1_loadscreen\*.png`
 
 ## Config: `r5rust.toml` (optional, gitignored)
@@ -79,11 +80,16 @@ GPU ms/frame, where the player ended up and the jump peak. `--debug`: 1 = sun vi
 
 `tools/export-map` (Rust, standalone) rebuilds `world.glb` + `meta.json` from the game's paks; `tools/build_materials.py`
 maps materials to the extracted textures + constants (`materials.json`). Lighting lumps live in `<map>/bsp/`,
-cubemaps in `cubemaps.dds`, the sky in `skycube.dds`. Compressed texture cache: `D:\R5Rust\_cache	ex`.
+cubemaps in `cubemaps.dds`, the sky in `skycube.dds`. Compressed texture cache: `D:\R5Rust\_cache\tex`.
+
+Collision only (about 20 s, reuses the last export's BSP + models):
+`cd tools\export-map; cargo run --release -- --collision --out D:\R5Rust\assets\maps\mp_rr_canyonlands_staging_mu1`.
+Compare it with the render triangles: `cargo run --release -p shared --example collcompare`; inspect one spot:
+`--example collprobe -- x,y [zmin zmax] [radius]`.
 
 ## Layout
 
-- `crates/shared`: GLB loader, BVH collision with an Apex-style hull sweep (`trace_hull`), deterministic
+- `crates/shared`: GLB loader, the game's collision (`collmesh.rs` loads `collision.bin`), BVH collision with an Apex-style hull sweep (`trace_hull`), deterministic
   `sim::simulate()` = Apex S21 movement ported from the R5Regenis specs (`docs/movement.md`), player settings + cvars
   (`settings.rs`), config. Checker: `cargo run --release -p shared --example movecheck`
 - `crates/client`: `r5rust`: wgpu renderer (4x MSAA HDR, reverse-Z, lightmaps + sun, ACES), loader thread, input

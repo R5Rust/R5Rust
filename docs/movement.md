@@ -236,7 +236,8 @@ All of these live in `crates/shared/src/settings.rs` (`STOCK`, `CVARS`). Each `P
 ## Collision
 
 Apex moves an axis-aligned box. `Collision::trace_hull(start, end, mins, maxs)` sweeps that box against every
-solid triangle in the BVH. It uses an exact separating-axis test on 13 axes: the 3 box axes, the triangle normal
+solid triangle in the BVH. The triangles are the game's own collision (`collision.bin`, the BSP's BVH4 plus
+static prop model trees, filtered by `TRACE_MASK_PLAYERSOLID`). See `docs/collision.md`. It uses an exact separating-axis test on 13 axes: the 3 box axes, the triangle normal
 and 9 edge cross products.
 
 - It returns `fraction`, `endpos`, the hit `normal`, `startsolid` and `allsolid`.

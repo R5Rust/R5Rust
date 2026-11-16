@@ -787,20 +787,14 @@ fn check_settings_file(c: &mut Checks) {
 }
 
 fn real_map(c: &mut Checks) {
-    use shared::{assets::Config, glb};
+    use shared::{assets::Config, collmesh};
     let cfg = Config::load();
-    let Ok(w) = glb::load_world(&cfg.world_glb(), glb::Mode::Geometry, true) else {
-        println!("SKIP real map (world.glb not found)");
+    // The game's collision.bin when exported, else world.glb's render triangles.
+    let Ok((col, src)) = collmesh::build_player_collision(&cfg) else {
+        println!("SKIP real map (no collision.bin or world.glb)");
         return;
     };
-    let idx: Vec<u32> = w
-        .draws
-        .iter()
-        .filter(|d| w.materials[d.material as usize].solid())
-        .flat_map(|d| w.indices[d.first_index as usize..(d.first_index + d.index_count) as usize].iter().copied())
-        .collect();
-    let col = Collision::build(w.positions.clone(), &idx);
-    println!("real map: {} triangles, BVH {:.0} ms", col.tri_count(), col.build_ms);
+    println!("real map: {src:?} collision, {} triangles, BVH {:.0} ms", col.tri_count(), col.build_ms);
     let spawn = sim::find_free(&col, Vec3::new(-11740.0, 512.0, 1584.0));
     let mut p = Player::new(spawn);
     run(&mut p, &col, 30, Input::default());
