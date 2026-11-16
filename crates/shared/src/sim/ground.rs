@@ -1,28 +1,31 @@
 //! Ground handling: CategorizePosition, SetGroundEntity, StayOnGround / GroundSnapTrace, step smoothing,
 //! CheckStuck, LandingSpeedScale (playermove.md sections 4-8).
 
-use super::{duck, Ctx, MoveType, UP};
+use super::{duck, upright, wall, Ctx, MoveType};
 use crate::collision::Trace;
 use glam::Vec3;
 
 /// CategorizePosition 0x140ba4f30 (playermove.md 4), forceVel = 0 at every caller here. The world is the only
-/// ground entity, so base velocity / standable-entity / push-off branches drop out.
+/// ground entity, so base velocity / standable-entity / push-off branches drop out. On a wall the probe runs
+/// along -n and any hit counts: the wall is the ground entity.
 pub(super) fn categorize_position(c: &mut Ctx) {
     // 4.1
     c.p.surface_friction = 1.0;
     if c.p.move_type == MoveType::Traverse {
         return;
     }
-    let n = UP;
-    // 4.2 probe length: the step height while walking on ground (snaps down stairs/ramps), else 2
-    let mut snap = c.p.move_type == MoveType::Walk && c.gnd();
+    let n = c.p.surface_normal;
+    let not_up = !upright(n);
+    // 4.2 probe length: the step height while walking on ground or on a wall (snaps down stairs/ramps, keeps
+    // the climber against the wall), else 2
+    let mut snap = c.p.move_type == MoveType::Walk && (c.gnd() || not_up);
     let dist = if snap { c.s.step_height } else { 2.0 };
     // 4.3
     let o0 = c.p.pos;
     let pend = o0 - n * dist;
     let vn = n.dot(c.p.vel);
     // 4.4 moving away from the ground (NON_JUMP_VELOCITY 140)
-    if vn > 140.0 {
+    if vn > 140.0 && !not_up {
         // 4.13 + 4.15
         set_ground(c, None);
         c.p.ground_normal = Vec3::ZERO;
@@ -35,8 +38,8 @@ pub(super) fn categorize_position(c: &mut Ctx) {
     let mut dn = tn.dot(n);
     let mut grounded = false;
     if hit {
-        if dn >= 0.7 {
-            // 4.9: standable; moving away from it faster than 140 leaves the ground entity unchanged
+        if dn >= 0.7 || not_up {
+            // 4.9: standable (on a wall any hit is); moving away from it faster than 140 leaves the ground entity unchanged
             if 140.0 > vn {
                 grounded = true;
             } else {
@@ -76,6 +79,19 @@ pub(super) fn categorize_position(c: &mut Ctx) {
         let mut tg = t;
         tg.normal = tn;
         set_ground(c, Some(&tg));
+        // on a wall: follow a turning wall face (WallSurfaceChange), end the climb if it became a floor
+        if not_up && 0.999 > dn {
+            if c.cv.wallrun_angle_change_min_cos > dn {
+                snap = false;
+            }
+            if tn.z > -0.35 {
+                wall::wall_surface_change(c, tn);
+                if c.p.surface_normal.z > 0.7 {
+                    wall::end_wall_run(c);
+                }
+            }
+        }
+        // 4.14's wall grounding timeout needs S[wallrun]: not for stock legends
     } else {
         // airborne
         if hit && (c.gnd() || 0.1 > (c.now - c.p.near_ground_time)) {
@@ -104,7 +120,7 @@ fn finish(c: &mut Ctx, t: &Trace, tn: Vec3, snap: bool) {
 
 /// SetGroundEntity 0x140ba46d0 (playermove.md 5). `tr` = the ground trace (normal used), None = leave the ground.
 pub(super) fn set_ground(c: &mut Ctx, tr: Option<&Trace>) {
-    let n = UP;
+    let n = c.p.surface_normal;
     let old = c.p.ground;
     let nw = tr.is_some();
     if old != nw {
@@ -130,11 +146,23 @@ pub(super) fn set_ground(c: &mut Ctx, tr: Option<&Trace>) {
         }
         c.p.ground = nw;
     }
-    if nw {
-        // ReplenishDoubleJump (skip_replenish_double_jump 1, upright): clears "jumped since leaving ground"
-        c.p.jumped = false;
+    if let Some(tr) = tr {
+        // ReplenishDoubleJump 0x140bf4760 (skip_replenish_double_jump 1), only upright (or wallrun legends):
+        // clears "jumped since leaving ground" and the deferred wall transition; upright also forgets the last
+        // wall and spends the up-wall boost (a ground jump restores it)
+        if upright(n) || c.s.wallrun {
+            c.p.jumped = false;
+            c.p.wall.retry_time = 0.0;
+            if upright(n) {
+                c.p.wall.last_count = 0;
+                c.p.wall.no_boost = true;
+            }
+        }
         let k = n.dot(c.p.vel);
         c.p.vel -= n * k;
+        c.p.ground_trace_normal = tr.normal;
+    } else {
+        c.p.ground_trace_normal = Vec3::ZERO;
     }
 }
 
@@ -158,10 +186,15 @@ pub(super) fn landing_speed_scale(c: &Ctx) -> f32 {
     1.0 - ((1.0 - r) * hf) * (1.0 - s.land_slowdown_frac)
 }
 
-/// StayOnGround 0x140b8b9f0 (6.1): keep the feet on the floor down slopes and stairs.
+/// StayOnGround 0x140b8b9f0 (6.1): keep the feet on the floor down slopes and stairs. On a wall it only
+/// reports the wall (no snap).
 pub(super) fn stay_on_ground(c: &mut Ctx) -> bool {
     let o = c.p.pos;
-    let Some(t) = ground_snap_trace(c, o, c.s.step_height, UP) else { return false };
+    let n = c.p.surface_normal;
+    let Some(t) = ground_snap_trace(c, o, c.s.step_height, n) else { return false };
+    if !upright(n) {
+        return true;
+    }
     let d = t.endpos - o;
     if d.length_squared() > 2.0 {
         step_smooth(c, d);
@@ -201,7 +234,7 @@ fn ground_snap_trace(c: &Ctx, start: Vec3, dist: f32, dir: Vec3) -> Option<Trace
 
 /// StepSmooth 0x140b9ac40 (6.3): the camera lags a step by its height, then DecayStepSmooth eases it back.
 pub(super) fn step_smooth(c: &mut Ctx, d: Vec3) {
-    let n = UP;
+    let n = c.p.surface_normal;
     let dn = n.dot(d);
     let s = if c.s.step_height < dn { c.s.step_height } else { dn };
     c.p.step_smooth -= n * s;

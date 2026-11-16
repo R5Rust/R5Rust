@@ -9,7 +9,7 @@ use glam::Vec3;
 /// StepSlide 0x140b9ad70 (stepslide.md 1): on a walkable hit, redirect the rest of the move along that surface
 /// and re-trace; otherwise (or if that is blocked too) fall back to the step dispatcher. True = origin set.
 pub(super) fn step_slide(c: &mut Ctx, tr: &mut Trace, keep_length: bool, dest: Option<Vec3>, force_fallback: bool) -> bool {
-    let n = UP;
+    let n = c.p.surface_normal;
     let nn = tr.normal;
     let w = n.dot(nn);
     if !(w > 0.7) || force_fallback {
@@ -97,7 +97,7 @@ pub(super) fn try_player_move(c: &mut Ctx, tr: &mut Trace) {
 /// StepMove 0x140bb0610 (stepslide.md 3): plain move A, and a stepped move B (up stepH, across, down);
 /// B is kept only when it got further along the horizontal velocity and landed sensibly. Returns stepOut.
 fn step_move(c: &mut Ctx, pos: &mut Vec3, vel: &mut Vec3, dt: f32, step_h: f32, tr_in: &mut Trace) -> Vec3 {
-    let up = UP;
+    let up = c.p.surface_normal;
     let (mn, mx) = c.p.hull();
     let col = c.col;
     // step 0
@@ -255,14 +255,18 @@ pub(super) fn try_player_move_core(col: &Collision, mn: Vec3, mx: Vec3, pos: &mu
     let mut time_left = dt;
     let mut all_fraction = 0.0;
     let mut blocked = 0;
-    let mut last = Trace { fraction: 1.0, endpos: *pos, normal: Vec3::ZERO, startsolid: false, allsolid: false };
+    // Source's pFirstTrace: the record left behind is the first bump's trace (the hit AirMove/WalkMove hand to
+    // SurfaceTransition and the contact plane)
+    let mut first: Option<Trace> = None;
     for _ in 0..4 {
         if vel.length_squared() == 0.0 {
             break;
         }
         let end = *pos + *vel * time_left;
         let t = col.trace_hull(*pos, end, mn, mx);
-        last = t;
+        if first.is_none() {
+            first = Some(t);
+        }
         all_fraction += t.fraction;
         if t.allsolid {
             *vel = Vec3::ZERO;
@@ -322,8 +326,8 @@ pub(super) fn try_player_move_core(col: &Collision, mn: Vec3, mx: Vec3, pos: &mu
     if all_fraction == 0.0 {
         *vel = Vec3::ZERO;
     }
-    if let Some(o) = tr_out {
-        *o = last;
+    if let (Some(o), Some(f)) = (tr_out, first) {
+        *o = f;
     }
     blocked
 }

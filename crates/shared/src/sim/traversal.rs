@@ -3,7 +3,7 @@
 //! no first-person animations, so the origin follows the two-segment path, which is the engine's own
 //! traversal_anim 0 code path), and the mantle boost (R5Regenis engine/s21-r5sdk mantle_boost.cpp).
 
-use super::{ground, walk, Ctx, MoveType, Traversal, IN_DUCK, IN_JUMP, UP};
+use super::{ground, upright, walk, wall, Ctx, MoveType, Traversal, IN_DUCK, IN_JUMP, UP};
 use glam::Vec3;
 
 /// Remaining mantle time in which a press counts as the mantle-boost sweet spot. The reconstruction measures
@@ -26,7 +26,8 @@ pub(super) fn check_auto_mantle(c: &mut Ctx) -> bool {
         return false;
     }
     let jump_held = c.buttons & IN_JUMP != 0;
-    if c.gnd() && !jump_held {
+    // on upright ground it needs jump held; on a wall (climbing) it does not
+    if c.gnd() && upright(c.p.surface_normal) && !jump_held {
         return false;
     }
     if 0.25 > c.now - c.p.near_ground_time && !jump_held {
@@ -110,6 +111,8 @@ fn start_traversal(c: &mut Ctx, start: Vec3, corner: Vec3, end: Vec3, cc: f32, p
     c.p.ground = true; // the ledge becomes the ground entity
     c.p.vel = Vec3::ZERO;
     c.p.move_type = MoveType::Traverse;
+    // StartTraversal ends a wall climb (EndWallRun call at 0x140b94cb0)
+    wall::end_wall_run(c);
 }
 
 /// FinishTraversal 0x140b99b60: origin at the stored progress, back to WALK, CategorizePosition.

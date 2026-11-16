@@ -2,7 +2,7 @@
 //! (fullwalkmove.md, walkmove.md, airmove.md; Friction/Accelerate/AirAccelerate/CheckVelocity from
 //! R5Regenis native/r5r_engine/src/movement.cpp, GetAccelerate disassembled for this port).
 
-use super::{duck, ground, step, Ctx, IN_BACK, IN_DUCK, IN_FORWARD, IN_JUMP, IN_MOVELEFT, IN_MOVERIGHT, UP};
+use super::{duck, ground, step, upright, wall, Ctx, IN_BACK, IN_DUCK, IN_FORWARD, IN_JUMP, IN_MOVELEFT, IN_MOVERIGHT, UP};
 use glam::Vec3;
 
 /// The engine's MAX(len, eps) epsilon (runtime value; any tiny positive number behaves the same).
@@ -16,14 +16,18 @@ pub(super) fn full_walk_move(c: &mut Ctx) {
     // step 2
     check_velocity(c);
     check_jump_button(c);
-    // steps 3-4: wallrun / constraints / tethers / gravity-grenade fields: not in scope
+    // step 3: WallRunUpdate (when a wall climb ends). Constraints / tethers / gravity-grenade fields: not in scope
+    wall::wall_run_update(c);
     // step 5
     check_velocity(c);
     if c.gnd() {
-        // step 6G: no slip triggers, minPush 0
+        // step 6G: no slip triggers, minPush 0 (on a wall the wall is the ground: WalkMove's wall branch)
         walk_move(c, dt);
     } else {
-        // step 7A (EndWallRun not needed: never on a wall)
+        // step 7A
+        if !upright(c.p.surface_normal) {
+            wall::end_wall_run(c);
+        }
         air_move(c, dt);
     }
     // step 8 (ImpactCheck: sounds/events only)
@@ -31,18 +35,25 @@ pub(super) fn full_walk_move(c: &mut Ctx) {
     apply_half_gravity(c, dt);
     // step 9: strip velocity along n when grounded
     if c.gnd() {
-        let d = c.p.vel.dot(UP);
-        c.p.vel -= UP * d;
+        let n = c.p.surface_normal;
+        let v = c.p.vel;
+        let d = ((v.y * n.y) + (v.x * n.x)) + (v.z * n.z);
+        c.p.vel = Vec3::new(v.x - (n.x * d), v.y - (n.y * d), v.z - (n.z * d));
     }
     // step 10 (CheckFalling: fall damage, not in scope)
     check_velocity(c);
 }
 
 /// ApplyHalfGravity / AddGravity 0x140b8c2a0 (fullwalkmove.md 3, slide.md 2E): half of gravity*dt per call,
-/// plus the slope-parallel part of gravity while sliding on the ground.
+/// plus the slope-parallel part of gravity while sliding on the ground. On a wall it is scaled by
+/// WallSpeedFrac (0 while climbing into the wall).
 pub(super) fn apply_half_gravity(c: &mut Ctx, dt: f32) {
     let gs = if c.s.gravity_scale == 0.0 { 1.0 } else { c.s.gravity_scale };
-    let g = ((((gs * c.cv.sv_gravity) as f64) * 0.5) * dt as f64) as f32;
+    let mut w = 1.0f32;
+    if !upright(c.p.surface_normal) {
+        w = wall::wall_speed_frac(c, c.now - c.p.wall.start_time);
+    }
+    let g = (((((gs * c.cv.sv_gravity) as f64) * 0.5) * dt as f64) * w as f64) as f32;
     let v = &mut c.p.vel;
     v.z -= g;
     if c.p.sliding && c.p.ground {
@@ -80,8 +91,8 @@ pub(super) fn check_velocity(c: &mut Ctx) {
     c.p.cv_cache = *v;
 }
 
-/// CheckJumpButton 0x140b8d490 (fullwalkmove.md 4, movemodes.md C). Ground jump only: this legend has no
-/// double jump, dodge, boost or wallrun.
+/// CheckJumpButton 0x140b8d490 (fullwalkmove.md 4, movemodes.md C). Ground jump and the jump off a wall
+/// (WallJump): this legend has no double jump, dodge or boost.
 pub(super) fn check_jump_button(c: &mut Ctx) -> bool {
     // J2: a jump press this tick (holding never re-jumps: there is no auto-hop)
     if c.pressed & IN_JUMP == 0 {
@@ -93,6 +104,10 @@ pub(super) fn check_jump_button(c: &mut Ctx) -> bool {
     let can_ground = if c.gnd() {
         true
     } else if c.cv.jump_graceperiod > c.now - c.p.last_ground_time && !c.p.jumped {
+        // the grace jump is refused when the last ground was a wall
+        if !upright(c.p.last_ground_normal) {
+            return false;
+        }
         true
     } else {
         false
@@ -131,10 +146,11 @@ pub(super) fn check_jump_button(c: &mut Ctx) -> bool {
             c.p.slide_long_jump = false;
         }
     }
-    // J9 normal height
+    // J9 wall-jump flag and normal height
+    let wall_jump = !upright(c.p.surface_normal);
     let mut h = if c.p.sliding { c.s.slide_jump_height } else { c.s.jump_height };
     let t = c.now - c.p.last_land_time;
-    if c.cv.skip_time > t {
+    if c.cv.skip_time > t && upright(c.p.surface_normal) {
         // bunny-hop "skip": jumping within 1 s of landing bleeds speed above the cap (sprint speed)
         let v = &mut c.p.vel;
         let h2 = (v.y * v.y + v.x * v.x) + 0.0;
@@ -164,12 +180,18 @@ pub(super) fn check_jump_button(c: &mut Ctx) -> bool {
     ground::set_ground(c, None);
     let js = ((c.cv.sv_gravity + c.cv.sv_gravity) * h).sqrt();
     c.p.jumped = true;
-    c.p.vel += UP * js;
-    let cp = c.p.contact_plane;
-    if 0.0 > cp.dot(c.wish) {
-        c.p.vel -= cp * 30.0; // push off what you lean into
+    if wall_jump {
+        wall::wall_jump(c);
+    } else {
+        c.p.wall.count = 0;
+        c.p.wall.no_boost = false;
+        c.p.vel += UP * js;
+        let cp = c.p.contact_plane;
+        if 0.0 > cp.dot(c.wish) {
+            c.p.vel -= cp * 30.0; // push off what you lean into
+        }
+        // LedgeAssist 0x140baca70 (jump assist target search): not ported
     }
-    // LedgeAssist 0x140baca70 (jump assist target search): not ported
     // FIN
     duck::stop_sliding(c);
     apply_half_gravity(c, c.ft);
@@ -286,8 +308,67 @@ fn accelerate(c: &mut Ctx, dir: Vec3, ws: f32, accel: f32) {
     c.p.vel = nv;
 }
 
-/// WalkMove 0x140b9cdb0, ground path (walkmove.md; the wallrun path needs a wall normal and is out of scope).
+/// WalkMove 0x140b9cdb0 (walkmove.md): the on-surface move. Upright: the ground walk (Friction + Accelerate).
+/// On a wall: the wallrun/climb branch (7W), then the shared tail (trace, StepSlide, SurfaceTransition).
 fn walk_move(c: &mut Ctx, dt: f32) {
+    if upright(c.p.surface_normal) {
+        ground_walk(c);
+    } else {
+        wall_walk(c);
+    }
+
+    // step 8 TAIL (no base velocity / pushers)
+    let n = c.p.surface_normal;
+    let spd = c.p.vel.length();
+    if c.p.sliding && c.s.slide_stop_speed > spd {
+        duck::stop_sliding(c);
+    }
+    if spd < 1.0 {
+        c.p.vel = Vec3::ZERO;
+        return;
+    }
+    let o = c.p.pos;
+    let mut m = c.p.vel;
+    let q = c.p.ground_normal;
+    let has_q = q.length_squared() != 0.0;
+    if has_q && upright(n) {
+        // redirect the (horizontal) velocity along the ground plane, keeping its length
+        let qm = q.dot(m);
+        let qn = q.dot(n);
+        let cc = m * qn - n * qm;
+        let rr = m.length_squared() / cc.length_squared();
+        let s = rr.min(f32::MAX).sqrt();
+        m = cc * s;
+    }
+    let mut e = m * dt + o;
+    if has_q {
+        let off = (e - o).dot(q);
+        if 0.0078125 > off {
+            e += q * (0.0078125 - off);
+        }
+    }
+    c.p.contact_plane = Vec3::ZERO;
+    let mut tr = c.trace(o, e);
+    if tr.startsolid {
+        c.p.start_solid = true;
+    }
+    if tr.fraction == 1.0 {
+        c.p.pos = tr.endpos;
+    } else {
+        let ov = c.p.vel;
+        if !step::step_slide(c, &mut tr, true, Some(e), false) {
+            let o = c.p.pos;
+            if (o - tr.endpos).dot(tr.normal) > -0.03125 {
+                c.p.contact_plane = tr.normal;
+            }
+            wall::surface_transition(c, tr.endpos, tr.normal, Some(&tr), ov);
+        }
+    }
+    ground::stay_on_ground(c);
+}
+
+/// WalkMove steps 1-7G, upright: ground input (sprint x1.25, soft clamp), Friction, Accelerate.
+fn ground_walk(c: &mut Ctx) {
     let n = UP;
     // step 1: strip velocity along n
     let d = n.dot(c.p.vel);
@@ -332,51 +413,173 @@ fn walk_move(c: &mut Ctx, dt: f32) {
     let acc = get_accelerate(c);
     friction(c, dir, ws);
     accelerate(c, dir, ws, acc);
+}
 
-    // step 8 TAIL (no base velocity / pushers)
-    let spd = c.p.vel.length();
-    if c.p.sliding && c.s.slide_stop_speed > spd {
-        duck::stop_sliding(c);
+/// MIN(1, x) in the asm operand order (MINSS 1, x)
+fn min1(x: f32) -> f32 {
+    if 1.0 < x { 1.0 } else { x }
+}
+
+/// copysign(1, x)
+fn sgn(x: f32) -> f32 {
+    1.0f32.copysign(x)
+}
+
+/// WalkMove steps 1-7W, on a wall (walkmove.md 7W): the surface basis from the view, raw input with the
+/// upward auto-push, then separate vertical and horizontal accelerate/decelerate. Climbing (CanWallClimb and
+/// pushing up the wall) uses the climb table: up-speed climbSpeedStart -> climbSpeedEnd over climbHeight above
+/// WallTop, climbAccel / climbDecel, climbHorz*. Otherwise the wallrun table with the slip ramp.
+fn wall_walk(c: &mut Ctx) {
+    let n = c.p.surface_normal;
+    let s = c.s;
+    // step 1: strip velocity along n
+    let v = c.p.vel;
+    let d = ((n.y * v.y) + (v.x * n.x)) + (n.z * v.z);
+    c.p.vel = Vec3::new(v.x - n.x * d, v.y - n.y * d, v.z - n.z * d);
+    // step 2: surface basis: F up the wall, R along it (P2 when the view's right is along the wall, else P1)
+    let (f0, r0) = (c.view_f, c.view_r);
+    let b = ((n.x * r0.x) + (n.y * r0.y)) + (n.z * r0.z);
+    let (f, r) = if !(0.7 > b.abs()) {
+        let cc = Vec3::new(n.z * f0.y - n.y * f0.z, n.x * f0.z - n.z * f0.x, n.y * f0.x - n.x * f0.y);
+        let l = (((cc.y * cc.y) + (cc.x * cc.x)) + (cc.z * cc.z)).sqrt();
+        let k = 1.0 / l.max(EPS);
+        let r = Vec3::new(k * cc.x, k * cc.y, k * cc.z);
+        let f = Vec3::new(n.y * r.z - n.z * r.y, n.z * r.x - n.x * r.z, n.x * r.y - n.y * r.x);
+        (f, r)
+    } else {
+        let cc = Vec3::new(n.y * r0.z - n.z * r0.y, n.z * r0.x - n.x * r0.z, n.x * r0.y - n.y * r0.x);
+        let l = (((cc.y * cc.y) + (cc.x * cc.x)) + (cc.z * cc.z)).sqrt();
+        let k = 1.0 / l.max(EPS);
+        let f = Vec3::new(k * cc.x, k * cc.y, k * cc.z);
+        let r = Vec3::new(f.y * n.z - f.z * n.y, f.z * n.x - f.x * n.z, f.x * n.y - f.y * n.x);
+        (f, r)
+    };
+    // step 4: wall input: raw, plus wallrun_upwardAutoPush of forward along the wall's horizontal tangent
+    let mut fwd = c.fwd;
+    let mut side = c.side;
+    let a = -n.x;
+    let l = (((n.y * n.y) + (a * a)) + 0.0).sqrt();
+    let k = 1.0 / l.max(EPS);
+    let tf = (((k * a) * f.y) + ((n.y * k) * f.x)) + ((k * 0.0) * f.z);
+    let up = ((if fwd > 0.0 { fwd } else { 0.0 }) * tf) * c.cv.wallrun_upward_auto_push;
+    let pr = (if tf * side > 0.0 { tf * side } else { 0.0 }) * fwd;
+    side += up;
+    fwd += pr;
+    if (r.z < -0.01 && side > 0.0) || (r.z > 0.01 && side < 0.0) {
+        side = 0.0;
     }
-    if spd < 1.0 {
-        c.p.vel = Vec3::ZERO;
-        return;
+    let w = Vec3::new(f.x * fwd + r.x * side, f.y * fwd + r.y * side, f.z * fwd + r.z * side);
+    // step 6: onto the surface
+    let dd = ((n.x * w.x) + (n.y * w.y)) + (n.z * w.z);
+    let ww = Vec3::new(w.x - n.x * dd, w.y - n.y * dd, w.z - n.z * dd);
+
+    // step 7W
+    let hang_k = 1.0; // WallHangSlipScale: never hanging
+    let climb = wall::can_wall_climb(c) && ww.z > 0.0;
+    let el = c.now - c.p.wall.start_time;
+    let mut r_slip = (el - c.cv.wallrun_slipstarttime) / c.cv.wallrun_slipduration;
+    r_slip = r_slip.max(0.0).min(1.0);
+    if fwd.abs() < 0.1 && side.abs() < 0.1 {
+        let x = c.cv.wallrun_no_input_slip_frac;
+        r_slip = if r_slip > x { r_slip } else { x };
     }
-    let o = c.p.pos;
-    let mut m = c.p.vel;
-    let q = c.p.ground_normal;
-    let has_q = q.length_squared() != 0.0;
-    if has_q {
-        // redirect the (horizontal) velocity along the ground plane, keeping its length
-        let qm = q.dot(m);
-        let qn = q.dot(n);
-        let cc = m * qn - n * qm;
-        let rr = m.length_squared() / cc.length_squared();
-        let s = rr.min(f32::MAX).sqrt();
-        m = cc * s;
-    }
-    let mut e = m * dt + o;
-    if has_q {
-        let off = (e - o).dot(q);
-        if 0.0078125 > off {
-            e += q * (0.0078125 - off);
+    let m = UP; // mv+0xa8 up axis
+    let ext = 1.0; // pl+0x6674 (1.0 from the constructor)
+    let (q, aa, dacc, bb, cch, e, fs, gs) = if climb {
+        let ba8 = s.climb_height;
+        let x = ((wall::wall_top(c) + ba8) - c.p.pos.z) / ba8;
+        let x = x.max(0.0).min(1.0);
+        let aa = ((1.0 - x) * s.climb_speed_end) + (x * s.climb_speed_start);
+        // WallClimbUpdate 0x140bf0e90 runs here: animation only
+        (0.0, aa, s.climb_accel, s.climb_decel, s.climb_horz_decel, s.climb_horz_speed, s.climb_horz_speed, s.climb_horz_accel)
+    } else {
+        let q = wall::wall_speed_frac(c, el);
+        (
+            q,
+            (1.0 - q) * s.wallrun_max_speed_vertical,
+            s.wallrun_accelerate_vertical,
+            ext * s.wallrun_decelerate_vertical,
+            ext * s.wallrun_decelerate_horizontal,
+            s.wallrun_max_speed_horizontal,
+            s.wallrun_max_speed_horizontal_backward,
+            s.wallrun_accelerate_horizontal,
+        )
+    };
+    // prelude: pl+0x6258 time ramp is 0 (ramp 1)
+    let rr = 1.0 * c.p.surface_friction;
+    let mut dv_dec = (rr * bb) * c.ft;
+    let ch = cch * rr;
+    let ads = 1.0; // ADS move-speed scale: no weapons
+    let u = ads * c.p.speed_scale;
+    // vertical
+    if ww.z.abs() > 1e-4 {
+        let l = ((ww.z * ww.z) + 0.0).sqrt();
+        let mn = min1(l);
+        let k = 1.0 / l.max(EPS);
+        let vd = Vec3::new(k * 0.0, k * 0.0, k * ww.z);
+        let vws = if s.wallstick_enabled { 0.0 } else { mn * ((u * aa) * hang_k) };
+        let v = c.p.vel;
+        let dv = ((vd.x * v.y) + (vd.x * v.x)) + (v.z * vd.z);
+        let apply = if dv < 0.0 {
+            dv_dec *= (1.0 - q) * (1.0 - r_slip);
+            true
+        } else {
+            dv > vws
+        };
+        if apply {
+            let g = sgn(dv) * dv_dec;
+            c.p.vel = Vec3::new(v.x - (g * m.x), v.y - (g * m.y), v.z - (g * m.z));
         }
-    }
-    c.p.contact_plane = Vec3::ZERO;
-    let mut tr = c.trace(o, e);
-    if tr.startsolid {
-        c.p.start_solid = true;
-    }
-    if tr.fraction == 1.0 {
-        c.p.pos = tr.endpos;
-    } else if !step::step_slide(c, &mut tr, true, Some(e), false) {
-        let o = c.p.pos;
-        if (o - tr.endpos).dot(tr.normal) > -0.03125 {
-            c.p.contact_plane = tr.normal;
+        accelerate(c, vd, vws, (1.0 - r_slip) * dacc);
+    } else {
+        let v = c.p.vel;
+        let dm = ((v.x * m.x) + (v.y * m.y)) + (v.z * m.z);
+        if dm < 0.0 {
+            dv_dec *= (1.0 - q) * (1.0 - r_slip);
         }
-        // SurfaceTransition (wallrun start): not in scope
+        c.p.vel = if dv_dec > dm.abs() {
+            Vec3::new(v.x - (m.x * dm), v.y - (m.y * dm), v.z - (m.z * dm))
+        } else {
+            let g = sgn(dm) * dv_dec;
+            Vec3::new(v.x - (m.x * g), v.y - (m.y * g), v.z - (m.z * g))
+        };
     }
-    ground::stay_on_ground(c);
+    let dh = if s.wallstick_enabled { 100.0 } else { ch * c.ft };
+    // horizontal
+    let h2 = ((ww.x * ww.x) + (ww.y * ww.y)) + 0.0;
+    if h2 > 1e-4 {
+        let hl = h2.sqrt();
+        let mn = min1(hl);
+        let k = 1.0 / hl.max(EPS);
+        let hd = Vec3::new(k * ww.x, k * ww.y, k * 0.0);
+        let mut hws = if s.wallstick_enabled {
+            0.0
+        } else {
+            // mv+0x3c..0x40: the view forward (backward along the wall caps at the backward speed)
+            let dd = ((c.view_f.y * hd.y) + (c.view_f.x * hd.x)) + (hd.z * 0.0);
+            if dd > -0.6 { mn * e } else { mn * fs }
+        };
+        hws *= u * hang_k;
+        let k2 = 1.0 / (((hd.y * hd.y) + (hd.x * hd.x)) + 0.0).sqrt().max(EPS);
+        let v = c.p.vel;
+        let dhv = ((v.y * (k2 * hd.y)) + (v.x * (k2 * hd.x))) + (v.z * (k2 * 0.0));
+        if dhv < 0.0 || dhv > hws {
+            let g = sgn(dhv) * dh;
+            c.p.vel = Vec3::new(v.x - (k2 * hd.x) * g, v.y - (k2 * hd.y) * g, v.z - g * (k2 * 0.0));
+        }
+        accelerate(c, hd, hws, (gs * 1.0 /* pl+0x5af0 */) * u);
+    } else {
+        let v = c.p.vel;
+        let dm = ((v.x * m.x) + (m.y * v.y)) + (m.z * v.z);
+        let p = Vec3::new(v.x - m.x * dm, v.y - m.y * dm, v.z - m.z * dm);
+        let pl = (((p.y * p.y) + (p.x * p.x)) + (p.z * p.z)).sqrt();
+        c.p.vel = if dh < pl {
+            let f = dh / pl;
+            Vec3::new(v.x - (f * p.x), v.y - (f * p.y), v.z - (f * p.z))
+        } else {
+            v - p
+        };
+    }
 }
 
 /// AirAccelerate 0x140b9b510. Below the wish speed along the wish direction: plain accel*dt. Otherwise the
@@ -481,9 +684,20 @@ fn air_move(c: &mut Ctx, dt: f32) {
     if tr.startsolid {
         c.p.start_solid = true;
     }
-    // step 11: unobstructed
+    // step 11: unobstructed; a deferred wall attach (the classifier asked to retry) fires here
     if tr.fraction == 1.0 {
         c.p.pos = tr.endpos.clamp(Vec3::splat(-65535.0), Vec3::splat(65535.0));
+        let t = c.p.wall.retry_time;
+        if t != 0.0 && now >= t {
+            c.p.wall.retry_time = 0.0;
+            let nn = c.p.wall.retry_normal;
+            let pp = c.p.wall.retry_pos;
+            let o = c.p.pos;
+            let d = (((o.y - pp.y) * nn.y) + ((o.x - pp.x) * nn.x)) + ((o.z - pp.z) * nn.z);
+            if 1.0 > d.abs() {
+                wall::surface_transition(c, o, nn, None, -nn);
+            }
+        }
         return;
     }
     // step 12: blocked: TryPlayerMove for steep falls into overhangs, else StepSlide
@@ -496,7 +710,7 @@ fn air_move(c: &mut Ctx, dt: f32) {
         let vz2 = ((0.0078125 - tr.normal.dot(ov)) * nz) + ov.z;
         0.0 > vz2
     } else {
-        let e2 = tr.endpos - UP * c.s.step_height;
+        let e2 = tr.endpos - c.p.surface_normal * c.s.step_height;
         let tr2 = c.trace(tr.endpos, e2);
         if tr2.fraction >= 1.0 { true } else { 0.7 > tr2.normal.z }
     };
@@ -509,7 +723,9 @@ fn air_move(c: &mut Ctx, dt: f32) {
     let nz = tr.normal.z;
     let vz = c.p.vel.z;
     if nz > 0.0 && 0.7 > nz && c.p.pos.z == o.z && vz >= 0.0 && 0.013531647 >= vz {
-        tr.normal = UP;
+        tr.normal = c.p.surface_normal;
     }
     c.p.contact_plane = tr.normal;
+    // SurfaceTransition: attach to the wall the move was blocked by
+    wall::surface_transition(c, tr.endpos, tr.normal, Some(&tr), ov);
 }

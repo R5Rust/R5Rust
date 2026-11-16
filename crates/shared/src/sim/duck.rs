@@ -1,7 +1,7 @@
 //! Duck 0x140ba7500 (playermove.md 7 / slide.md 2C), CanUnduck, FinishUnDuck, SetDuckViewOffset,
 //! StartSliding 0x140ba7ed0, StopSliding 0x140ba8250 (slide.md 2A/2B).
 
-use super::{ground, Ctx, MoveType, IN_DUCK, UP};
+use super::{ground, upright, Ctx, MoveType, IN_DUCK, UP};
 use glam::Vec3;
 
 fn clamp01(f: f32) -> f32 {
@@ -23,6 +23,9 @@ pub(super) fn duck(c: &mut Ctx) {
     let msp = c.s.slide_max_stop_speed;
     if c.p.sliding && (v.x * v.x + v.y * v.y) > msp * msp {
         want = true; // can't stand up out of a slide faster than slideMaxStopSpeed
+    }
+    if !upright(c.p.surface_normal) {
+        want = false; // no crouch on a wall
     }
     let d = c.s.crouch_enabled && want;
     let mut fast = c.p.sliding;
@@ -96,7 +99,7 @@ pub(super) fn duck(c: &mut Ctx) {
 }
 
 /// Crouched height minus standing height (negative), halved when the contact plane is exactly flat.
-fn air_hull_delta(c: &Ctx) -> Option<Vec3> {
+pub(super) fn air_hull_delta(c: &Ctx) -> Option<Vec3> {
     let x = c.p.contact_plane.z;
     if 0.0 < x {
         return None;
@@ -111,7 +114,7 @@ fn air_hull_delta(c: &Ctx) -> Option<Vec3> {
 
 /// CanUnduck 0x140bfd500: the standing hull must fit (in the air: lowered so the head stays, and not within
 /// 2 units of the ground).
-fn can_unduck(c: &Ctx) -> bool {
+pub(super) fn can_unduck(c: &Ctx) -> bool {
     if !c.p.ducked {
         return true;
     }
@@ -124,7 +127,7 @@ fn can_unduck(c: &Ctx) -> bool {
         if let Some(d) = air_hull_delta(c) {
             s += d;
         }
-        e = s - UP * 2.0;
+        e = s - c.p.surface_normal * 2.0;
     }
     let t = c.col.trace_hull(s, e, c.s.stand.hull_min, c.s.stand.hull_max);
     !t.startsolid && t.fraction == 1.0

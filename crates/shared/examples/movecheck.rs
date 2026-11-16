@@ -65,7 +65,8 @@ impl Geo {
 
 /// Flat floor at z 0, split into many triangles like a real mesh, plus test fixtures (all facing +X from x 200):
 /// y 0: a 22-unit step; y 1000: a 23-unit step; y 2000: a 60-unit ledge (mantle); y 3000: a 100-unit cliff
-/// (x -3000..-2000) to walk off.
+/// (x -3000..-2000) to walk off; y 4200: a 300-unit wall (wall climb); y 5200: a 150-unit wall (climb, then
+/// mantle the top).
 fn test_world() -> Collision {
     let mut g = Geo { pos: vec![], idx: vec![] };
     let s = 500.0;
@@ -82,6 +83,8 @@ fn test_world() -> Collision {
     g.aabb(Vec3::new(200.0, 900.0, 0.0), Vec3::new(400.0, 1100.0, 23.0));
     g.aabb(Vec3::new(200.0, 1800.0, 0.0), Vec3::new(700.0, 2200.0, 60.0));
     g.aabb(Vec3::new(-3000.0, 2500.0, 0.0), Vec3::new(-2000.0, 3500.0, 100.0));
+    g.aabb(Vec3::new(200.0, 3800.0, 0.0), Vec3::new(400.0, 4600.0, 300.0));
+    g.aabb(Vec3::new(200.0, 4900.0, 0.0), Vec3::new(700.0, 5500.0, 150.0));
     Collision::build(g.pos, &g.idx)
 }
 
@@ -389,6 +392,9 @@ fn main() {
     // ------------------------------------------------------------ mantle (native TraversalMove exits)
     mantle_checks(&mut c, &col);
 
+    // ------------------------------------------------------------ wall climb
+    wall_checks(&mut c, &col);
+
     // ------------------------------------------------------------ real map + perf
     real_map(&mut c);
 
@@ -536,6 +542,127 @@ fn mantle_checks(c: &mut Checks, col: &Collision) {
     c.truth("no press: plain finish, boost state 0", p.mantle_boost.state == 0 && (hspeed(&p) - 173.5).abs() < 0.5, format!("state {} {:.1}", p.mantle_boost.state, hspeed(&p)));
 }
 
+/// Sprint from x -100 toward the wall face at x 200 (row `y`), view yaw `yaw`, jump at x 120, W held.
+/// Returns the player on the tick it attached to the wall (None if it never did within 2 s).
+fn climb_start(col: &Collision, y: f32, yaw: f32) -> Option<Player> {
+    let mut p = settle(col, Vec3::new(-100.0, y, 0.1));
+    let mut jumped = false;
+    for _ in 0..120 {
+        let jump = !jumped && p.pos.x > 120.0;
+        jumped |= jump;
+        sim::simulate(&mut p, &Input { forward: 1.0, sprint: true, yaw, jump, ..Default::default() }, TICK, col);
+        if p.on_wall() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// WallTop 0x140b9f680: min(attach z, refHeight + verticalGainCutoff_wallrun - climbFinalJumpUpHeight - climbHeight)
+fn wall_top(p: &Player) -> f32 {
+    let s = &p.settings;
+    p.wall.attach_pos.z.min(((s.vertical_gain_cutoff_wallrun + p.wall.ref_height) - s.climb_final_jump_up_height) - s.climb_height)
+}
+
+fn wall_checks(c: &mut Checks, col: &Collision) {
+    let g = STOCK;
+    let w_in = Input { forward: 1.0, ..Default::default() };
+    // ---- run + jump into the 300u wall, hold W
+    let Some(p0) = climb_start(col, 4200.0, 0.0) else {
+        c.truth("run + jump into a 300u wall attaches (wall climb)", false, "never attached".into());
+        return;
+    };
+    c.truth("run + jump into a 300u wall attaches (wall climb)", p0.surface_normal.x < -0.99, format!("n {:.2?} z {:.1}", p0.surface_normal, p0.pos.z));
+    c.range("attach: rising at most climbSpeedStart/2 (100)", p0.vel.z, -1000.0, 100.0);
+    let top0 = wall_top(&p0);
+    let mut p = p0;
+    let mut ticks = 0;
+    let mut prev = p;
+    while p.on_wall() && ticks < 300 {
+        prev = p;
+        sim::simulate(&mut p, &w_in, TICK, col);
+        ticks += 1;
+    }
+    let dur = ticks as f32 * TICK;
+    c.near("climb rises climbHeight (100) above WallTop", prev.pos.z - top0, g.climb_height, 1.0);
+    c.range("climb duration (200 -> 50 u/s over 100u, climbAccel 500)", dur, 0.9, 1.05);
+    c.near("climb speed at the top = climbSpeedEnd", prev.vel.z, g.climb_speed_end, 2.0);
+    // the top ends the climb with the final jump up: vz += sqrt(2 g (climbFinalJumpUpHeight + min(top - z, 10)))
+    let h = ((top0 + g.climb_height) - prev.pos.z).min(10.0) + g.climb_final_jump_up_height;
+    let want = prev.vel.z + (2.0 * 750.0 * h).sqrt() - 0.5 * 750.0 * TICK;
+    c.near("top: final jump up (climbFinalJumpUpHeight 28)", p.vel.z, want, 0.05);
+    c.near("top: pushed off by wallrun_fallAwaySpeed 70 (- one tick of air control)", p.vel.x, -70.0 + 500.0 * TICK, 0.05);
+    c.near("top: reference height lowered by wallclimb_vertical_gain_reduction", p.wall.ref_height, p0.wall.ref_height - 128.0, 0.01);
+    let mut peak = p.pos.z;
+    let mut again = false;
+    for _ in 0..240 {
+        sim::simulate(&mut p, &w_in, TICK, col);
+        peak = peak.max(p.pos.z);
+        again |= p.on_wall() && p.pos.z > 20.0;
+    }
+    c.range("peak after the climb (feet z)", peak, 185.0, 200.0);
+    c.truth("then drops to the floor (no re-climb of the same wall)", p.on_ground && !p.on_wall() && p.pos.z < 0.1 && !again, format!("z {:.2} {} again {again}", p.pos.z, p.state_name()));
+
+    // ---- jump during the climb, W held and facing the wall
+    let mut p = p0;
+    run(&mut p, col, 20, w_in);
+    let b = p;
+    sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, col);
+    // WallJump: out = wallrunJumpOutwardSpeed * (1 - 0.8 (n.view)(n.input)) = 188 * 0.2; the same tick
+    // WallRunUpdate sees the lowered reference height, ends the climb and adds wallrun_fallAwaySpeed 70
+    c.truth("jump on the wall: off the wall", !p.on_wall() && !p.on_ground, p.state_name().to_string());
+    c.near("wall jump (W held): out 188*0.2 + 70, minus one tick of air control", -p.vel.x, 188.0 * 0.2 + 70.0 - 500.0 * TICK, 0.05);
+    c.near("wall jump: no up boost above the cutoff (keeps the climb vz)", p.vel.z, b.vel.z - 0.5 * 750.0 * TICK, 0.05);
+    // without input: the full outward speed
+    let mut p = p0;
+    run(&mut p, col, 20, w_in);
+    sim::simulate(&mut p, &Input { jump: true, ..Default::default() }, TICK, col);
+    c.near("wall jump (no input): out 188 + 70", -p.vel.x, 188.0 + 70.0, 0.05);
+    c.range("wall jump (no input): still rising", p.vel.z, 100.0, 140.0);
+
+    // ---- let go of W: the climb stops, you slide and drop off
+    let mut p = p0;
+    run(&mut p, col, 20, w_in);
+    let mut t = 0;
+    while p.on_wall() && t < 300 {
+        sim::simulate(&mut p, &Input::default(), TICK, col);
+        t += 1;
+    }
+    c.range("let go of W: falls off within (s)", t as f32 * TICK, 0.5, 1.3);
+
+    // ---- glancing approach: the view must face the wall within ~45.6 deg (cos^2 > 0.49)
+    c.truth("approach at 50 deg: no climb", climb_start(col, 4200.0, 50.0).is_none(), String::new());
+    c.truth("approach at 44 deg: climbs", climb_start(col, 4200.0, 44.0).is_some(), String::new());
+
+    // ---- 150u wall: climb, then the mantle takes the ledge once it is within mantleHeight
+    match climb_start(col, 5200.0, 0.0) {
+        None => c.truth("150u wall: climb, then mantle onto the top", false, "never attached".into()),
+        Some(mut p) => {
+            let mut mantled = false;
+            for _ in 0..180 {
+                sim::simulate(&mut p, &w_in, TICK, col);
+                mantled |= p.mantling();
+                if mantled && !p.mantling() {
+                    break;
+                }
+            }
+            c.truth("150u wall: climb, then mantle onto the top", mantled && p.on_ground && (p.pos.z - 150.0).abs() < 0.1, format!("mantled {mantled} z {:.2}", p.pos.z));
+        }
+    }
+
+    // ---- the 60u ledge from a running jump still mantles (no climb)
+    let mut p = settle(col, Vec3::new(-100.0, 2000.0, 0.1));
+    let (mut jumped, mut mantled, mut climbed) = (false, false, false);
+    for _ in 0..180 {
+        let jump = !jumped && p.pos.x > 120.0;
+        jumped |= jump;
+        sim::simulate(&mut p, &Input { forward: 1.0, sprint: true, jump, ..Default::default() }, TICK, col);
+        mantled |= p.mantling();
+        climbed |= p.on_wall();
+    }
+    c.truth("60u ledge from a running jump: mantles, no wall climb", mantled && !climbed && (p.pos.z - 60.0).abs() < 0.1, format!("mantled {mantled} climbed {climbed} z {:.2}", p.pos.z));
+}
+
 /// Settings consts vs the game's own file (tolerant line regex `"key": value`; poseSettings blocks in order).
 fn check_settings_file(c: &mut Checks) {
     let cfg = shared::assets::Config::load();
@@ -624,6 +751,32 @@ fn check_settings_file(c: &mut Checks) {
         ("slideSpeedBoostCap", s.slide_speed_boost_cap),
         ("wallrunJumpUpSpeed", s.wallrun_jump_up_speed),
         ("wallrunJumpOutwardSpeed", s.wallrun_jump_outward_speed),
+        ("wallrunJumpInputDirSpeed", s.wallrun_jump_input_dir_speed),
+        ("climbHeight", s.climb_height),
+        ("climbFinalJumpUpHeight", s.climb_final_jump_up_height),
+        ("climbSpeedStart", s.climb_speed_start),
+        ("climbSpeedEnd", s.climb_speed_end),
+        ("climbAccel", s.climb_accel),
+        ("climbDecel", s.climb_decel),
+        ("climbHorzSpeed", s.climb_horz_speed),
+        ("climbHorzAccel", s.climb_horz_accel),
+        ("climbHorzDecel", s.climb_horz_decel),
+        ("verticalGainCutoff_wallrun", s.vertical_gain_cutoff_wallrun),
+        ("wallrun_timeLimit", s.wallrun_time_limit),
+        ("wallrunCeilingLimit", s.wallrun_ceiling_limit),
+        ("wallrunAllowedWallDistance", s.wallrun_allowed_wall_distance),
+        ("wallrunUpWallBoost", s.wallrun_up_wall_boost),
+        ("wallrunMaxSpeedVertical", s.wallrun_max_speed_vertical),
+        ("wallrunMaxSpeedHorizontal", s.wallrun_max_speed_horizontal),
+        ("wallrunMaxSpeedHorizontalBackward", s.wallrun_max_speed_horizontal_backward),
+        ("wallrunAccelerateVertical", s.wallrun_accelerate_vertical),
+        ("wallrunDecelerateVertical", s.wallrun_decelerate_vertical),
+        ("wallrunAccelerateHorizontal", s.wallrun_accelerate_horizontal),
+        ("wallrunDecelerateHorizontal", s.wallrun_decelerate_horizontal),
+        ("wallrunGravityRampUpTime", s.wallrun_gravity_ramp_up_time),
+        ("wallrunSameWallHeight", s.wallrun_same_wall_height),
+        ("wallrunAdsType", s.wallrun_ads_type as f32),
+        ("mantleAngleScale", s.mantle_angle_scale),
         ("gravityScale", s.gravity_scale),
     ] {
         if num(&top, k) != v {

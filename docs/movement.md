@@ -6,9 +6,9 @@ which were read off the disassembly. A few functions those specs leave as calls 
 (GetAccelerate, GetMaxSpeed, UpdateSprint/CanSprint/AllowSprint, LandingSpeedScale), from
 `%USERPROFILE%\Games\R5Flowstate\r5apex_ds.exe`. The two builds are the same: the offsets and constants match.
 
-The code follows the specs' order of operations and their MIN/MAX operand order. It is not bit-exact: NaN paths,
-networking notifies and the double-precision UPRIGHT tests were dropped. The player never stands on a wall
-(no wallrun), so every UPRIGHT test passes.
+The code follows the specs' order of operations and their MIN/MAX operand order. It is not bit-exact: NaN paths
+and networking notifies were dropped. The surface normal (pl+0x662c) is world up except while climbing a wall, and
+UPRIGHT is the engine's double-precision test (`sim::upright`).
 
 ## Run the checker
 
@@ -16,11 +16,12 @@ networking notifies and the double-precision UPRIGHT tests were dropped. The pla
 cargo run --release -p shared --example movecheck
 ```
 
-It runs 87 checks on a synthetic test world: a floor, a 22u step, a 23u step, a 60u ledge and a 100u cliff.
+It runs 107 checks on a synthetic test world: a floor, a 22u step, a 23u step, a 60u ledge, a 100u cliff, a 300u
+wall and a 150u wall.
 If the assets are present it also runs them on the real Firing Range, and it re-reads the legend's settings file
 to confirm the consts below still match it. It exits with code 1 if any check fails.
 
-Last run: 87/87 passed. A tick on the real 5.4M-triangle map costs **~50 µs** on average and ~0.3 ms at worst
+Last run: 107/107 passed. A tick on the real 5.4M-triangle map costs **~50 µs** on average and ~0.3 ms at worst
 (sprint, jump, slide and mantle mixed, at 60 Hz).
 
 | Check | Got |
@@ -65,6 +66,7 @@ Last run: 87/87 passed. A tick on the real 5.4M-triangle map costs **~50 µs** o
 | `sim/duck.rs` | Duck 0x140ba7500 (4 states, integer-ms timer, smoothstep eye height), CanUnduck, FinishUnDuck, SetDuckViewOffset, StartSliding 0x140ba7ed0, StopSliding | playermove.md §7, slide.md |
 | `sim/step.rs` | StepSlide 0x140b9ad70 (all 4 variants), TryPlayerMoveStep 0x140b9a970, StepMove 0x140bb0610 | stepslide.md |
 | `sim/traversal.rs` | TraversalMove 0x140b981b0 (progress, rest, jump-off, hop-back, END and completion), TraversalPathPos, Start/Finish/EndTraversal, CheckAutoMantle (rebuilt), the mantle boost | movemodes.md part B |
+| `sim/wall.rs` + `walk.rs` (`wall_walk`) | Wall climb: SurfaceTransition 0x140ba1990 and its classifier 0x140ba0a80, WallProbe 0x140ba1690, MantleIntent 0x140b92e80, FacingWall 0x140bf0a40, CanWallClimb 0x140bf0a90, WallTop 0x140b9f680, UpWallBoostScale 0x140ba2aa0, WallSpeedFrac 0x140b8b6b0, WallRunUpdate 0x140b9f6e0, EndWallRun 0x140bf0ba0, WallSurfaceChange 0x140ba2680, WallJump 0x140ba2c90, RememberWall 0x140bacb10; WalkMove's wall branch 7W | walkmove.md 7W, decompiled for this port |
 | `collision.rs` | `trace_hull`: an axis-aligned box swept against the triangle BVH | (Source TraceHull semantics) |
 
 ### How it feels, briefly
@@ -81,6 +83,90 @@ Last run: 87/87 passed. A tick on the real 5.4M-triangle map costs **~50 µs** o
   leaving the ground, the coyote grace is 0.2 s.
 - **Crouch** takes 400 ms (200 ms when sliding) before the hull shrinks and crouch speed applies. Only the eye
   height eases (smoothstep). Uncrouching needs the standing hull to fit.
+
+## Wall climb
+
+Stock legends have `climbEnabled` and no `wallrun`, so every wall they attach to is climbed. The R5Regenis specs
+leave this whole chain as calls, so it was decompiled for this port from r5apex_ds.exe (Ghidra headless, with the
+asm checked where the C was unclear): SurfaceTransition and its classifier, WallRunUpdate, WallJump, EndWallRun and
+their helpers live in `sim/wall.rs`. The motion on the wall is WalkMove's wall branch (walkmove.md 7W) in
+`walk.rs` (`wall_walk`).
+
+While climbing, the wall is the ground entity and `Player::surface_normal` (pl+0x662c) is the wall's normal, so
+FullWalkMove runs WalkMove, CategorizePosition probes along -n, and every UPRIGHT test fails. `Player::on_wall()`
+reports it; the HUD state is `climb`.
+
+### How it plays
+
+1. **Attach.** You must be in the air: not on the ground and not near it within 0.5 s (a jump resets that clock).
+   When AirMove is blocked by a wall, SurfaceTransition's classifier needs: a wall (normal z between -0.5 and 0.7),
+   the view yaw facing it within ~45.6° (`cos² > 0.49`), velocity into it, rising no faster than
+   climbSpeedStart/2 = 100 u/s, feet no higher than ground + 147 (verticalGainCutoff 175 - climbFinalJumpUpHeight 28),
+   and two box probes (feet and mid-body) finding the wall within 17u. If you are pushing and looking into it like
+   a mantle, a head probe must find the wall too; if it doesn't, the ledge is in reach and the mantle takes it.
+   A probe that misses the wall asks for a retry 0.07 s later (AirMove's deferred transition).
+2. **Climb.** Holding W pushes up the wall (the surface basis turns view-forward into "up the wall"). Gravity is 0
+   while you push into the wall. The target up-speed falls linearly from climbSpeedStart 200 to climbSpeedEnd 50 over
+   climbHeight 100 above WallTop (the attach height, capped at ground + 47), reached at climbAccel 500 u/s².
+   Sideways input moves along the wall at climbHorzSpeed 100.
+3. **End.** WallRunUpdate ends it when: you reach WallTop + 100 (then a **final jump up**: `vz += sqrt(2g * (28 +
+   min(top - z, 10)))`), you look away (facing test fails), you rise slower than 10 u/s after 1 s, you crouch, you
+   pull away for 0.05 s, or the wall is no longer within 17u of a probe 16u above the feet. Falling off pushes you
+   70 u/s off the wall (wallrun_fallAwaySpeed) and lowers the reference height by 128
+   (wallclimb_vertical_gain_reduction), so you cannot climb again until you stand on the floor. The same wall cannot
+   be re-attached at or above the last attach height.
+4. **Jump off (WallJump).** Out from the wall at `188 * (1 - 0.8 * (n·view) * (n·input))` (both terms only count
+   when they face the wall), plus `sqrt(2g * 28)` = 205 up scaled by UpWallBoostScale. A climb jump lowers the
+   reference height by 128 first, which puts you above the 175 cutoff, so in practice the up boost is 0 and you keep
+   the climb's vertical speed. The same tick, WallRunUpdate sees the lowered WallTop and ends the climb, adding the
+   70 fall-away push.
+5. **Let go of W.** The no-climb table applies (wallrun speeds, slip ramp, no-input slip 0.7), gravity ramps back
+   in over 1 s, and you drop off when the 10 u/s rule fires.
+
+### Checker results (300u and 150u walls)
+
+| Check | Got |
+|---|---|
+| run + jump into the wall: attaches at | z 48.9, vz 89.6 (the tick vz fell under 100) |
+| climb rise above WallTop / duration | 100.2 u / 0.97 s |
+| up-speed at the top | 51.0 (climbSpeedEnd 50) |
+| final jump up at the top | vz 249.0 = 51.0 + sqrt(1500 * 27.8) - one half-gravity |
+| pushed off at the top | -61.7 = -70 plus one tick of air control back toward the wall |
+| peak after the climb / then | feet z 192.8, slides down the wall to the floor, no re-climb |
+| jump on the wall, W held, facing it | out 99.3 (= 188 * 0.2 + 70 - one tick of air control), vz unchanged |
+| jump on the wall, no input | out 258 (188 + 70), vz unchanged |
+| let go of W | off the wall 0.67 s later |
+| approach at 44° / 50° to the wall | climbs / doesn't |
+| 150u wall | climbs 11 ticks, then the mantle takes the ledge, ends standing on top |
+| 60u ledge from a running jump | mantles, never attaches |
+
+### Approximated, or a judgement call
+
+- **Animation-driven parts are skipped.** WallClimbUpdate 0x140bf0e90 only plays the `wall_climb` animation and
+  its own distance trace turns that animation off; the view punches on attach / time-out and the sounds are not
+  ported either.
+- **LedgeAssist 0x140baca70** (the jump-assist target search) is not ported, so WallRunUpdate's fall-off never
+  finds an assist target and always applies the 70 u/s push, and WallJump never gets its assist.
+- **WallJump + WallRunUpdate on the same tick.** The literal order (CheckJumpButton, then WallRunUpdate, with the
+  surface normal still the wall's) makes a climb jump also trigger the climb-height fall-off, so a climb jump leaves
+  at 188·k + 70 and keeps the climb's vertical speed. That is what the decompile says; it has not been compared
+  with the live S21 client.
+- **TryPlayerMoveCore's trace record.** The rebuilt Source TryPlayerMove now hands back its first bump's trace
+  (Source's `pFirstTrace`) instead of its last one. AirMove's contact plane and SurfaceTransition need the wall
+  hit; with the last trace they got an empty normal after a slide. All older checks are unchanged by it.
+- **Wall hang** needs wallrunAdsType 1 (stock is 2), so WallHangSlipScale is 1 and the hang branch is not ported.
+  The wallrun-legend branches (`wallrun` true: the airborne wallrun start in WallRunUpdate, the up-wall boost at
+  attach) are written out where they were short, but no stock legend reaches them.
+- **Unknown fields assumed default:** pl+0x6674 (wallrun B/C multiplier) = 1.0 (its constructor value), pl+0x5af0 =
+  1, pl+0x6258 time ramp off, the ADS move-speed scale = 1, `*(pl+0x6578) & 3` = 0 (selects the plain wall probe in
+  WallRunUpdate), slide state pl+0x5aac never 2/3, `mv+0xa8` up axis = world up, `mv+0x3c` = the view forward.
+- **Crouched in the air**, the classifier moves its probes by CanUnduck's hull delta (the same pl+0x65fc..0x6628
+  fields); which of the two hulls each field holds is inferred from CanUnduck.
+- **Inline sines.** The engine's SSE sine polynomial (cos as sin(a + pi/2)) is replaced by `f32::sin`; the
+  thresholds (cos 45°, 50°, 90°) can differ in the last bit.
+- **Build doubt.** The ds binary is older than the S21 client; R5Regenis uses it as the movement reference, and so
+  does this port. The settings values come from the S21 legend file and match the names the ds binary reads.
+
 
 ## Settings and cvars used
 
@@ -100,7 +186,13 @@ have the same movement values. The checker asserts the consts match the file.
 | slideRequiredStartSpeed (Air) | 200 (90) | slideSpeedBoost / Cap / Cooldown | 150 / 400 / 2 |
 | slideDecel / WantToStopDecel / VelocityDecay / Accel | 100 / 400 / 0.7 / 50 | slideStop / MaxStop / MaxJump speed | 125 / 350 / 350 |
 | mantleHeight | 80 | mantleDuration below / level / above / high | 0.7 / 0.6 / 0.5 / 0.35 |
-| wallrunJumpOutwardSpeed / UpSpeed (hop-back) | 188 / 240 | | |
+| wallrunJumpOutwardSpeed / UpSpeed (hop-back) | 188 / 240 | wallrunJumpInputDirSpeed | 75 |
+| climbEnabled / wallrun / wallrunDuckCausesFallOff | true / false / true | climbHeight / climbFinalJumpUpHeight | 100 / 28 |
+| climbSpeedStart / End / Accel / Decel | 200 / 50 / 500 / 300 | climbHorzSpeed / Accel / Decel | 100 / 100 / 500 |
+| verticalGainCutoff_wallrun | 175 | wallrunAllowedWallDistance / CeilingLimit | 17 / 0.5 |
+| wallrunMaxSpeedVertical / Horizontal / Backward | 112 / 225 / 50 | wallrunAccel/DecelerateVertical | 450 / 300 |
+| wallrunAccel/DecelerateHorizontal | 200 / 500 | wallrunGravityRampUpTime / wallrun_timeLimit | 1 / 2 |
+| mantleAngleScale | 1 | wallrunAdsType (1 = hang on ADS) | 2 |
 
 Every cvar default below was read from the exe's static ConVar objects (the default string sits at ConVar+0x50):
 
@@ -115,6 +207,15 @@ Every cvar default below was read from the exe's static ConVar objects (the defa
 | traversal_enable / traversal_cooldown | 1 / 0.5 | automantle_enable / _cooldown | 1 / .25 |
 | automantle_searchdist / _mindist | 5 / 18 | automantle_height_level / above / below | 10 / 30 / -10 |
 | automantle_jumpoff_duration / _anim_maxfrac | 0.1 / 0.5 | automantle_rest_frac / _below / backoff_anim_maxfrac | 0.4 / 0.3 / 0.7 |
+| wallrun_enable / wallrun_retry_interval | 1 / 0.07 | wallrun_sameWallDot / Dist / Slope | 0.9 / 100 / 0 |
+| wallrun_upwardAutoPush | 0.65 | wallrun_angleChangeMinCos / rotateMaxRate | 0.8 / 3 |
+| wallrun_pushAwayFallOffTime / fallAwaySpeed | 0.05 / 70 | wallclimb_vertical_gain_reduction | 128 |
+| wallrun_slipstarttime / slipduration / noInputSlipFrac | 1.5 / 1.0 / 0.7 | wallrun_minAngle_air | 180 |
+| wallrun_strengthLossStart / End | 1000 / 1000 | wallrun_repelEnable | 1 |
+| automantle_maxangle_push / _view / automantle_wallrun_maxangle_view | 50 / 50 / 45 | | |
+
+The wall-climb cvar names were resolved from their registration code (`lea rax, "name"; mov [obj+0x18], rax`): the
+ConVar objects only receive their name pointer at runtime, so obj+0x18 is empty in the file.
 
 The mantle boost and the tap-strafe gate come from R5Regenis's bridge (`engine/s21-r5sdk/src/game/server/
 mantle_boost.cpp`, `tapstrafe.cpp`), not from the exe:
@@ -181,7 +282,7 @@ and 9 edge cross products.
 - **Slide super jump and the Nitro Gate launch** (`slide_super_jump.cpp`, `slide_gate_launch.cpp`) are not ported.
   The first is the `boosted_slide_jump` mod (`player_slideSuperJumpEnabled` is false in stock settings). The second
   is a map gadget.
-- **Not in scope:** wallrun and its surface transitions, double jump, dodge, zipline, grapple, skydive, jetpack,
+- **Not in scope:** wallrun proper (wallrun legends; stock pilots only climb), wall hang, double jump, dodge, zipline, grapple, skydive, jetpack,
   slip triggers, launch pads, gravity fields, base velocity, moving ground, standing on players/NPCs, doors, water,
   fall damage, sounds, view punch and LedgeAssist (the jump-assist target search).
 - **CheckStuck.** The 54 nudges are Source's table, which Apex fills the same way at runtime. EA skips the whole

@@ -75,6 +75,38 @@ pub struct PlayerSettings {
     pub mantle_duration_high: f32,
     pub wallrun_jump_up_speed: f32,
     pub wallrun_jump_outward_speed: f32,
+    pub wallrun_jump_input_dir_speed: f32,
+    // Wall climb (sim/wall.rs, walkmove.md 7W). Stock pilots climb (climbEnabled) and do not wallrun.
+    pub climb_enabled: bool,
+    pub wallrun: bool,
+    pub wallstick_enabled: bool,
+    pub wallrun_duck_causes_fall_off: bool,
+    pub wallrun_same_wall_allowed: bool,
+    pub wallrun_ads_type: i32,
+    pub climb_height: f32,
+    pub climb_final_jump_up_height: f32,
+    pub climb_speed_start: f32,
+    pub climb_speed_end: f32,
+    pub climb_accel: f32,
+    pub climb_decel: f32,
+    pub climb_horz_speed: f32,
+    pub climb_horz_accel: f32,
+    pub climb_horz_decel: f32,
+    pub vertical_gain_cutoff_wallrun: f32,
+    pub wallrun_time_limit: f32,
+    pub wallrun_ceiling_limit: f32,
+    pub wallrun_allowed_wall_distance: f32,
+    pub wallrun_up_wall_boost: f32,
+    pub wallrun_max_speed_vertical: f32,
+    pub wallrun_max_speed_horizontal: f32,
+    pub wallrun_max_speed_horizontal_backward: f32,
+    pub wallrun_accelerate_vertical: f32,
+    pub wallrun_decelerate_vertical: f32,
+    pub wallrun_accelerate_horizontal: f32,
+    pub wallrun_decelerate_horizontal: f32,
+    pub wallrun_gravity_ramp_up_time: f32,
+    pub wallrun_same_wall_height: f32,
+    pub mantle_angle_scale: f32,
 }
 
 const fn v(x: f32, y: f32, z: f32) -> Vec3 {
@@ -156,6 +188,37 @@ pub const STOCK: PlayerSettings = PlayerSettings {
     mantle_duration_high: 0.35,
     wallrun_jump_up_speed: 240.0,
     wallrun_jump_outward_speed: 188.0,
+    wallrun_jump_input_dir_speed: 75.0,
+    climb_enabled: true,
+    wallrun: false,
+    wallstick_enabled: false,
+    wallrun_duck_causes_fall_off: true,
+    wallrun_same_wall_allowed: true,
+    wallrun_ads_type: 2,
+    climb_height: 100.0,
+    climb_final_jump_up_height: 28.0,
+    climb_speed_start: 200.0,
+    climb_speed_end: 50.0,
+    climb_accel: 500.0,
+    climb_decel: 300.0,
+    climb_horz_speed: 100.0,
+    climb_horz_accel: 100.0,
+    climb_horz_decel: 500.0,
+    vertical_gain_cutoff_wallrun: 175.0,
+    wallrun_time_limit: 2.0,
+    wallrun_ceiling_limit: 0.5,
+    wallrun_allowed_wall_distance: 17.0,
+    wallrun_up_wall_boost: 250.0,
+    wallrun_max_speed_vertical: 112.0,
+    wallrun_max_speed_horizontal: 225.0,
+    wallrun_max_speed_horizontal_backward: 50.0,
+    wallrun_accelerate_vertical: 450.0,
+    wallrun_decelerate_vertical: 300.0,
+    wallrun_accelerate_horizontal: 200.0,
+    wallrun_decelerate_horizontal: 500.0,
+    wallrun_gravity_ramp_up_time: 1.0,
+    wallrun_same_wall_height: 0.0,
+    mantle_angle_scale: 1.0,
 };
 
 /// Movement cvars. `exe` = default string read from r5apex_ds.exe (ConVar+0x50); `spec` = value the spec states.
@@ -201,6 +264,28 @@ pub struct Cvars {
     pub mantle_boost_sprint_mult: f32,           // "1.3" (bridge_mantle_boost_sprint_mult)
     pub mantle_boost_jump_height: f32,           // "90" (bridge_mantle_boost_jump_height)
     pub lurch_cutoff_speed: f32,                 // "1100" (bridge_lurch_cutoff_speed = client jump_grace_cutoff_speed)
+    // Wall climb cvars (ConVar pointer -> name from the registration code, default from ConVar+0x50)
+    pub wallrun_enable: bool,                    // 0x1422e9e28 exe "1"
+    pub wallrun_retry_interval: f32,             // 0x14236f348 exe "0.07"
+    pub wallrun_same_wall_dot: f32,              // 0x142315528 exe "0.9"
+    pub wallrun_same_wall_dist: f32,             // 0x142314cd8 exe "100"
+    pub wallrun_same_wall_slope: f32,            // 0x1422e4eb8 exe "0"
+    pub wallrun_strength_loss_start: f32,        // 0x14234b888 exe "1000"
+    pub wallrun_strength_loss_end: f32,          // 0x14234bb88 exe "1000"
+    pub wallrun_min_angle_air: f32,              // 0x142364e28 exe "180.0"
+    pub wallrun_upward_auto_push: f32,           // 0x142371958 exe "0.65"
+    pub wallrun_angle_change_min_cos: f32,       // 0x142385238 exe "0.8"
+    pub wallrun_push_away_fall_off_time: f32,    // 0x1422e8648 exe "0.05"
+    pub wallrun_fall_away_speed: f32,            // 0x142372ef8 exe "70.0"
+    pub wallclimb_vertical_gain_reduction: f32,  // 0x142373ad8 exe "128"
+    pub wallrun_rotate_max_rate: f32,            // 0x142315b18 exe "3"
+    pub wallrun_slipstarttime: f32,              // 0x142372af8 exe "1.5"
+    pub wallrun_slipduration: f32,               // 0x142384b48 exe "1.0"
+    pub wallrun_no_input_slip_frac: f32,         // 0x142372e58 exe "0.7"
+    pub wallrun_repel_enable: bool,              // 0x14236d758 exe "1" (gates the last-wall record)
+    pub automantle_maxangle_push: f32,           // 0x14236fb18 exe "50"
+    pub automantle_maxangle_view: f32,           // 0x142371d38 exe "50"
+    pub automantle_wallrun_maxangle_view: f32,   // 0x1423719f8 exe "45"
 }
 
 pub const CVARS: Cvars = Cvars {
@@ -242,4 +327,25 @@ pub const CVARS: Cvars = Cvars {
     mantle_boost_sprint_mult: 1.3,
     mantle_boost_jump_height: 90.0,
     lurch_cutoff_speed: 1100.0,
+    wallrun_enable: true,
+    wallrun_retry_interval: 0.07,
+    wallrun_same_wall_dot: 0.9,
+    wallrun_same_wall_dist: 100.0,
+    wallrun_same_wall_slope: 0.0,
+    wallrun_strength_loss_start: 1000.0,
+    wallrun_strength_loss_end: 1000.0,
+    wallrun_min_angle_air: 180.0,
+    wallrun_upward_auto_push: 0.65,
+    wallrun_angle_change_min_cos: 0.8,
+    wallrun_push_away_fall_off_time: 0.05,
+    wallrun_fall_away_speed: 70.0,
+    wallclimb_vertical_gain_reduction: 128.0,
+    wallrun_rotate_max_rate: 3.0,
+    wallrun_slipstarttime: 1.5,
+    wallrun_slipduration: 1.0,
+    wallrun_no_input_slip_frac: 0.7,
+    wallrun_repel_enable: true,
+    automantle_maxangle_push: 50.0,
+    automantle_maxangle_view: 50.0,
+    automantle_wallrun_maxangle_view: 45.0,
 };

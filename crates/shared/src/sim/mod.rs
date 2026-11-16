@@ -13,12 +13,15 @@
 //! - `duck.rs`: Duck 0x140ba7500, StartSliding 0x140ba7ed0, StopSliding 0x140ba8250
 //! - `step.rs`: StepSlide 0x140b9ad70, TryPlayerMoveStep 0x140b9a970, StepMove 0x140bb0610, TryPlayerMove core
 //! - `traversal.rs`: TraversalMove 0x140b981b0 (mantle), CheckAutoMantle, mantle boost
+//! - `wall.rs`: wall climb: SurfaceTransition 0x140ba1990, its classifier 0x140ba0a80, WallRunUpdate 0x140b9f6e0,
+//!   WallJump 0x140ba2c90, EndWallRun 0x140bf0ba0 and their helpers
 
 mod duck;
 mod ground;
 mod step;
 mod traversal;
 mod walk;
+mod wall;
 
 use crate::collision::{Collision, Trace};
 pub use crate::settings::{Cvars, PlayerSettings, Stance, CVARS, STOCK};
@@ -35,6 +38,34 @@ pub const IN_BACK: u32 = 0x10;
 pub const IN_MOVELEFT: u32 = 0x200;
 pub const IN_MOVERIGHT: u32 = 0x400;
 pub const IN_SPEED: u32 = 0x8000;
+
+/// Wall state (pl+0x6644..0x6694, pl+0x5c4c..0x5c68, pl+0x5da0). Stock pilots only climb (no wallrun / hang).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Wall {
+    /// pl+0x6650: when the current wall attach started (climb time, gravity ramp, slip)
+    pub start_time: f32,
+    /// pl+0x6654: when the last wall ended
+    pub end_time: f32,
+    /// pl+0x6644..0x664c: origin at the attach (WallTop, same-wall height test)
+    pub attach_pos: Vec3,
+    /// pl+0x6658: walls attached since the last ground jump
+    pub count: i32,
+    /// pl+0x665c: the up-wall boost / gravity ramp is spent (UpWallBoostScale returns 0)
+    pub no_boost: bool,
+    /// pl+0x6670: when pulling away from the wall started (0 = not pulling)
+    pub push_away_time: f32,
+    /// pl+0x667c / 0x6680 / 0x668c: deferred surface transition (retry time, origin, wall normal)
+    pub retry_time: f32,
+    pub retry_pos: Vec3,
+    pub retry_normal: Vec3,
+    /// pl+0x5c4c / 0x5c64 / 0x5c68: the last wall left (flat normal), when, and whether the record is set
+    pub last_normal: Vec3,
+    pub last_time: f32,
+    pub last_count: i32,
+    /// pl+0x5da0: reference height for verticalGainCutoff (the floor you last stood on, lowered while falling,
+    /// and lowered by wallclimb_vertical_gain_reduction after each climb)
+    pub ref_height: f32,
+}
 
 /// One tick of player input.
 #[derive(Clone, Copy, Debug, Default)]
@@ -136,6 +167,9 @@ pub struct Player {
     pub sprinting: bool,
     pub traversal: Traversal,
     pub mantle_boost: MantleBoost,
+    /// pl+0x662c: the surface up-normal. World up, or the wall's normal while on a wall (climbing).
+    pub surface_normal: Vec3,
+    pub wall: Wall,
 
     time: f64,
     ground: bool,
@@ -148,6 +182,8 @@ pub struct Player {
     sprint_req_until: f32,
     /// pl+0x724c
     ground_normal: Vec3,
+    /// pl+0x5da4: normal of the ground entity's trace (SetGroundEntity), zero in the air
+    ground_trace_normal: Vec3,
     /// pl+0x6ce0 m_surfaceFriction
     surface_friction: f32,
     /// pl+0x6214 / pl+0x6224: last time on (non-player) ground and the normal there
@@ -197,6 +233,8 @@ impl Player {
             sprinting: false,
             traversal: Traversal::default(),
             mantle_boost: MantleBoost::default(),
+            surface_normal: UP,
+            wall: Wall { ref_height: pos.z, ..Wall::default() },
             time: 0.0,
             ground: false,
             duck_timer_ms: 0,
@@ -207,6 +245,7 @@ impl Player {
             sprint_latch: false,
             sprint_req_until: 0.0,
             ground_normal: Vec3::ZERO,
+            ground_trace_normal: Vec3::ZERO,
             surface_friction: 1.0,
             last_ground_time: -100.0,
             last_ground_normal: Vec3::Z,
@@ -239,6 +278,11 @@ impl Player {
         self.move_type == MoveType::Traverse
     }
 
+    /// On a wall (wall climb): the surface normal is not upright.
+    pub fn on_wall(&self) -> bool {
+        !upright(self.surface_normal)
+    }
+
     /// Simulation clock (seconds since spawn).
     pub fn time(&self) -> f64 {
         self.time
@@ -250,6 +294,8 @@ impl Player {
             "FLY"
         } else if self.mantling() {
             "mantle"
+        } else if self.on_wall() {
+            "climb"
         } else if self.sliding {
             "slide"
         } else if !self.on_ground {
@@ -281,8 +327,13 @@ pub fn find_free(col: &Collision, pos: Vec3) -> Vec3 {
     pos
 }
 
-/// The surface up-normal (pl+0x662c). Without wallrunning it is always world up, so every UPRIGHT test passes.
+/// World up (and the surface normal pl+0x662c while not on a wall).
 pub(crate) const UP: Vec3 = Vec3::Z;
+
+/// UPRIGHT: `(double)(((n.x*0) + (n.y*0)) - (n.z*1)) <= -0.999`. EndWallRun writes (-0, -0, 1), which passes.
+pub(crate) fn upright(n: Vec3) -> bool {
+    ((((n.x * 0.0) + (n.y * 0.0)) - (n.z * 1.0)) as f64) <= -0.999
+}
 
 /// Per-tick movement context: CGameMovement + CMoveData of the specs.
 pub(crate) struct Ctx<'a> {
@@ -302,6 +353,11 @@ pub(crate) struct Ctx<'a> {
     /// mv+0x60 / mv+0x6c: flat view forward / right
     pub flat_f: Vec3,
     pub flat_r: Vec3,
+    /// AngleVectors(view angles): forward / right (mv+0xc), used for the wall basis
+    pub view_f: Vec3,
+    pub view_r: Vec3,
+    /// mv+0x10 view yaw, degrees
+    pub yaw: f32,
     /// mv+0x78 (= mv+0x84 = mv+0xb4 while upright): input direction, length <= 1
     pub wish: Vec3,
     /// mv+0xd4 GetMaxSpeed
@@ -369,6 +425,7 @@ pub fn simulate(p: &mut Player, input: &Input, dt: f32, col: &Collision) {
     let yr = input.yaw.to_radians();
     let flat_f = Vec3::new(yr.cos(), yr.sin(), 0.0);
     let flat_r = Vec3::new(yr.sin(), -yr.cos(), 0.0);
+    let view_f = forward_vec(input.yaw, input.pitch);
     let mut wish = flat_f * fwd + flat_r * side;
     if wish.length_squared() > 1.0 {
         wish = wish.normalize();
@@ -393,6 +450,9 @@ pub fn simulate(p: &mut Player, input: &Input, dt: f32, col: &Collision) {
         side,
         flat_f,
         flat_r,
+        view_f,
+        view_r: flat_r,
+        yaw: input.yaw,
         wish,
         max_speed: 0.0,
     };
@@ -424,7 +484,7 @@ fn player_move(c: &mut Ctx) {
     // step 16: ground maintenance (skipped while traversing)
     if mt0 == MoveType::Walk {
         if c.cv.sv_optimizedmovement {
-            let dv = UP.dot(c.p.vel);
+            let dv = c.p.surface_normal.dot(c.p.vel);
             if dv > 200.0 {
                 ground::set_ground(c, None);
             }
@@ -455,10 +515,20 @@ fn player_move(c: &mut Ctx) {
     // step 24: DecayStepSmooth
     ground::decay_step_smooth(c);
 
-    // post-think 0x140bfc660: last time on ground + the normal there (coyote grace)
+    // post-think 0x140bfc660: last time on ground + the normal there (coyote grace; a wall counts, and its
+    // normal makes the grace jump refuse)
     if c.gnd() {
         c.p.last_ground_time = c.now;
-        c.p.last_ground_normal = UP;
+        c.p.last_ground_normal = c.p.surface_normal;
+    }
+    // post-think 0x140bfca13: the verticalGainCutoff reference height follows the feet down, and snaps to them
+    // on walkable, upright ground (pl+0x67c0 launch-pad latch: no launch pads here)
+    let z = c.p.pos.z;
+    let w = &mut c.p.wall;
+    if w.ref_height > z {
+        w.ref_height = z;
+    } else if w.ref_height != z && c.p.ground && upright(c.p.surface_normal) && !(0.7 > c.p.ground_trace_normal.z) {
+        w.ref_height = z;
     }
 }
 

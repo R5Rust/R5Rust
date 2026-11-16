@@ -35,8 +35,9 @@ Everything saves to `r5rust_settings.toml` (gitignored). Defaults:
 | Settings menu | Esc (Resume / Quit in the menu) |
 
 Movement is Apex's own (ported from R5Regenis' disassembly specs + the game's pilot settings): walk 173.5, sprint 260,
-crouch 80, slide + boost, slide jump, bhop rules, tap strafe, step 22, mantle + superglide + **mantle boost**.
-See `docs/movement.md`; `cargo run --release -p shared --example movecheck` runs its 87 checks.
+crouch 80, slide + boost, slide jump, bhop rules, tap strafe, step 22, mantle + superglide + **mantle boost**,
+**wall climb** + jump off the wall.
+See `docs/movement.md`; `cargo run --release -p shared --example movecheck` runs its 107 checks.
 
 The window title shows fps, position and ground/air/FLY.
 
@@ -91,7 +92,7 @@ cubemaps in `cubemaps.dds`, the sky in `skycube.dds`. Compressed texture cache: 
 ## Status (2026-11-16)
 
 v1 works: load screen, Firing Range with baked lighting at ~340-600 fps on a 2080 Ti, fly with collision, and Apex's
-real movement (walk/sprint/crouch/slide/jump/air strafe/tap-strafe/step/mantle/mantle boost; ~50 us per tick, see
+real movement (walk/sprint/crouch/slide/jump/air strafe/tap-strafe/step/mantle/mantle boost/wall climb; ~50 us per tick, see
 `docs/movement.md`). See `HANDOFF.md` for what's next.
 
 Not done: dedicated server + netcode + prediction (v2), shadows on unlightmapped props (big rocks, some props),
