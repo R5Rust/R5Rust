@@ -4,7 +4,14 @@ From-scratch Rust engine that loads the Apex Legends **Firing Range** (`mp_rr_ca
 your own extracted assets, and lets you walk around it. Long-term goal: client `r5rust` + headless dedicated
 server `r5rust_ds`, like R5Flowstate's `r5apex.exe` / `r5apex_ds.exe`.
 
-## Run
+## Play (while code keeps changing)
+
+Double-click **`play.bat`** (or `.\play.ps1`). It runs your own copy in `play\current\`, so builds never
+fight with an open game. `tools\publish.ps1` builds and stages a new version in `play
+ext\`; the next time
+you launch `play.bat` it swaps in automatically and prints what it updated to. `play\` is gitignored.
+
+## Run (dev)
 
 ```powershell
 cargo run --release --bin r5rust
