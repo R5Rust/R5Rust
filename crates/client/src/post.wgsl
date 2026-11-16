@@ -18,6 +18,27 @@ struct Expo {
 };
 @group(0) @binding(4) var<storage, read> expo: Expo;
 @group(0) @binding(5) var bloom_tex: texture_2d<f32>;
+@group(0) @binding(6) var grading_lut: texture_3d<f32>;
+
+// SMPTE ST 2084 (PQ). input: luminance / 10000 nits
+fn pq_encode(y: vec3<f32>) -> vec3<f32> {
+    let m1 = 0.1593017578125;
+    let m2 = 78.84375;
+    let c1 = 0.8359375;
+    let c2 = 18.8515625;
+    let c3 = 18.6875;
+    let p = pow(max(y, vec3<f32>(0.0)), vec3<f32>(m1));
+    return pow((c1 + c2 * p) / (1.0 + c3 * p), vec3<f32>(m2));
+}
+fn pq_decode(e: vec3<f32>) -> vec3<f32> {
+    let m1 = 0.1593017578125;
+    let m2 = 78.84375;
+    let c1 = 0.8359375;
+    let c2 = 18.8515625;
+    let c3 = 18.6875;
+    let p = pow(max(e, vec3<f32>(0.0)), vec3<f32>(1.0 / m2));
+    return pow(max(p - c1, vec3<f32>(0.0)) / (c2 - c3 * p), vec3<f32>(1.0 / m1));
+}
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
@@ -74,5 +95,19 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     }
     // Apex composite: (scene + bloom) * exposure -> tonemap   (bloom added before exposure)
     let h = textureSampleLevel(hdr_tex, samp, i.uv, 0.0).rgb + textureSampleLevel(bloom_tex, samp, i.uv, 0.0).rgb * pp.bloom.x;
-    return out_color(aces(h * pp.params.z * max(expo.exposure, 1e-3)));
+    var c = h * pp.params.z * max(expo.exposure, 1e-3);
+    if (pp.bloom.y > 0.5) {
+        // HDR colour correction (EnginePost 0xB93D3531CBE5AD02): 1.0 scene = 100 nits, hue-preserving clamp at
+        // 10k nits, 33^3 LUT in PQ space, decoded back to scene units
+        let m = max(max(c.r, c.g), c.b);
+        let pq = pq_encode(c * 0.01 * min(1.0, 100.0 / max(m, 1e-6)));
+        let g = textureSampleLevel(grading_lut, samp, pq * (32.0 / 33.0) + 0.5 / 33.0, 0.0).rgb;
+        c = pq_decode(g) * 100.0;
+    }
+    // tonemap: Apex picks one of six at runtime (c_tonemapFunction); z = 0 ACES fit, 1 = function 0
+    if (pp.bloom.z > 0.5) {
+        let t = c * (10.0 * c + 0.3) / (c * (10.0 * c + 0.5) + 1.5);
+        return out_color(clamp(t, vec3<f32>(0.0), vec3<f32>(1.0)));
+    }
+    return out_color(aces(c));
 }

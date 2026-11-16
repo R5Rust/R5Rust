@@ -125,7 +125,9 @@ fn encode_level(img: &RgbaImage, kind: Kind) -> Vec<u8> {
 
 /// Loads `<root>/<rel>` as `kind`, from the cache if present, else decodes + encodes + caches it.
 pub fn load(root: &Path, cache: &Path, rel: &str, kind: Kind, cap: u32) -> Option<Encoded> {
-    let cp = cache_path(cache, rel, kind, cap);
+    // key includes the source's size + mtime, so a re-exported image is re-encoded
+    let stamp = std::fs::metadata(root.join(rel)).ok().map(|m| format!("{}:{:?}", m.len(), m.modified().ok())).unwrap_or_default();
+    let cp = cache_path(cache, &format!("{rel}|{stamp}"), kind, cap);
     if let Some(e) = read_cache(&cp, kind) {
         return Some(e);
     }

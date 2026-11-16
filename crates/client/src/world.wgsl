@@ -64,6 +64,14 @@ struct Mat {
     albedo_tint: vec4<f32>,
     emissive_tint: vec4<f32>,
     emissive_edge: vec4<f32>,  // exponent, inner, outer
+    blend: vec4<f32>,          // x 1 two-layer / 2 transparent overlay, y c_layerBlendRamp, z layer 0 world-planar, w has detail normal
+    uv1: vec4<f32>,            // c_uv1RotScaleX.xy, c_uv1RotScaleY.xy
+    uv_t: vec4<f32>,           // c_uv1Translate.xy, c_uv2Translate.xy
+    uv2: vec4<f32>,            // c_uv2RotScaleX.xy, c_uv2RotScaleY.xy
+    albedo2_tint: vec4<f32>,
+    layer2: vec4<f32>,         // x has gloss2, y has spec2, z perf gloss L0, w perf gloss L1
+    perf_spec: vec4<f32>,      // rgb L0 spec constant, w has spec texture
+    perf_spec2: vec4<f32>,
 };
 @group(1) @binding(0) var<uniform> mt: Mat;
 @group(1) @binding(1) var albedo_tex: texture_2d<f32>;
@@ -72,6 +80,31 @@ struct Mat {
 @group(1) @binding(4) var spec_tex: texture_2d<f32>;
 @group(1) @binding(5) var ao_tex: texture_2d<f32>;
 @group(1) @binding(6) var emis_tex: texture_2d<f32>;
+@group(1) @binding(7) var albedo2_tex: texture_2d<f32>;
+@group(1) @binding(8) var normal2_tex: texture_2d<f32>;
+@group(1) @binding(9) var gloss2_tex: texture_2d<f32>;
+@group(1) @binding(10) var spec2_tex: texture_2d<f32>;
+@group(1) @binding(11) var blend_tex: texture_2d<f32>;
+@group(1) @binding(12) var detail_n_tex: texture_2d<f32>;
+
+// tangent frame from screen derivatives of a UV set; N = normalize(T*x + B*y + Nvtx)
+fn tbn_normal(nv: vec3<f32>, rel: vec3<f32>, uv: vec2<f32>, n2: vec2<f32>) -> vec3<f32> {
+    let dp1 = dpdx(rel);
+    let dp2 = dpdy(rel);
+    let duv1 = dpdx(uv);
+    let duv2 = dpdy(uv);
+    let dp2p = cross(dp2, nv);
+    let dp1p = cross(nv, dp1);
+    var t = dp2p * duv1.x + dp1p * duv2.x;
+    var b = dp2p * duv1.y + dp1p * duv2.y;
+    let inv = inverseSqrt(max(max(dot(t, t), dot(b, b)), 1e-20));
+    return normalize(t * inv * n2.x + b * inv * n2.y + nv);
+}
+
+fn xform(p: vec2<f32>, rs: vec4<f32>, t: vec2<f32>) -> vec2<f32> {
+    let q = p + t;
+    return vec2<f32>(dot(q, rs.xy), dot(q, rs.zw));
+}
 
 struct VIn {
     @location(0) pos: vec3<f32>,
@@ -244,39 +277,53 @@ fn sky_term(n: vec3<f32>, sky_vec: vec3<f32>) -> f32 {
 
 @fragment
 fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    // ---- material (section 1)
-    let base = textureSample(albedo_tex, mat_samp, i.uv0);
+    // ---- material (section 1). Layer 0 goes through c_uv1 (world-planar for terrain blends: (x, -y)),
+    // layer 1 and the blend mask use the mesh UV (blend PS 0x15B60B41971F5517).
+    let wp0 = i.rel + fr.cam_pos.xyz;
+    let planar_base = vec2<f32>(wp0.x, -wp0.y);
+    let base_uv = select(i.uv0, planar_base, mt.blend.z > 0.5);
+    let uv_l0 = xform(base_uv, mt.uv1, mt.uv_t.xy);
+    let uv_d = xform(base_uv, mt.uv2, mt.uv_t.zw);
+    let base = textureSample(albedo_tex, mat_samp, uv_l0);
     var albedo = base.rgb * mt.color.rgb * mt.albedo_tint.rgb;
     var vtx = vec3<f32>(1.0);
     if (mt.params.w > 0.5) {
         vtx = pow(abs(i.col.rgb), vec3<f32>(2.2));
         albedo *= vtx;
     }
-    let n2 = textureSample(normal_tex, mat_samp, i.uv0).rg * 2.867661 - 1.439453;
-    let gloss = textureSample(gloss_tex, mat_samp, i.uv0).r;
-    let f0 = textureSample(spec_tex, mat_samp, i.uv0).rgb;
-    let ao_s = textureSample(ao_tex, mat_samp, i.uv0).r;
+    var n2 = textureSample(normal_tex, mat_samp, uv_l0).rg * 2.867661 - 1.439453;
+    let dn = textureSample(detail_n_tex, mat_samp, uv_d).rg * 2.867661 - 1.439453;
+    if (mt.blend.w > 0.5) { n2 += dn; }
+    var gloss = textureSample(gloss_tex, mat_samp, uv_l0).r;
+    var f0 = textureSample(spec_tex, mat_samp, uv_l0).rgb;
+    if (mt.blend.x > 0.5 && mt.perf_spec.w < 0.5) { f0 = mt.perf_spec.rgb; }
+    let ao_s = textureSample(ao_tex, mat_samp, uv_l0).r;
     let emis_t = textureSample(emis_tex, mat_samp, i.uv0).rgb;
+    let alb2 = textureSample(albedo2_tex, mat_samp, i.uv0).rgb;
+    let n2b = textureSample(normal2_tex, mat_samp, i.uv0).rg * 2.867661 - 1.439453;
+    let gloss2 = textureSample(gloss2_tex, mat_samp, i.uv0).r;
+    let spec2 = textureSample(spec2_tex, mat_samp, i.uv0).rgb;
+    let mask = textureSample(blend_tex, mat_samp, i.uv0).r;
+    let mask_l0 = textureSample(blend_tex, mat_samp, uv_l0).r;
     let lm0 = textureSample(lm0_tex, lm_samp, i.uv1);
     let lm1 = textureSample(lm1_tex, lm_samp, i.uv1);
     let vis_a = textureSample(rtl_vis, lm_samp, vec2<f32>(i.uv1.x, i.uv1.y * 0.5)).rg;
     let vis_b = textureSample(rtl_vis, lm_samp, vec2<f32>(i.uv1.x, i.uv1.y * 0.5 + 0.5)).rg;
 
-    // tangent frame from screen derivatives (the export has no tangents); N = normalize(T*x + B*y + Nvtx)
     var nv = normalize(i.nrm + vec3<f32>(0.0, 0.0, 1e-6));
     if (!front) { nv = -nv; }
-    let dp1 = dpdx(i.rel);
-    let dp2 = dpdy(i.rel);
-    let duv1 = dpdx(i.uv0);
-    let duv2 = dpdy(i.uv0);
-    let dp2p = cross(dp2, nv);
-    let dp1p = cross(nv, dp1);
-    var t = dp2p * duv1.x + dp1p * duv2.x;
-    var b = dp2p * duv1.y + dp1p * duv2.y;
-    let inv = inverseSqrt(max(max(dot(t, t), dot(b, b)), 1e-20));
-    t *= inv;
-    b *= inv;
-    let n = normalize(t * n2.x + b * n2.y + nv);
+    var n = tbn_normal(nv, i.rel, uv_l0, n2);
+    let n_l1 = tbn_normal(nv, i.rel, i.uv0, n2b);
+    if (mt.blend.x > 0.5 && mt.blend.x < 1.5) {
+        // blend = saturate(ramp * (mask - 1) + vertexAlpha * (ramp + 1)); every layer property lerps
+        let ramp = mt.blend.y;
+        let bl = clamp(ramp * (mask - 1.0) + i.col.a * (ramp + 1.0), 0.0, 1.0);
+        albedo = mix(albedo, alb2 * mt.albedo2_tint.rgb, bl);
+        n = normalize(mix(n, n_l1, bl));
+        let g2 = select(mt.layer2.w, gloss2, mt.layer2.x > 0.5);
+        gloss = mix(gloss, g2, bl);
+        f0 = mix(f0, select(mt.perf_spec2.rgb, spec2, mt.layer2.y > 0.5), bl);
+    }
 
     let r = max(1.0 - gloss, 0.04);
     var s: Surf;
@@ -373,12 +420,18 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
     if (dbg > 6.5 && dbg < 7.5) { c = env; }
 
     var a = base.a * mt.color.a;
+    if (mt.blend.x > 1.5) {
+        // transparent overlay (PS 0x937D8E4BC98DD7A9 / 0x954097DFD1711C57): opacity = (1 - blend) * albedo.a
+        let ramp = mt.blend.y;
+        a *= 1.0 - clamp(ramp * (mask_l0 - 1.0) + i.col.a * (ramp + 1.0), 0.0, 1.0);
+    }
     if (mt.params.z > 0.5 && mt.params.z < 1.5) {
         // alpha-tested: sharpen around the cutoff so alpha-to-coverage gives crisp, AA'd edges
         a = (a - mt.params.x) / max(fwidth(a), 1e-4) + 0.5;
     } else if (mt.params.z < 0.5) {
         a = 1.0;
     }
+    if (fr.misc.w > 7.5 && fr.misc.w < 8.5) { return vec4<f32>(vec3<f32>(a, i.col.a, mask_l0), 1.0); }
     return vec4<f32>(c, a);
 }
 

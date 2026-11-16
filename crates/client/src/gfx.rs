@@ -82,6 +82,13 @@ pub struct Gfx {
     pub csm: Csm,
     bloom: Bloom,
     pub bloom_amount: f32,
+    /// grading LUT in use (a dummy until a map provides one)
+    grading: wgpu::TextureView,
+    grading_on: bool,
+    /// grading off until it matches the real game (R5_GRADE=1 turns it on)
+    pub no_grading: bool,
+    /// 0 = ACES fit, 1 = Apex tonemap function 0 (env R5_TONEMAP)
+    pub tonemap: u32,
     expo_state: wgpu::Buffer,
     expo_params: wgpu::Buffer,
     expo_layout: wgpu::BindGroupLayout,
@@ -244,11 +251,26 @@ impl Gfx {
         });
         let mat_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("mat"),
-            entries: &[layout_entry(0, uniform_ty()), layout_entry(1, tex_ty()), layout_entry(2, tex_ty()), layout_entry(3, tex_ty()), layout_entry(4, tex_ty()), layout_entry(5, tex_ty()), layout_entry(6, tex_ty())],
+            entries: &[
+                layout_entry(0, uniform_ty()),
+                layout_entry(1, tex_ty()),
+                layout_entry(2, tex_ty()),
+                layout_entry(3, tex_ty()),
+                layout_entry(4, tex_ty()),
+                layout_entry(5, tex_ty()),
+                layout_entry(6, tex_ty()),
+                // two-layer blend materials: albedo2, normal2, gloss2, spec2, blend mask, detail normal
+                layout_entry(7, tex_ty()),
+                layout_entry(8, tex_ty()),
+                layout_entry(9, tex_ty()),
+                layout_entry(10, tex_ty()),
+                layout_entry(11, tex_ty()),
+                layout_entry(12, tex_ty()),
+            ],
         });
         let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("post"),
-            entries: &[layout_entry(0, uniform_ty()), layout_entry(1, tex_ty()), layout_entry(2, tex_ty()), layout_entry(3, samp_ty()), layout_entry(4, storage_ty()), layout_entry(5, tex_ty())],
+            entries: &[layout_entry(0, uniform_ty()), layout_entry(1, tex_ty()), layout_entry(2, tex_ty()), layout_entry(3, samp_ty()), layout_entry(4, storage_ty()), layout_entry(5, tex_ty()), layout_entry(6, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false })],
         });
 
         let world_sh = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("world"), source: wgpu::ShaderSource::Wgsl(include_str!("world.wgsl").into()) });
@@ -368,7 +390,19 @@ impl Gfx {
         let expo_bg = Self::make_expo_bg(&device, &expo_layout, &hdr_view, &expo_state, &expo_params);
         let mut bloom = Bloom::new(&device, cfg.bloom_cutoff, cfg.bloom_clamp);
         bloom.resize(&device, &queue, &hdr_view, &expo_state, width.max(1), height.max(1));
-        let post_bg = Self::make_post_bg(&device, &post_layout, &post_ub, &hdr_view, &load_view, &post_samp, &expo_state, &bloom.output);
+        let grading = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("no grading"),
+                size: wgpu::Extent3d { width: 2, height: 2, depth_or_array_layers: 2 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgb10a2Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+            .create_view(&Default::default());
+        let post_bg = Self::make_post_bg(&device, &post_layout, &post_ub, &hdr_view, &load_view, &post_samp, &expo_state, &bloom.output, &grading);
 
         Ok(Gfx {
             device,
@@ -400,6 +434,10 @@ impl Gfx {
             csm,
             bloom,
             bloom_amount: cfg.bloom_amount,
+            grading,
+            grading_on: false,
+            no_grading: std::env::var_os("R5_GRADE").is_none(),
+            tonemap: std::env::var("R5_TONEMAP").ok().and_then(|v| v.parse().ok()).unwrap_or(cfg.tonemap),
             expo_state,
             expo_params,
             expo_layout,
@@ -440,7 +478,7 @@ impl Gfx {
         v
     }
 
-    fn make_post_bg(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, ub: &wgpu::Buffer, hdr: &wgpu::TextureView, load: &wgpu::TextureView, samp: &wgpu::Sampler, expo: &wgpu::Buffer, bloom: &wgpu::TextureView) -> wgpu::BindGroup {
+    fn make_post_bg(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, ub: &wgpu::Buffer, hdr: &wgpu::TextureView, load: &wgpu::TextureView, samp: &wgpu::Sampler, expo: &wgpu::Buffer, bloom: &wgpu::TextureView, grading: &wgpu::TextureView) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("post"),
             layout,
@@ -451,6 +489,7 @@ impl Gfx {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(samp) },
                 wgpu::BindGroupEntry { binding: 4, resource: expo.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(bloom) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(grading) },
             ],
         })
     }
@@ -471,7 +510,7 @@ impl Gfx {
         self.hdr_view = hd;
         self.depth_view = d;
         self.bloom.resize(&self.device, &self.queue, &self.hdr_view, &self.expo_state, w, h);
-        self.post_bg = Self::make_post_bg(&self.device, &self.post_layout, &self.post_ub, &self.hdr_view, &self.load_view, &self.post_samp, &self.expo_state, &self.bloom.output);
+        self.post_bg = Self::make_post_bg(&self.device, &self.post_layout, &self.post_ub, &self.hdr_view, &self.load_view, &self.post_samp, &self.expo_state, &self.bloom.output, &self.grading);
         self.expo_bg = Self::make_expo_bg(&self.device, &self.expo_layout, &self.hdr_view, &self.expo_state, &self.expo_params);
     }
 
@@ -498,6 +537,11 @@ impl Gfx {
             ],
         }));
         self.csm.invalidate();
+        if let Some(g) = &world.grading {
+            self.grading = g.clone();
+            self.grading_on = true;
+            self.post_bg = Self::make_post_bg(&self.device, &self.post_layout, &self.post_ub, &self.hdr_view, &self.load_view, &self.post_samp, &self.expo_state, &self.bloom.output, &self.grading);
+        }
     }
 
     /// Per-frame work before drawing: re-renders the shadow cascades the camera has moved away from.
@@ -565,7 +609,7 @@ impl Gfx {
             let cam = Vec3::new(fu.cam_pos[0], fu.cam_pos[1], fu.cam_pos[2]);
             let mut drawn = 0;
             for d in &w.draws {
-                if !visible(&planes, Vec3::from(d.min) - cam, Vec3::from(d.max) - cam) || (d.key == 6 && std::env::var_os("R5_NOSKYMAT").is_some()) {
+                if !visible(&planes, Vec3::from(d.min) - cam, Vec3::from(d.max) - cam) || (d.key == 6 && std::env::var_os("R5_NOSKYMAT").is_some()) || (d.key / 2 == 2 && std::env::var_os("R5_NOBLEND").is_some()) {
                     continue;
                 }
                 drawn += 1;
@@ -600,7 +644,7 @@ impl Gfx {
         let pu = PostUniform {
             params: [mode, progress, self.exposure, if self.out_srgb { 1.0 } else { 0.0 }],
             screen: [self.width as f32, self.height as f32, self.load_size.0 as f32, self.load_size.1 as f32],
-            bloom: [self.bloom_amount, 0.0, 0.0, 0.0],
+            bloom: [self.bloom_amount, if self.grading_on && !self.no_grading { 1.0 } else { 0.0 }, self.tonemap as f32, 0.0],
         };
         self.queue.write_buffer(&self.post_ub, 0, bytemuck::bytes_of(&pu));
         {

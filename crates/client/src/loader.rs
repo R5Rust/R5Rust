@@ -82,6 +82,8 @@ pub struct LoadedWorld {
     /// the sky material's cube texture (Firing Range: projected 'fake sky')
     pub sky_cube: wgpu::TextureView,
     pub fog: crate::fog::Fog,
+    /// HDR colour-grading LUT (33^3, PQ in/out) from the map's color_correction entity
+    pub grading: Option<wgpu::TextureView>,
     pub collision: Collision,
     pub meta: Meta,
     pub stats: String,
@@ -111,9 +113,38 @@ struct MatUniform {
     emissive_tint: [f32; 4],
     /// c_emissiveEdgeFade exponent, inner, outer
     emissive_edge: [f32; 4],
+    /// x = two-layer blend, y = c_layerBlendRamp, z = layer 0 world-planar mapped, w = has detail normal
+    blend: [f32; 4],
+    /// c_uv1RotScaleX.xy, c_uv1RotScaleY.xy
+    uv1: [f32; 4],
+    /// c_uv1Translate.xy, c_uv2Translate.xy
+    uv_t: [f32; 4],
+    /// c_uv2RotScaleX.xy, c_uv2RotScaleY.xy
+    uv2: [f32; 4],
+    /// layer 1 albedo tint (rgb)
+    albedo2_tint: [f32; 4],
+    /// x = has gloss2, y = has spec2, z = perf gloss L0, w = perf gloss L1
+    layer2: [f32; 4],
+    /// perf spec colour L0 (rgb), w = has spec texture
+    perf_spec: [f32; 4],
+    /// perf spec colour L1 (rgb)
+    perf_spec2: [f32; 4],
 }
 
-const TEX_SLOTS: [(&str, Kind); 6] = [("albedo", Kind::Albedo), ("normal", Kind::Normal), ("gloss", Kind::Gloss), ("spec", Kind::Spec), ("ao", Kind::Ao), ("emissive", Kind::Emissive)];
+const TEX_SLOTS: [(&str, Kind); 12] = [
+    ("albedo", Kind::Albedo),
+    ("normal", Kind::Normal),
+    ("gloss", Kind::Gloss),
+    ("spec", Kind::Spec),
+    ("ao", Kind::Ao),
+    ("emissive", Kind::Emissive),
+    ("albedo2", Kind::Albedo),
+    ("normal2", Kind::Normal),
+    ("gloss2", Kind::Gloss),
+    ("spec2", Kind::Spec),
+    ("blend", Kind::Gloss),
+    ("detail_normal", Kind::Normal),
+];
 
 /// Six faces `<leaf>_albedoTexture_000..005.png` (D3D face order) of the sky material, as one cube texture.
 fn load_sky_cube(device: &wgpu::Device, queue: &wgpu::Queue, root: &std::path::Path, map_dir: &std::path::Path, sky_mat: Option<&str>) -> wgpu::TextureView {
@@ -159,6 +190,43 @@ fn load_sky_cube(device: &wgpu::Device, queue: &wgpu::Queue, root: &std::path::P
         }
     }
     tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::Cube), ..Default::default() })
+}
+
+/// The map's color_correction `.raw_hdr` (4-byte header + 33^3 R10G10B10A2 texels, red fastest, PQ-encoded),
+/// looked up by file name next to the map.
+fn load_grading(device: &wgpu::Device, queue: &wgpu::Queue, map_dir: &std::path::Path, bsp_dir: &std::path::Path) -> Option<wgpu::TextureView> {
+    let mut text = String::new();
+    for e in std::fs::read_dir(bsp_dir).ok()?.flatten() {
+        if e.path().extension().map(|x| x == "ent").unwrap_or(false) {
+            text.push_str(&String::from_utf8_lossy(&std::fs::read(e.path()).unwrap_or_default()));
+        }
+    }
+    let kv = crate::fog::parse_ent(&text, "color_correction")?;
+    let file = kv.get("filename")?.rsplit('/').next()?.to_string();
+    let b = std::fs::read(map_dir.join(&file)).map_err(|e| log::warn!("grading {file}: {e}")).ok()?;
+    const N: u32 = 33;
+    if b.len() != 4 + (N * N * N * 4) as usize {
+        log::warn!("grading {file}: unexpected size {}", b.len());
+        return None;
+    }
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("grading lut"),
+        size: wgpu::Extent3d { width: N, height: N, depth_or_array_layers: N },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgb10a2Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        &b[4..],
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(N * 4), rows_per_image: Some(N) },
+        wgpu::Extent3d { width: N, height: N, depth_or_array_layers: N },
+    );
+    log::info!("grading: {file} (33^3 HDR LUT)");
+    Some(tex.create_view(&Default::default()))
 }
 
 fn tint(v: &serde_json::Value) -> [f32; 4] {
@@ -274,7 +342,7 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     for m in &world.materials {
         let e = &mats_json[&m.name];
         for (k, kind) in TEX_SLOTS {
-            if kind == Kind::Albedo && m.alpha_mode != 0 {
+            if kind == Kind::Albedo && m.alpha_mode != 0 && !(m.alpha_mode == 2 && e["blend"].is_string()) {
                 continue; // cut-out / blended surfaces keep the glb albedo, which carries their alpha
             }
             if let Some(rel) = e[k].as_str() {
@@ -329,7 +397,7 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
         .map(|m| {
             let e = &mats_json[&m.name];
             let get = |k: &str, kind: Kind| e[k].as_str().and_then(|r| mat_tex.get(&(r.to_string(), kind as u8)));
-            let albedo = if m.alpha_mode == 0 { get("albedo", Kind::Albedo) } else { None }.or_else(|| m.base_tex.and_then(|t| views.get(&t))).unwrap_or(&white);
+            let albedo = if m.alpha_mode == 0 || (m.alpha_mode == 2 && e["blend"].is_string()) { get("albedo", Kind::Albedo) } else { None }.or_else(|| m.base_tex.and_then(|t| views.get(&t))).unwrap_or(&white);
             let normal = get("normal", Kind::Normal).unwrap_or(&flat_n);
             let gloss = get("gloss", Kind::Gloss).unwrap_or(&def_gloss);
             let spec = get("spec", Kind::Spec).unwrap_or(&def_spec);
@@ -337,6 +405,25 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
             // two-layer blend materials use vertex alpha as the blend factor, not the RGB as a tint
             let is_blend = e["all"].get("layerBlendTexture").is_some() || e["all"].get("bm").is_some();
             let emis = get("emissive", Kind::Emissive);
+            let albedo2 = get("albedo2", Kind::Albedo);
+            let normal2 = get("normal2", Kind::Normal);
+            let gloss2 = get("gloss2", Kind::Gloss);
+            let spec2 = get("spec2", Kind::Spec);
+            let mask = get("blend", Kind::Gloss);
+            let detail_n = get("detail_normal", Kind::Normal);
+            let f2 = |k: &str, d: [f32; 2]| -> [f32; 2] {
+                let a = e[k].as_array();
+                let c = |i: usize| a.and_then(|a| a.get(i)).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(d[i]);
+                [c(0), c(1)]
+            };
+            let f1 = |k: &str, d: f32| e[k].as_f64().map(|x| x as f32).unwrap_or(d);
+            let (rx, ry, t1) = (f2("uv1RotScaleX", [1.0, 0.0]), f2("uv1RotScaleY", [0.0, 1.0]), f2("uv1Translate", [0.0, 0.0]));
+            let (rx2, ry2, t2) = (f2("uv2RotScaleX", [1.0, 0.0]), f2("uv2RotScaleY", [0.0, 1.0]), f2("uv2Translate", [0.0, 0.0]));
+            let two_layer = albedo2.is_some();
+            // blended "transparent" overlays (e.g. sand over the range floor): opacity = (1 - blend) * albedo alpha
+            let overlay = !two_layer && m.alpha_mode == 2 && mask.is_some();
+            // a tiny layer-0 UV scale means the shader maps layer 0 from world position (terrain-style)
+            let planar = (two_layer || overlay) && (rx[0].abs() + rx[1].abs()) < 0.05;
             let u = MatUniform {
                 color: m.base_color,
                 params: [m.alpha_cutoff, if m.lightmapped { 1.0 } else { 0.0 }, m.alpha_mode as f32, if m.name.starts_with("world/") && !is_blend { 1.0 } else { 0.0 }],
@@ -348,6 +435,14 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
                     let c = |i: usize, d: f32| a.and_then(|a| a.get(i)).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(d);
                     [c(0, 0.0), c(1, 1.0), c(2, 1.0), 0.0]
                 },
+                blend: [if overlay { 2.0 } else { two_layer as u32 as f32 }, f1("blend_ramp", 0.0), planar as u32 as f32, detail_n.is_some() as u32 as f32],
+                uv1: [rx[0], rx[1], ry[0], ry[1]],
+                uv_t: [t1[0], t1[1], t2[0], t2[1]],
+                uv2: [rx2[0], rx2[1], ry2[0], ry2[1]],
+                albedo2_tint: tint(&e["albedo2_tint"]),
+                layer2: [gloss2.is_some() as u32 as f32, spec2.is_some() as u32 as f32, f1("perf_gloss", 0.25), f1("perf_gloss2", 0.25)],
+                perf_spec: { let t = tint(&e["perf_spec"]); [t[0], t[1], t[2], (!std::ptr::eq(spec, &def_spec)) as u32 as f32] },
+                perf_spec2: tint(&e["perf_spec2"]),
             };
             let ub = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mat"), contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM });
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -361,6 +456,12 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
                     tv(4, spec),
                     tv(5, ao.unwrap_or(&one)),
                     tv(6, emis.unwrap_or(&black)),
+                    tv(7, albedo2.unwrap_or(&white)),
+                    tv(8, normal2.unwrap_or(&flat_n)),
+                    tv(9, gloss2.unwrap_or(&def_gloss)),
+                    tv(10, spec2.unwrap_or(&def_spec)),
+                    tv(11, mask.unwrap_or(&one)),
+                    tv(12, detail_n.unwrap_or(&flat_n)),
                 ],
             })
         })
@@ -390,6 +491,7 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     );
     log::info!("{stats}");
     let fog = crate::fog::Fog::from_map(&cfg.bsp_dir(), light.sun_dir);
-    Ok(LoadedWorld { vbuf, ibuf, draws, mat_groups, probe_vbuf, light, sky_cube, fog, collision, meta, stats })
+    let grading = load_grading(device, queue, &cfg.map_dir(), &cfg.bsp_dir());
+    Ok(LoadedWorld { vbuf, ibuf, draws, mat_groups, probe_vbuf, light, sky_cube, fog, grading, collision, meta, stats })
 }
 

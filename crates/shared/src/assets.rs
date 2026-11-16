@@ -31,6 +31,8 @@ pub struct Config {
     pub bloom_cutoff: f32,
     /// cap on exposed luminance that blooms (c_bloomClamp)
     pub bloom_clamp: f32,
+    /// 0 = ACES fit, 1 = Apex tonemap function 0
+    pub tonemap: u32,
 }
 
 /// Apex-style auto exposure (mat_autoexposure_*): dead band on the centre-spot mean luminance.
@@ -77,6 +79,7 @@ impl Default for Config {
             bloom_amount: 0.12,
             bloom_cutoff: 1.0,
             bloom_clamp: 20.0,
+            tonemap: 0,
         }
     }
 }

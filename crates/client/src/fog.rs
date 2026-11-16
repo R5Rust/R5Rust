@@ -16,7 +16,7 @@ fn srgb(c: f32) -> f32 {
     if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
 }
 
-fn parse_ent(text: &str, class: &str) -> Option<std::collections::HashMap<String, String>> {
+pub fn parse_ent(text: &str, class: &str) -> Option<std::collections::HashMap<String, String>> {
     for blk in text.split('{').skip(1) {
         let blk = blk.split('}').next().unwrap_or("");
         let mut kv = std::collections::HashMap::new();
