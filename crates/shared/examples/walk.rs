@@ -1,10 +1,9 @@
 //! walk forward from spawn with the real sim; report where it stops and what pushes back.
 use glam::Vec3;
-use shared::{assets::Config, collision::Collision, glb, sim};
+use shared::{assets::Config, collmesh, sim};
 fn main() {
-    let w = glb::load_world(&Config::load().world_glb(), glb::Mode::Geometry, true).unwrap();
-    let idx: Vec<u32> = w.draws.iter().filter(|d| w.materials[d.material as usize].solid()).flat_map(|d| w.indices[d.first_index as usize..(d.first_index + d.index_count) as usize].iter().copied()).collect();
-    let col = Collision::build(w.positions.clone(), &idx);
+    let (col, src) = collmesh::build_player_collision(&Config::load()).unwrap();
+    println!("collision: {src:?}, {} triangles", col.tri_count());
     let mut p = sim::Player::new(sim::find_free(&col, Vec3::new(-11740.0, 512.0, 1584.0)));
     let idle = sim::Input::default();
     for _ in 0..30 { sim::simulate(&mut p, &idle, 1.0 / 60.0, &col); }

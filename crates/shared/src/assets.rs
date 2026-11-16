@@ -130,6 +130,10 @@ impl Config {
     pub fn meta_json(&self) -> PathBuf {
         self.map_dir().join("meta.json")
     }
+    /// The game's own collision, decoded by tools/export-map (see docs/collision.md).
+    pub fn collision_bin(&self) -> PathBuf {
+        self.map_dir().join("collision.bin")
+    }
 
     /// First PNG in images/ui/maps_<map>_loadscreen/ (the owner's extracted loading screen).
     pub fn loadscreen(&self) -> Option<PathBuf> {

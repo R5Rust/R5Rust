@@ -1,13 +1,19 @@
 //! floor heights along a line: cargo run --example floor -- x0,y,z x1 step
+//! Uses collision.bin when present; RENDER=1 forces world.glb's render triangles.
 use glam::Vec3;
-use shared::{assets::Config, collision::Collision, glb};
+use shared::{assets::Config, collision::Collision, collmesh, glb};
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let p: Vec<f32> = a[0].split(',').map(|v| v.parse().unwrap()).collect();
     let (x1, step): (f32, f32) = (a[1].parse().unwrap(), a[2].parse().unwrap());
-    let w = glb::load_world(&Config::load().world_glb(), glb::Mode::Geometry, true).unwrap();
-    let idx: Vec<u32> = w.draws.iter().filter(|d| w.materials[d.material as usize].solid()).flat_map(|d| w.indices[d.first_index as usize..(d.first_index + d.index_count) as usize].iter().copied()).collect();
-    let col = Collision::build(w.positions.clone(), &idx);
+    let col = if std::env::var_os("RENDER").is_some() {
+        let w = glb::load_world(&Config::load().world_glb(), glb::Mode::Geometry, true).unwrap();
+        Collision::build(w.positions.clone(), &collmesh::render_indices(&w))
+    } else {
+        let (col, src) = collmesh::build_player_collision(&Config::load()).unwrap();
+        println!("collision: {src:?}, {} triangles", col.tri_count());
+        col
+    };
     let mut x = p[0];
     while x <= x1 {
         let o = Vec3::new(x, p[1], p[2] + 60.0);
