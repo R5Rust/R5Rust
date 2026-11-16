@@ -299,6 +299,87 @@ impl Collision {
         c
     }
 
+    /// Sweeps the capsule (feet at `pos`) straight down by up to `dist`. Returns the distance travelled
+    /// before touching geometry (can be slightly negative = already resting a hair inside) and the contact normal.
+    /// Only the bottom sphere can lead a vertical sweep, so that's all that is tested.
+    pub fn sweep_down(&self, pos: Vec3, dist: f32) -> Option<(f32, Vec3)> {
+        const TOL: f32 = 0.5;
+        let c = pos + Vec3::new(0.0, 0.0, RADIUS);
+        let r = RADIUS;
+        let mut cand = Vec::with_capacity(32);
+        self.query_aabb(Vec3::new(c.x - r, c.y - r, c.z - r - dist - 1.0), Vec3::new(c.x + r, c.y + r, c.z + 1.0), &mut cand);
+        let mut best: Option<(f32, Vec3)> = None;
+        let mut take = |t: f32, n: Vec3| {
+            if t >= -TOL && t <= dist && best.is_none_or(|(bt, _)| t < bt) {
+                best = Some((t, n));
+            }
+        };
+        for [p0, p1, p2] in cand {
+            let nn = (p1 - p0).cross(p2 - p0);
+            let nl = nn.length();
+            if nl < 1e-6 {
+                continue;
+            }
+            let n_wind = nn / nl;
+            let n = if n_wind.z < 0.0 { -n_wind } else { n_wind };
+            // face
+            if n.z > 1e-4 {
+                let t = ((c - p0).dot(n) - r) / n.z;
+                let hit = c - Vec3::Z * t - n * r;
+                if in_tri(hit, p0, p1, p2, n_wind) {
+                    take(t, n);
+                }
+            }
+            // edges
+            for (e0, e1) in [(p0, p1), (p1, p2), (p2, p0)] {
+                let el = (e1 - e0).length();
+                if el < 1e-6 {
+                    continue;
+                }
+                let u = (e1 - e0) / el;
+                let w0 = c - e0;
+                let a = w0 - u * u.dot(w0);
+                let b = Vec3::Z - u * u.z;
+                let bb = b.dot(b);
+                if bb < 1e-8 {
+                    continue;
+                }
+                let ab = a.dot(b);
+                let disc = ab * ab - bb * (a.dot(a) - r * r);
+                if disc < 0.0 {
+                    continue;
+                }
+                let t = (ab - disc.sqrt()) / bb;
+                let pt = c - Vec3::Z * t;
+                let s = u.dot(pt - e0);
+                if s >= 0.0 && s <= el {
+                    let perp = (pt - e0) - u * s;
+                    take(t, perp / r);
+                }
+            }
+            // vertices
+            for v in [p0, p1, p2] {
+                let h2 = r * r - (c.x - v.x).powi(2) - (c.y - v.y).powi(2);
+                if h2 >= 0.0 {
+                    let t = (c.z - v.z) - h2.sqrt();
+                    take(t, (c - Vec3::Z * t - v) / r);
+                }
+            }
+        }
+        best
+    }
+
+    /// Debug: every triangle the capsule at `pos` overlaps, with its push-out vector.
+    pub fn contacts(&self, pos: Vec3) -> Vec<([Vec3; 3], Vec3)> {
+        let lo = Vec3::new(pos.x - RADIUS - 6.0, pos.y - RADIUS - 6.0, pos.z - 6.0);
+        let hi = Vec3::new(pos.x + RADIUS + 6.0, pos.y + RADIUS + 6.0, pos.z + RADIUS * 2.0 + AXIS_LEN + 6.0);
+        let mut cand = Vec::new();
+        self.query_aabb(lo, hi, &mut cand);
+        let a = pos + Vec3::new(0.0, 0.0, RADIUS);
+        let b = a + Vec3::new(0.0, 0.0, AXIS_LEN);
+        cand.into_iter().filter_map(|t| capsule_tri(a, b, RADIUS, &t).map(|p| (t, p))).collect()
+    }
+
     /// True if the capsule at `pos` is not overlapping any triangle.
     pub fn is_free(&self, pos: Vec3) -> bool {
         let mut p = pos;

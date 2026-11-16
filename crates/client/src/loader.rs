@@ -154,7 +154,7 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     let mut col_idx: Vec<u32> = Vec::new();
     for d in &world.draws {
         let m = &world.materials[d.material as usize];
-        if m.alpha_mode != 2 {
+        if m.solid() {
             col_idx.extend_from_slice(&world.indices[d.first_index as usize..(d.first_index + d.index_count) as usize]);
         }
     }

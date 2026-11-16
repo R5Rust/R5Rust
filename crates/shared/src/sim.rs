@@ -1,7 +1,7 @@
 //! Deterministic player movement (Source units = inches, Z up). Same code will run on the client
 //! (prediction) and the dedicated server (authority) once netcode lands in v2.
 
-use crate::collision::{Collision, AXIS_LEN, RADIUS};
+use crate::collision::{Collision, AXIS_LEN, RADIUS, WALKABLE_Z};
 use glam::Vec3;
 
 pub const WALK_SPEED: f32 = 190.0;
@@ -14,6 +14,8 @@ pub const FRICTION: f32 = 6.0;
 pub const STOP_SPEED: f32 = 100.0;
 /// Max height snapped down onto when walking off a step / down a slope.
 pub const STEP_DOWN: f32 = 20.0;
+/// Max ledge height walked up without jumping (Source/Apex: 18).
+pub const STEP_UP: f32 = 18.0;
 pub const EYE_HEIGHT: f32 = 60.0;
 pub const PLAYER_HEIGHT: f32 = RADIUS * 2.0 + AXIS_LEN;
 
@@ -139,24 +141,70 @@ pub fn simulate(p: &mut Player, input: &Input, dt: f32, col: &Collision) {
         p.vel.z -= GRAVITY * dt;
     }
 
-    let was_ground = p.on_ground;
-    let delta = p.vel * dt;
-    let c = col.move_capsule(&mut p.pos, delta, &mut p.vel);
-    p.on_ground = c.ground && p.vel.z <= 1.0;
-
-    // stick to the floor when walking down slopes / off small steps
-    if !p.on_ground && was_ground && p.vel.z <= 0.0 {
-        let save = p.pos;
-        let mut v = p.vel;
-        let c2 = col.move_capsule(&mut p.pos, Vec3::new(0.0, 0.0, -STEP_DOWN), &mut v);
-        if c2.ground {
-            p.on_ground = true;
-            p.vel.z = 0.0;
-        } else {
-            p.pos = save;
+    if p.on_ground {
+        ground_move(p, dt, col);
+    } else {
+        col.move_capsule(&mut p.pos, p.vel * dt, &mut p.vel);
+        // landed? (only when not moving up)
+        if p.vel.z <= 0.0 {
+            if let Some((t, n)) = col.sweep_down(p.pos + Vec3::new(0.0, 0.0, 2.0), 3.0) {
+                if n.z > WALKABLE_Z {
+                    p.pos.z += 2.0 - t;
+                    p.vel.z = 0.0;
+                    p.on_ground = true;
+                }
+            }
         }
     }
-    if p.on_ground {
-        p.vel.z = 0.0;
+}
+
+fn horiz(a: Vec3, b: Vec3) -> f32 {
+    Vec3::new(b.x - a.x, b.y - a.y, 0.0).length()
+}
+
+/// Walking: plain slide vs. step up STEP_UP / slide / step down, whichever gets further
+/// (Quake/Source StepMove), then stick to the floor within STEP_DOWN or start falling.
+fn ground_move(p: &mut Player, dt: f32, col: &Collision) {
+    let start = p.pos;
+    let delta = Vec3::new(p.vel.x, p.vel.y, 0.0) * dt;
+
+    let mut pa = start;
+    let mut va = p.vel;
+    col.move_capsule(&mut pa, delta, &mut va);
+
+    let mut pb = start;
+    let mut vb = p.vel;
+    let mut tmp = Vec3::ZERO;
+    col.move_capsule(&mut pb, Vec3::new(0.0, 0.0, STEP_UP), &mut tmp);
+    let raised = pb.z - start.z;
+    col.move_capsule(&mut pb, delta, &mut vb);
+    let landed = col.sweep_down(pb, raised + STEP_DOWN).filter(|(_, n)| n.z > WALKABLE_Z);
+    let use_b = match landed {
+        Some((t, _)) => {
+            pb.z -= t;
+            pb.z > start.z + 0.5 && horiz(start, pb) > horiz(start, pa) + 0.05
+        }
+        None => false,
+    };
+    if use_b {
+        p.pos = pb;
+        p.vel.x = vb.x;
+        p.vel.y = vb.y;
+    } else {
+        p.pos = pa;
+        p.vel.x = va.x;
+        p.vel.y = va.y;
+    }
+    p.vel.z = 0.0;
+
+    // stay glued to the floor (ramps, small drops); otherwise we walked off a ledge
+    // probe starts a few units up: wall push-outs can leave the feet a hair inside the floor
+    const LIFT: f32 = 4.0;
+    match col.sweep_down(p.pos + Vec3::new(0.0, 0.0, LIFT), STEP_DOWN + LIFT) {
+        Some((t, n)) if n.z > WALKABLE_Z => {
+            p.pos.z += LIFT - t;
+            p.on_ground = true;
+        }
+        _ => p.on_ground = false,
     }
 }

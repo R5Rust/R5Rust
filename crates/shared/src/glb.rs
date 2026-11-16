@@ -19,6 +19,7 @@ pub enum Mode {
 
 #[derive(Clone, Debug, Default)]
 pub struct Material {
+    pub name: String,
     pub base_color: [f32; 4],
     pub base_tex: Option<u32>,
     pub normal_tex: Option<u32>,
@@ -27,6 +28,19 @@ pub struct Material {
     pub alpha_cutoff: f32,
     pub double_sided: bool,
     pub lightmapped: bool,
+}
+
+impl Material {
+    /// Does this surface block the player? Grass, leaves, bushes, wires, cables and decals don't
+    /// (tree trunks, stumps and logs do). Blended (glass/fx) surfaces never do.
+    pub fn solid(&self) -> bool {
+        if self.alpha_mode == 2 {
+            return false;
+        }
+        let n = self.name.to_ascii_lowercase();
+        const SOFT: [&str; 14] = ["grass", "leaves", "leaf", "branch", "bush", "plant_", "fern", "roots_small", "wire", "cable", "hose", "decal", "vine", "lens"];
+        !SOFT.iter().any(|k| n.contains(k))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -216,6 +230,7 @@ fn parse_materials(j: &Value) -> Vec<Material> {
             _ => 0,
         };
         out.push(Material {
+            name: m["name"].as_str().unwrap_or("").to_string(),
             base_color: [bc[0], bc[1], bc[2], bc.get(3).copied().unwrap_or(1.0)],
             base_tex: tex_img(&pbr["baseColorTexture"]),
             normal_tex: tex_img(&m["normalTexture"]),
