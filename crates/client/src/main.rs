@@ -1,10 +1,11 @@
 //! r5rust client (v1: single program, no server yet).
-//! Loading screen -> Firing Range at the real spawn -> walk / sprint / jump / fly (V) with collision.
+//! Loading screen -> Firing Range at the real spawn -> Apex movement (walk / sprint / crouch / slide / jump / mantle), fly (V).
 //!
 //! Screenshot mode (no window, renders offscreen and exits):
 //!   r5rust --screenshot out.png [--frames 120] [--loadshot load.png] [--pos x,y,z] [--yaw d] [--pitch d]
 //!          [--hold w,shift,space] [--fly]
 
+mod binds;
 mod bloom;
 mod csm;
 mod dds;
@@ -13,8 +14,11 @@ mod lighting;
 mod texcache;
 mod gfx;
 mod loader;
+mod menu;
 
+use binds::{Action, Bind, Binds, InputState, UserSettings};
 use gfx::{Camera, Gfx};
+use menu::Menu;
 use glam::Vec3;
 use loader::{LoadedWorld, Progress};
 use shared::assets::Config;
@@ -48,6 +52,7 @@ struct Args {
     debug: f32,
     fov: Option<f32>,
     exposure: Option<f32>,
+    menu: bool,
 }
 
 fn parse_args() -> Args {
@@ -76,6 +81,7 @@ fn parse_args() -> Args {
             "--debug" => a.debug = next(&mut i).parse().unwrap_or(0.0),
             "--fov" => a.fov = next(&mut i).parse().ok(),
             "--exposure" => a.exposure = next(&mut i).parse().ok(),
+            "--menu" => a.menu = true,
             other => log::warn!("unknown arg {other}"),
         }
         i += 1;
@@ -116,24 +122,23 @@ fn spawn(world: &LoadedWorld, args: &Args) -> (Player, f32, f32) {
     (p, args.yaw.unwrap_or(s[3]), args.pitch.unwrap_or(0.0))
 }
 
-fn input_from(keys: &HashSet<String>, yaw: f32, pitch: f32) -> Input {
+/// `keys` = held keys plus any key pressed since the last tick (a tap shorter than a tick still counts once).
+fn input_from(keys: &HashSet<String>, jump_pressed: bool, yaw: f32, pitch: f32) -> Input {
     let k = |n: &str| keys.contains(n);
     let ax = |p: &str, n: &str| (k(p) as i32 - k(n) as i32) as f32;
-    Input { forward: ax("w", "s"), right: ax("d", "a"), jump: k("space"), sprint: k("shift"), down: k("ctrl"), yaw, pitch }
+    Input {
+        forward: ax("w", "s"),
+        right: ax("d", "a"),
+        jump: k("space"),
+        jump_pressed,
+        sprint: k("shift"),
+        crouch: k("ctrl"),
+        down: k("ctrl"),
+        yaw,
+        pitch,
+    }
 }
 
-fn key_name(code: KeyCode) -> Option<&'static str> {
-    Some(match code {
-        KeyCode::KeyW => "w",
-        KeyCode::KeyA => "a",
-        KeyCode::KeyS => "s",
-        KeyCode::KeyD => "d",
-        KeyCode::Space => "space",
-        KeyCode::ShiftLeft | KeyCode::ShiftRight => "shift",
-        KeyCode::ControlLeft | KeyCode::ControlRight | KeyCode::KeyC => "ctrl",
-        _ => return None,
-    })
-}
 
 // ---------------------------------------------------------------- screenshot mode
 
@@ -156,12 +161,12 @@ fn run_headless(cfg: Config, args: Args) -> Result<(), String> {
     let keys: HashSet<String> = args.hold.iter().cloned().collect();
     // settle onto the floor for 30 ticks, then hold the keys for --frames ticks
     for _ in 0..30 {
-        sim::simulate(&mut player, &input_from(&HashSet::new(), yaw, pitch), TICK, &world.collision);
+        sim::simulate(&mut player, &input_from(&HashSet::new(), false, yaw, pitch), TICK, &world.collision);
     }
     let start = player.pos;
     let mut max_z = start.z;
     for _ in 0..args.frames {
-        sim::simulate(&mut player, &input_from(&keys, yaw, pitch), TICK, &world.collision);
+        sim::simulate(&mut player, &input_from(&keys, false, yaw, pitch), TICK, &world.collision);
         max_z = max_z.max(player.pos.z);
     }
     println!("peak height above start: {:.0}u", max_z - start.z);
@@ -184,7 +189,12 @@ fn run_headless(cfg: Config, args: Args) -> Result<(), String> {
     }
     let ms = tg.elapsed().as_secs_f64() * 1000.0 / n as f64;
     let path = args.screenshot.clone().unwrap();
-    gfx.screenshot(&path, Some((&world, &fu)), 1.0)?;
+    if args.menu {
+        let mut m = Menu::new_headless(&gfx.device, gfx.out_format(), UserSettings::load(cfg.sensitivity, cfg.fov));
+        gfx.screenshot_with(&path, Some((&world, &fu)), 1.0, |dev, q, view, size| m.draw_headless(dev, q, view, size))?;
+    } else {
+        gfx.screenshot(&path, Some((&world, &fu)), 1.0)?;
+    }
     println!("{}", world.stats);
     println!("chunks drawn: {} of {}", gfx.drawn.get(), world.draws.len());
     let (e, avg) = gfx.read_exposure();
@@ -217,7 +227,10 @@ struct App {
     progress: Arc<Progress>,
     rx: Option<Receiver<Result<LoadedWorld, String>>>,
     game: Option<Game>,
-    keys: HashSet<String>,
+    /// physical input state, read through the rebindable actions in the settings menu
+    input: InputState,
+    /// Esc settings menu (created with the window)
+    menu: Option<Menu>,
     grabbed: bool,
     last: Instant,
     start: Instant,
@@ -271,22 +284,41 @@ impl App {
         }
 
         let gfx = self.gfx.as_mut().unwrap();
+        let (binds, fov, menu_open) = match &self.menu {
+            Some(m) => (m.settings.binds.clone(), m.settings.fov, m.open),
+            None => (Binds::default(), self.cfg.fov, false),
+        };
+        let frame = gfx.begin_frame();
         if let Some(g) = &mut self.game {
-            let input = input_from(&self.keys, g.yaw, g.pitch);
             g.accum += dt;
             while g.accum >= TICK {
+                self.input.begin_tick();
+                // the menu freezes input (the sim keeps running, like Apex's Esc menu)
+                let input = if menu_open { Input { yaw: g.yaw, pitch: g.pitch, ..Default::default() } } else { bind_input(&self.input, &binds, g.yaw, g.pitch) };
+                self.input.end_tick();
                 g.prev_eye = g.player.eye();
                 sim::simulate(&mut g.player, &input, TICK, &g.world.collision);
                 g.accum -= TICK;
             }
             let alpha = g.accum / TICK;
             let eye = g.prev_eye.lerp(g.player.eye(), alpha);
-            let cam = Camera { pos: eye, yaw: g.yaw, pitch: g.pitch, fov: self.cfg.fov, debug: self.args.debug };
+            let cam = Camera { pos: eye, yaw: g.yaw, pitch: g.pitch, fov, debug: self.args.debug };
             gfx.prepare(&cam, &g.world);
             let fu = gfx.frame_uniform(&cam, &g.world, self.start.elapsed().as_secs_f32());
-            gfx.present(Some((&g.world, &fu)), 1.0);
-        } else {
-            gfx.present(None, self.progress.get());
+            if let Some((_, view)) = &frame {
+                gfx.draw(view, Some((&g.world, &fu)), 1.0);
+            }
+        } else if let Some((_, view)) = &frame {
+            gfx.draw(view, None, self.progress.get());
+        }
+        if let Some((tex, view)) = frame {
+            if let (Some(m), Some(w)) = (&mut self.menu, &self.window) {
+                m.draw(w, &gfx.device, &gfx.queue, view_ref(&view), [gfx.width, gfx.height]);
+            }
+            gfx.end_frame(tex);
+        }
+        if self.menu.as_ref().is_some_and(|m| m.quit_requested) {
+            el.exit();
         }
 
         self.fps_n += 1;
@@ -295,18 +327,78 @@ impl App {
             if let (Some(w), Some(g)) = (&self.window, &self.game) {
                 let p = g.player.pos;
                 w.set_title(&format!(
-                    "R5Rust  |  {fps:.0} fps  |  {:.0}, {:.0}, {:.0}  |  {}{}",
+                    "R5Rust  |  {fps:.0} fps  |  {:.0}, {:.0}, {:.0}  |  {:.0} u/s  |  {}{}",
                     p.x,
                     p.y,
                     p.z,
-                    if g.player.flying { "FLY" } else if g.player.on_ground { "ground" } else { "air" },
-                    if self.grabbed { "" } else { "  |  click to play" }
+                    g.player.vel.truncate().length(),
+                    g.player.state_name(),
+                    if self.menu.as_ref().is_some_and(|m| m.open) { "  |  settings (Esc to resume)" } else if self.grabbed { "  |  Esc: settings" } else { "  |  click to play" }
                 ));
             }
             self.fps_n = 0;
             self.fps_t = Instant::now();
         }
     }
+}
+
+impl App {
+    /// Actions that fire on press rather than feeding the movement sim.
+    fn instant_actions(&mut self, b: Bind) {
+        let actions: Vec<Action> = match &self.menu {
+            Some(m) => m.settings.binds.actions_for(b).collect(),
+            None => Binds::default().actions_for(b).collect(),
+        };
+        for a in actions {
+            match a {
+                Action::FlyToggle => {
+                    if let Some(g) = &mut self.game {
+                        g.player.flying = !g.player.flying;
+                        g.player.vel = Vec3::ZERO;
+                    }
+                }
+                Action::Respawn => {
+                    if let Some(g) = &mut self.game {
+                        let (mut p, yaw, pitch) = spawn(&g.world, &Args::default());
+                        p.fly_speed = self.cfg.fly_speed;
+                        g.player = p;
+                        g.prev_eye = g.player.eye();
+                        g.yaw = yaw;
+                        g.pitch = pitch;
+                    }
+                }
+                Action::Fullscreen => {
+                    if let Some(w) = &self.window {
+                        w.set_fullscreen(if w.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Movement input for one sim tick from the rebindable actions.
+fn bind_input(st: &InputState, binds: &Binds, yaw: f32, pitch: f32) -> Input {
+    let d = |a| st.down(binds, a);
+    let ax = |p, n| (d(p) as i32 - d(n) as i32) as f32;
+    Input {
+        forward: ax(Action::Forward, Action::Back),
+        right: ax(Action::Right, Action::Left),
+        jump: d(Action::Jump),
+        jump_pressed: st.pressed(binds, Action::Jump),
+        sprint: d(Action::Sprint),
+        crouch: d(Action::Crouch),
+        // fly mode: crouch or the Fly Down bind descends
+        down: d(Action::FlyDown) || d(Action::Crouch),
+        yaw,
+        pitch,
+        ..Default::default()
+    }
+}
+
+fn view_ref(v: &wgpu::TextureView) -> &wgpu::TextureView {
+    v
 }
 
 impl ApplicationHandler for App {
@@ -337,12 +429,35 @@ impl ApplicationHandler for App {
             }
         };
         self.rx = Some(start_loader(&self.cfg, &gfx, self.progress.clone()));
+        let settings = UserSettings::load(self.cfg.sensitivity, self.cfg.fov);
+        self.menu = Some(Menu::new(&window, &gfx.device, gfx.out_format(), settings));
         self.gfx = Some(gfx);
         self.window = Some(window);
         self.grab(true);
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Esc toggles the settings menu (unless the menu is waiting for a key to bind, where it cancels)
+        if let WindowEvent::KeyboardInput { event: ke, .. } = &event {
+            if ke.state == ElementState::Pressed && !ke.repeat && ke.physical_key == PhysicalKey::Code(KeyCode::Escape) {
+                let listening = self.menu.as_ref().is_some_and(|m| m.open && m.is_listening());
+                if !listening {
+                    if let Some(m) = &mut self.menu {
+                        m.toggle();
+                        let open = m.open;
+                        self.input.clear();
+                        self.grab(!open);
+                    }
+                    return;
+                }
+            }
+        }
+        let is_input = matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } | WindowEvent::CursorMoved { .. });
+        if let (Some(m), Some(w)) = (&mut self.menu, &self.window) {
+            if m.on_window_event(w, &event) && is_input {
+                return;
+            }
+        }
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(s) => {
@@ -351,56 +466,47 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Focused(false) => {
-                self.keys.clear();
+                self.input.clear();
                 self.grab(false);
             }
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.grabbed {
+                    let y = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                        winit::event::MouseScrollDelta::PixelDelta(p) => (p.y / 40.0) as f32,
+                    };
+                    if y != 0.0 {
+                        let up = y > 0.0;
+                        self.input.wheel(up, y.abs().round().max(1.0) as u32);
+                        self.instant_actions(if up { Bind::WheelUp } else { Bind::WheelDown });
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
                 if !self.grabbed {
-                    self.grab(true);
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        self.grab(true);
+                    }
+                    return;
+                }
+                let b = Bind::Mouse(button.into());
+                if state == ElementState::Pressed {
+                    self.input.press(b);
+                    self.instant_actions(b);
+                } else {
+                    self.input.release(b);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else { return };
-                let down = event.state == ElementState::Pressed;
-                if let Some(n) = key_name(code) {
-                    if down {
-                        self.keys.insert(n.to_string());
-                    } else {
-                        self.keys.remove(n);
+                let b = Bind::Key(code);
+                if event.state == ElementState::Pressed {
+                    if !event.repeat {
+                        self.input.press(b);
+                        self.instant_actions(b);
                     }
-                }
-                if down && !event.repeat {
-                    match code {
-                        KeyCode::Escape => {
-                            if self.grabbed {
-                                self.grab(false);
-                            } else {
-                                el.exit();
-                            }
-                        }
-                        KeyCode::KeyV => {
-                            if let Some(g) = &mut self.game {
-                                g.player.flying = !g.player.flying;
-                                g.player.vel = Vec3::ZERO;
-                            }
-                        }
-                        KeyCode::KeyR => {
-                            if let Some(g) = &mut self.game {
-                                let (mut p, yaw, pitch) = spawn(&g.world, &Args::default());
-                                p.fly_speed = self.cfg.fly_speed;
-                                g.player = p;
-                                g.prev_eye = g.player.eye();
-                                g.yaw = yaw;
-                                g.pitch = pitch;
-                            }
-                        }
-                        KeyCode::F11 => {
-                            if let Some(w) = &self.window {
-                                w.set_fullscreen(if w.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) });
-                            }
-                        }
-                        _ => {}
-                    }
+                } else {
+                    self.input.release(b);
                 }
             }
             WindowEvent::RedrawRequested => self.frame(el),
@@ -410,13 +516,14 @@ impl ApplicationHandler for App {
 
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: winit::event::DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
-            if !self.grabbed {
+            if !self.grabbed || self.menu.as_ref().is_some_and(|m| m.open) {
                 return;
             }
+            let (sens, inv) = self.menu.as_ref().map(|m| (m.settings.sensitivity, m.settings.invert_y)).unwrap_or((self.cfg.sensitivity, false));
             if let Some(g) = &mut self.game {
-                let s = self.cfg.sensitivity * M_YAW;
+                let s = sens * M_YAW;
                 g.yaw = (g.yaw - delta.0 as f32 * s).rem_euclid(360.0);
-                g.pitch = (g.pitch + delta.1 as f32 * s).clamp(-89.0, 89.0);
+                g.pitch = (g.pitch + delta.1 as f32 * s * if inv { -1.0 } else { 1.0 }).clamp(-89.0, 89.0);
             }
         }
     }
@@ -453,7 +560,8 @@ fn main() {
         progress: Arc::new(Progress(AtomicU32::new(0))),
         rx: None,
         game: None,
-        keys: HashSet::new(),
+        input: InputState::default(),
+        menu: None,
         grabbed: false,
         last: now,
         start: now,

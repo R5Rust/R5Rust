@@ -1,3 +1,4 @@
 target/
 /r5rust.toml
 /play/
+/r5rust_settings.toml

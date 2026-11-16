@@ -665,8 +665,17 @@ impl Gfx {
     }
 
     /// Draws to the window. Returns false if the frame was skipped.
+    #[allow(dead_code)]
     pub fn present(&mut self, world: Option<(&LoadedWorld, &FrameUniform)>, progress: f32) -> bool {
-        let Some((s, c)) = &self.surface else { return false };
+        let Some((tex, view)) = self.begin_frame() else { return false };
+        self.draw(&view, world, progress);
+        self.queue.present(tex);
+        true
+    }
+
+    /// The swapchain image for this frame (draw into the view, overlay UI, then `end_frame`).
+    pub fn begin_frame(&mut self) -> Option<(wgpu::SurfaceTexture, wgpu::TextureView)> {
+        let (s, c) = self.surface.as_ref()?;
         let tex = match s.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => t,
             wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
@@ -675,17 +684,28 @@ impl Gfx {
             }
             _ => {
                 s.configure(&self.device, c);
-                return false;
+                return None;
             }
         };
         let view = tex.texture.create_view(&Default::default());
-        self.draw(&view, world, progress);
+        Some((tex, view))
+    }
+
+    pub fn end_frame(&self, tex: wgpu::SurfaceTexture) {
         self.queue.present(tex);
-        true
+    }
+
+    pub fn out_format(&self) -> wgpu::TextureFormat {
+        self.out_format
     }
 
     /// Renders one frame offscreen and writes it as a PNG.
     pub fn screenshot(&self, path: &std::path::Path, world: Option<(&LoadedWorld, &FrameUniform)>, progress: f32) -> Result<(), String> {
+        self.screenshot_with(path, world, progress, |_, _, _, _| {})
+    }
+
+    /// Like `screenshot`, with an overlay drawn over the finished frame (e.g. the menu).
+    pub fn screenshot_with(&self, path: &std::path::Path, world: Option<(&LoadedWorld, &FrameUniform)>, progress: f32, mut overlay: impl FnMut(&wgpu::Device, &wgpu::Queue, &wgpu::TextureView, [u32; 2])) -> Result<(), String> {
         assert_eq!(self.out_format, SHOT_FORMAT, "screenshots need the offscreen (no window) Gfx");
         let (w, h) = (self.width, self.height);
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -698,7 +718,9 @@ impl Gfx {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        self.draw(&tex.create_view(&Default::default()), world, progress);
+        let view = tex.create_view(&Default::default());
+        self.draw(&view, world, progress);
+        overlay(&self.device, &self.queue, &view, [w, h]);
         let row = (w * 4).div_ceil(256) * 256;
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("shot"), size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
         let mut enc = self.device.create_command_encoder(&Default::default());

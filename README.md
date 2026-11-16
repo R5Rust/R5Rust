@@ -19,17 +19,24 @@ cargo run --release --bin r5rust
 
 Shows the real loading screen, loads the map (~8 s cold, ~1.5 s warm), and drops you at the real spawn.
 
-| Key | Does |
+Controls are rebindable: **Esc opens Settings** (two binds per action, like Apex; click a slot and press a key,
+mouse button or wheel; right-click clears). Sensitivity (Apex units), FOV and invert are on the Mouse & View tab.
+Everything saves to `r5rust_settings.toml` (gitignored). Defaults:
+
+| Action | Binds |
 |---|---|
-| WASD / mouse | move / look (mouse is grabbed; click the window to re-grab) |
-| Shift | sprint (Apex-style: one tap latches it while you keep moving forward; fly: 3x speed) |
-| Space / mouse wheel | jump (fly: up). The wheel is the second bind for tap-strafes and mantle-boost timing |
-| Ctrl / C | crouch; slide when pressed while sprinting (fly: down) |
-| W + jump into a ledge | mantle (in the air just push into it). Jump in the last ~0.1 s of the climb = mantle boost |
-| V | toggle fly (noclip-ish: still collides) |
-| R | respawn |
-| F11 | borderless fullscreen |
-| Esc | release mouse; again to quit |
+| Move | W / A / S / D |
+| Jump | SPACE, MWHEELDOWN (superglides, bhops) |
+| Crouch (hold) / slide | LCTRL, C |
+| Sprint | LSHIFT (one tap latches it while you keep moving forward) |
+| Fly toggle / fly down | V / X |
+| Respawn | R |
+| Fullscreen | F11 |
+| Settings menu | Esc (Resume / Quit in the menu) |
+
+Movement is Apex's own (ported from R5Regenis' disassembly specs + the game's pilot settings): walk 173.5, sprint 260,
+crouch 80, slide + boost, slide jump, bhop rules, tap strafe, step 22, mantle + superglide + **mantle boost**.
+See `docs/movement.md`; `cargo run --release -p shared --example movecheck` runs its 87 checks.
 
 The window title shows fps, position and ground/air/FLY.
 

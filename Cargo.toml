@@ -22,8 +22,11 @@ postcard = { version = "1", features = ["use-std"] }
 ctrlc = "3"
 rayon = "1"
 memmap2 = "0.9"
-winit = "0.30.13"
+winit = { version = "0.30.13", features = ["serde"] }
 shared = { path = "crates/shared" }
+egui = { version = "0.37", features = ["default_fonts"] }
+egui-wgpu = "0.37"
+egui-winit = { version = "0.37", default-features = false, features = ["links", "wayland", "x11"] }
 
 [profile.dev]
 opt-level = 2
