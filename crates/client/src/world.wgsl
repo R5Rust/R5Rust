@@ -72,14 +72,19 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
     if (!front) { n = -n; }
 
     let ndl = max(dot(n, fr.to_sun.xyz), 0.0);
+    // lightmapped: the bake already holds sky + bounce light, so no hemisphere fill on top
     var light = mix(fr.ground.rgb, fr.sky.rgb, n.z * 0.5 + 0.5) * fr.sky.w;
     var sun_vis = 1.0;
     if (mt.params.y > 0.5) {
-        light += lm.rgb * 4.0;
-        sun_vis = lm.a;
+        // + a little hemisphere fill: the bake has no interior lights, so indoors would go black
+        light = lm.rgb * 4.0 + light * 0.45;
+        sun_vis = smoothstep(0.3, 0.6, lm.a);
     }
     light += fr.sun_color.rgb * fr.sun_color.w * ndl * sun_vis;
-    let c = fog_mix(albedo.rgb * light, i.rel);
+    var c = fog_mix(albedo.rgb * light, i.rel);
+    if (fr.misc.w > 0.5 && fr.misc.w < 1.5) { c = vec3<f32>(lm.a); }
+    if (fr.misc.w > 1.5 && fr.misc.w < 2.5) { c = lm.rgb * 4.0; }
+    if (fr.misc.w > 2.5) { c = albedo.rgb; }
 
     var a = albedo.a;
     if (mt.params.z > 0.5 && mt.params.z < 1.5) {

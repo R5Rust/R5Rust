@@ -39,6 +39,7 @@ struct Args {
     pitch: Option<f32>,
     hold: Vec<String>,
     fly: bool,
+    debug: f32,
 }
 
 fn parse_args() -> Args {
@@ -64,6 +65,7 @@ fn parse_args() -> Args {
             "--pitch" => a.pitch = next(&mut i).parse().ok(),
             "--hold" => a.hold = next(&mut i).split(',').map(|s| s.trim().to_ascii_lowercase()).collect(),
             "--fly" => a.fly = true,
+            "--debug" => a.debug = next(&mut i).parse().unwrap_or(0.0),
             other => log::warn!("unknown arg {other}"),
         }
         i += 1;
@@ -140,11 +142,18 @@ fn run_headless(cfg: Config, args: Args) -> Result<(), String> {
     let (mut player, yaw, pitch) = spawn(&world, &args);
     player.fly_speed = cfg.fly_speed;
     let keys: HashSet<String> = args.hold.iter().cloned().collect();
+    // settle onto the floor for 30 ticks, then hold the keys for --frames ticks
+    for _ in 0..30 {
+        sim::simulate(&mut player, &input_from(&HashSet::new(), yaw, pitch), TICK, &world.collision);
+    }
     let start = player.pos;
+    let mut max_z = start.z;
     for _ in 0..args.frames {
         sim::simulate(&mut player, &input_from(&keys, yaw, pitch), TICK, &world.collision);
+        max_z = max_z.max(player.pos.z);
     }
-    let cam = Camera { pos: player.eye(), yaw, pitch, fov: cfg.fov };
+    println!("peak height above start: {:.0}u", max_z - start.z);
+    let cam = Camera { pos: player.eye(), yaw, pitch, fov: cfg.fov, debug: args.debug };
     let fu = gfx.frame_uniform(&cam, &world, args.frames as f32 * TICK);
     // GPU timing: a few warm-up frames, then average
     for _ in 0..5 {
@@ -253,7 +262,7 @@ impl App {
             }
             let alpha = g.accum / TICK;
             let eye = g.prev_eye.lerp(g.player.eye(), alpha);
-            let cam = Camera { pos: eye, yaw: g.yaw, pitch: g.pitch, fov: self.cfg.fov };
+            let cam = Camera { pos: eye, yaw: g.yaw, pitch: g.pitch, fov: self.cfg.fov, debug: self.args.debug };
             let fu = gfx.frame_uniform(&cam, &g.world, self.start.elapsed().as_secs_f32());
             gfx.present(Some((&g.world, &fu)), 1.0);
         } else {

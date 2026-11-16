@@ -216,4 +216,3 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     Ok(LoadedWorld { vbuf, ibuf, draws, mat_groups, lightmap, collision, meta, stats })
 }
 
-pub type Shared = Arc<Progress>;

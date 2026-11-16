@@ -42,11 +42,13 @@ pub struct Player {
     pub flying: bool,
     pub fly_speed: f32,
     jump_held: bool,
+    /// seconds left in which a jump pressed just before landing still fires
+    jump_buffer: f32,
 }
 
 impl Player {
     pub fn new(pos: Vec3) -> Self {
-        Self { pos, vel: Vec3::ZERO, on_ground: false, flying: false, fly_speed: 1200.0, jump_held: false }
+        Self { pos, vel: Vec3::ZERO, on_ground: false, flying: false, fly_speed: 1200.0, jump_held: false, jump_buffer: 0.0 }
     }
     pub fn eye(&self) -> Vec3 {
         self.pos + Vec3::new(0.0, 0.0, EYE_HEIGHT)
@@ -81,8 +83,12 @@ pub fn find_free(col: &Collision, pos: Vec3) -> Vec3 {
 
 /// Advances the player by `dt` seconds.
 pub fn simulate(p: &mut Player, input: &Input, dt: f32, col: &Collision) {
-    let jump_pressed = input.jump && !p.jump_held;
+    if input.jump && !p.jump_held {
+        p.jump_buffer = 0.12;
+    }
     p.jump_held = input.jump;
+    let jump_pressed = p.jump_buffer > 0.0;
+    p.jump_buffer = (p.jump_buffer - dt).max(0.0);
 
     if p.flying {
         let fwd = forward_vec(input.yaw, input.pitch);
@@ -123,6 +129,7 @@ pub fn simulate(p: &mut Player, input: &Input, dt: f32, col: &Collision) {
         accelerate(&mut p.vel, wish_dir, wish_speed, GROUND_ACCEL, dt);
         p.vel.z = 0.0;
         if jump_pressed {
+            p.jump_buffer = 0.0;
             p.vel.z = JUMP_SPEED;
             p.on_ground = false;
         }

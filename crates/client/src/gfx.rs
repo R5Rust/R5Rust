@@ -3,7 +3,7 @@
 //! (alpha-to-coverage) / blended draws. Post pass: ACES tonemap, or the loading screen.
 
 use crate::loader::{upload_rgba, LoadedWorld};
-use glam::{Mat4, Vec3};
+use glam::Vec3;
 use shared::assets::Config;
 use std::sync::Arc;
 use winit::window::Window;
@@ -35,6 +35,7 @@ struct PostUniform {
 }
 
 pub struct Camera {
+    pub debug: f32,
     pub pos: Vec3,
     pub yaw: f32,
     pub pitch: f32,
@@ -142,6 +143,7 @@ impl Gfx {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: surface.as_ref(),
+                apply_limit_buckets: false,
             }));
             match adapter {
                 Ok(a) => {
@@ -180,6 +182,7 @@ impl Gfx {
                     desired_maximum_frame_latency: 2,
                     alpha_mode: caps.alpha_modes[0],
                     view_formats: vec![],
+                    color_space: wgpu::SurfaceColorSpace::Auto,
                 };
                 s.configure(&device, &config);
                 (Some((s, config)), fmt)
@@ -216,7 +219,7 @@ impl Gfx {
             world_pipes.push(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("world"),
                 layout: Some(&world_pl),
-                vertex: wgpu::VertexState { module: &world_sh, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[vlayout.clone()] },
+                vertex: wgpu::VertexState { module: &world_sh, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[Some(vlayout.clone())] },
                 primitive: wgpu::PrimitiveState { cull_mode: if double { None } else { Some(wgpu::Face::Back) }, ..Default::default() },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH,
@@ -362,8 +365,8 @@ impl Gfx {
         let aspect = self.width as f32 / self.height as f32;
         let vfov = 2.0 * ((cam.fov.to_radians() * 0.5).tan() * 0.75).atan();
         let fwd = shared::sim::forward_vec(cam.yaw, cam.pitch);
-        let view = Mat4::look_to_rh(Vec3::ZERO, fwd, Vec3::Z);
-        let proj = Mat4::perspective_infinite_reverse_rh(vfov, aspect, 4.0);
+        let view = glam::camera::rh::view::look_to_mat4(Vec3::ZERO, fwd, Vec3::Z);
+        let proj = glam::camera::rh::proj::directx::perspective_infinite_reverse(vfov, aspect, 4.0);
         let vp = proj * view;
         let m = &world.meta;
         let to_sun = -Vec3::from(m.sun_dir).normalize_or(Vec3::Z);
@@ -373,11 +376,11 @@ impl Gfx {
             inv_view_proj: vp.inverse().to_cols_array_2d(),
             cam_pos: [cam.pos.x, cam.pos.y, cam.pos.z, 0.0],
             to_sun: [to_sun.x, to_sun.y, to_sun.z, 0.0],
-            sun_color: [m.sun_color[0], m.sun_color[1], m.sun_color[2], 2.4 / std::f32::consts::PI],
-            sky: [amb[0], amb[1], amb[2], 1.1 / std::f32::consts::PI],
+            sun_color: [m.sun_color[0], m.sun_color[1], m.sun_color[2], 3.2],
+            sky: [amb[0], amb[1], amb[2], 0.9],
             ground: [0.147, 0.102, 0.064, 0.0],
             fog: [0.347, 0.456, 0.578, 20000.0],
-            misc: [90000.0, time, 1.0, 0.0],
+            misc: [90000.0, time, 1.0, cam.debug],
         }
     }
 
@@ -386,7 +389,7 @@ impl Gfx {
     pub fn draw(&self, target: &wgpu::TextureView, world: Option<(&LoadedWorld, &FrameUniform)>, progress: f32) {
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         let mode = if let (Some((w, fu)), Some(fbg)) = (world, &self.frame_bg) {
-            self.queue.write_buffer(&self.frame_ub, 0, bytemuck::bytes_of(*fu));
+            self.queue.write_buffer(&self.frame_ub, 0, bytemuck::bytes_of(fu));
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("world"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -459,7 +462,7 @@ impl Gfx {
         };
         let view = tex.texture.create_view(&Default::default());
         self.draw(&view, world, progress);
-        tex.present();
+        self.queue.present(tex);
         true
     }
 
@@ -490,7 +493,7 @@ impl Gfx {
         let slice = buf.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("poll: {e}"))?;
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().map_err(|e| format!("map: {e:?}"))?;
         let mut img = image::RgbaImage::new(w, h);
         for y in 0..h {
             let src = &data[(y * row) as usize..(y * row + w * 4) as usize];
