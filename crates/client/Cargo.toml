@@ -1,0 +1,21 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "r5rust"
+path = "src/main.rs"
+
+[dependencies]
+shared = { workspace = true }
+bytemuck = { workspace = true }
+env_logger = { workspace = true }
+glam = { workspace = true }
+image = { workspace = true }
+log = { workspace = true }
+pollster = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+wgpu = { workspace = true }
+winit = { workspace = true }

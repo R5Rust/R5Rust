@@ -1,0 +1,13 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "r5rust_ds"
+path = "src/main.rs"
+
+[dependencies]
+shared = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
