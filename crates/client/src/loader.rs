@@ -424,6 +424,9 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
             let overlay = !two_layer && m.alpha_mode == 2 && mask.is_some();
             // a tiny layer-0 UV scale means the shader maps layer 0 from world position (terrain-style)
             let planar = (two_layer || overlay) && (rx[0].abs() + rx[1].abs()) < 0.05;
+            if m.alpha_mode == 2 && std::env::var_os("R5_LOG_BLEND").is_some() {
+                log::info!("blend mat {} overlay={overlay} two_layer={two_layer} mask={} json_blend={}", m.name, mask.is_some(), e["blend"]);
+            }
             let u = MatUniform {
                 color: m.base_color,
                 params: [m.alpha_cutoff, if m.lightmapped { 1.0 } else { 0.0 }, m.alpha_mode as f32, if m.name.starts_with("world/") && !is_blend { 1.0 } else { 0.0 }],
@@ -435,7 +438,7 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
                     let c = |i: usize, d: f32| a.and_then(|a| a.get(i)).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(d);
                     [c(0, 0.0), c(1, 1.0), c(2, 1.0), 0.0]
                 },
-                blend: [if overlay { 2.0 } else { two_layer as u32 as f32 }, f1("blend_ramp", 0.0), planar as u32 as f32, detail_n.is_some() as u32 as f32],
+                blend: [if overlay { if e["old_style"].as_bool().unwrap_or(false) { 3.0 } else { 2.0 } } else { two_layer as u32 as f32 }, f1("blend_ramp", 3.0), planar as u32 as f32, detail_n.is_some() as u32 as f32],
                 uv1: [rx[0], rx[1], ry[0], ry[1]],
                 uv_t: [t1[0], t1[1], t2[0], t2[1]],
                 uv2: [rx2[0], rx2[1], ry2[0], ry2[1]],

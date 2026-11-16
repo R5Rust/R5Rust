@@ -79,7 +79,7 @@ impl Default for Config {
             bloom_amount: 0.12,
             bloom_cutoff: 1.0,
             bloom_clamp: 20.0,
-            tonemap: 0,
+            tonemap: 1,
         }
     }
 }

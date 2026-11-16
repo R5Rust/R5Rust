@@ -436,7 +436,8 @@ impl Gfx {
             bloom_amount: cfg.bloom_amount,
             grading,
             grading_on: false,
-            no_grading: std::env::var_os("R5_GRADE").is_none(),
+            // game grading LUT + Apex tonemap function 0 measured closest to R5Flowstate (R5_NOGRADE=1 to compare)
+            no_grading: std::env::var_os("R5_NOGRADE").is_some(),
             tonemap: std::env::var("R5_TONEMAP").ok().and_then(|v| v.parse().ok()).unwrap_or(cfg.tonemap),
             expo_state,
             expo_params,

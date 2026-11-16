@@ -421,9 +421,16 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
 
     var a = base.a * mt.color.a;
     if (mt.blend.x > 1.5) {
-        // transparent overlay (PS 0x937D8E4BC98DD7A9 / 0x954097DFD1711C57): opacity = (1 - blend) * albedo.a
         let ramp = mt.blend.y;
-        a *= 1.0 - clamp(ramp * (mask_l0 - 1.0) + i.col.a * (ramp + 1.0), 0.0, 1.0);
+        let bl = clamp(ramp * (mask_l0 - 1.0) + i.col.a * (ramp + 1.0), 0.0, 1.0);
+        if (mt.blend.x < 2.5) {
+            // transparent overlay (PS 0x937D8E4BC98DD7A9 / 0x954097DFD1711C57): opacity = (1 - blend) * albedo.a
+            a *= 1.0 - bl;
+        } else {
+            // old-style _col/_nml/_gls/_bm translucent blend (its PS isn't in the extraction): vertex alpha is painted
+            // where the layer shows, so opacity = blend. Inferred from the vertex paint + the R5Flowstate reference.
+            a *= bl;
+        }
     }
     if (mt.params.z > 0.5 && mt.params.z < 1.5) {
         // alpha-tested: sharpen around the cutoff so alpha-to-coverage gives crisp, AA'd edges
@@ -432,6 +439,7 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
         a = 1.0;
     }
     if (fr.misc.w > 7.5 && fr.misc.w < 8.5) { return vec4<f32>(vec3<f32>(a, i.col.a, mask_l0), 1.0); }
+    if (fr.misc.w > 8.5 && fr.misc.w < 9.5) { return vec4<f32>(i.col.r, i.col.a, mt.blend.x * 0.5, 1.0); }
     return vec4<f32>(c, a);
 }
 
