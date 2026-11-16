@@ -182,7 +182,7 @@ impl Menu {
         if ui.checkbox(&mut self.settings.mantle_boost, "Mantle Boost").changed() {
             self.dirty = true;
         }
-        ui.label("Jump in the sweet spot at the end of a mantle to launch out of it. With it off, every jump during a mantle                   is Apex's normal jump-off / hop-back, and superglides (crouch + jump at the end of the mantle) work.");
+        ui.label("Jump in the sweet spot at the end of a mantle to launch out of it. With it off, every jump during a mantle is Apex's normal jump-off / hop-back, and superglides (crouch + jump at the end of the mantle) work.");
     }
 
     fn mouse_tab(&mut self, ui: &mut egui::Ui) {
