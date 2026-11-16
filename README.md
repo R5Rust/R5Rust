@@ -22,9 +22,10 @@ Shows the real loading screen, loads the map (~8 s cold, ~1.5 s warm), and drops
 | Key | Does |
 |---|---|
 | WASD / mouse | move / look (mouse is grabbed; click the window to re-grab) |
-| Shift | sprint (fly: 3x speed) |
-| Space | jump (fly: up) |
-| Ctrl / C | fly: down |
+| Shift | sprint (Apex-style: one tap latches it while you keep moving forward; fly: 3x speed) |
+| Space / mouse wheel | jump (fly: up). The wheel is the second bind for tap-strafes and mantle-boost timing |
+| Ctrl / C | crouch; slide when pressed while sprinting (fly: down) |
+| W + jump into a ledge | mantle (in the air just push into it). Jump in the last ~0.1 s of the climb = mantle boost |
 | V | toggle fly (noclip-ish: still collides) |
 | R | respawn |
 | F11 | borderless fullscreen |
@@ -74,14 +75,17 @@ cubemaps in `cubemaps.dds`, the sky in `skycube.dds`. Compressed texture cache: 
 
 ## Layout
 
-- `crates/shared`: GLB loader, BVH capsule collision, deterministic `sim::simulate()` (movement), config
+- `crates/shared`: GLB loader, BVH collision with an Apex-style hull sweep (`trace_hull`), deterministic
+  `sim::simulate()` = Apex S21 movement ported from the R5Regenis specs (`docs/movement.md`), player settings + cvars
+  (`settings.rs`), config. Checker: `cargo run --release -p shared --example movecheck`
 - `crates/client`: `r5rust`: wgpu renderer (4x MSAA HDR, reverse-Z, lightmaps + sun, ACES), loader thread, input
 - `crates/server`: `r5rust_ds`, a stub for now
 
 ## Status (2026-11-16)
 
-v1 works: load screen, Firing Range with baked lighting at ~340-600 fps on a 2080 Ti, walk / sprint / jump / fly
-with collision. See `HANDOFF.md` for what's next.
+v1 works: load screen, Firing Range with baked lighting at ~340-600 fps on a 2080 Ti, fly with collision, and Apex's
+real movement (walk/sprint/crouch/slide/jump/air strafe/tap-strafe/step/mantle/mantle boost; ~50 us per tick, see
+`docs/movement.md`). See `HANDOFF.md` for what's next.
 
 Not done: dedicated server + netcode + prediction (v2), shadows on unlightmapped props (big rocks, some props),
 interior lights (the bake has none, so interiors use a flat fill), dynamic props, HUD, weapons, audio.

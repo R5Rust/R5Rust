@@ -29,6 +29,12 @@ Still off vs the real game: 2-layer blend materials (_bm, e.g. range floor concr
 of Apex's 6; using ACES fit), HDR colour-grading LUT (mp_rr_desertlands_hu_hdr.raw_hdr, in the game VPK), outdoor
 exposure slightly dark, mat_* convar values unknown (couldn't type into the client console while the user was active).
 
+## Movement status (2026-11-16, session 4)
+Apex S21 movement ported into `crates/shared/src/sim/` from the R5Regenis bit-exact specs (+ a few functions
+disassembled from r5apex_ds.exe), on a new AABB hull sweep (`Collision::trace_hull`). Mantle boost from the R5Regenis
+bridge. `cargo run --release -p shared --example movecheck` = 87 checks (all pass), ~50 us/tick on the real map.
+Details, approximations and Lab disagreements: `docs/movement.md`.
+
 ## Next (v2)
 1. `r5rust_ds`: UDP server running `shared::sim` at 60 Hz; client spawns it locally unless `--connect`.
 2. Client prediction + reconciliation (sim is already deterministic and shared).

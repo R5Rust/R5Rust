@@ -1,0 +1,675 @@
+//! Headless movement checker: runs the Apex movement port on a synthetic test world (and the real Firing Range
+//! when the assets are present) and asserts concrete numbers. `cargo run --release -p shared --example movecheck`
+//! Exit code 1 if any check fails.
+
+use glam::Vec3;
+use shared::collision::Collision;
+use shared::settings::STOCK;
+use shared::sim::{self, Input, MoveType, Player};
+use std::time::Instant;
+
+const TICK: f32 = 1.0 / 60.0;
+
+struct Checks {
+    fails: u32,
+    n: u32,
+}
+
+impl Checks {
+    fn near(&mut self, name: &str, got: f32, want: f32, tol: f32) {
+        let ok = (got - want).abs() <= tol;
+        self.report(name, ok, format!("{got:9.2}"), format!("{want} +-{tol}"));
+    }
+    fn range(&mut self, name: &str, got: f32, lo: f32, hi: f32) {
+        let ok = got >= lo && got <= hi;
+        self.report(name, ok, format!("{got:9.2}"), format!("[{lo}, {hi}]"));
+    }
+    fn truth(&mut self, name: &str, ok: bool, detail: String) {
+        self.report(name, ok, detail, "true".into());
+    }
+    fn report(&mut self, name: &str, ok: bool, got: String, want: String) {
+        self.n += 1;
+        if !ok {
+            self.fails += 1;
+        }
+        println!("{} {name:58} {got:>14}   want {want}", if ok { "PASS" } else { "FAIL" });
+    }
+}
+
+// ---------------------------------------------------------------- test world
+
+struct Geo {
+    pos: Vec<[f32; 3]>,
+    idx: Vec<u32>,
+}
+
+impl Geo {
+    fn quad(&mut self, a: Vec3, b: Vec3, c: Vec3, d: Vec3) {
+        let i = self.pos.len() as u32;
+        for v in [a, b, c, d] {
+            self.pos.push(v.to_array());
+        }
+        self.idx.extend_from_slice(&[i, i + 1, i + 2, i, i + 2, i + 3]);
+    }
+    fn aabb(&mut self, mn: Vec3, mx: Vec3) {
+        let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z);
+        let (a, b) = (mn, mx);
+        self.quad(v(a.x, a.y, b.z), v(b.x, a.y, b.z), v(b.x, b.y, b.z), v(a.x, b.y, b.z)); // top
+        self.quad(v(a.x, a.y, a.z), v(a.x, b.y, a.z), v(b.x, b.y, a.z), v(b.x, a.y, a.z)); // bottom
+        self.quad(v(a.x, a.y, a.z), v(b.x, a.y, a.z), v(b.x, a.y, b.z), v(a.x, a.y, b.z));
+        self.quad(v(a.x, b.y, a.z), v(a.x, b.y, b.z), v(b.x, b.y, b.z), v(b.x, b.y, a.z));
+        self.quad(v(a.x, a.y, a.z), v(a.x, a.y, b.z), v(a.x, b.y, b.z), v(a.x, b.y, a.z));
+        self.quad(v(b.x, a.y, a.z), v(b.x, b.y, a.z), v(b.x, b.y, b.z), v(b.x, a.y, b.z));
+    }
+}
+
+/// Flat floor at z 0, split into many triangles like a real mesh, plus test fixtures (all facing +X from x 200):
+/// y 0: a 22-unit step; y 1000: a 23-unit step; y 2000: a 60-unit ledge (mantle); y 3000: a 100-unit cliff
+/// (x -3000..-2000) to walk off.
+fn test_world() -> Collision {
+    let mut g = Geo { pos: vec![], idx: vec![] };
+    let s = 500.0;
+    let mut x = -4000.0;
+    while x < 4000.0 {
+        let mut y = -4000.0;
+        while y < 6000.0 {
+            g.quad(Vec3::new(x, y, 0.0), Vec3::new(x + s, y, 0.0), Vec3::new(x + s, y + s, 0.0), Vec3::new(x, y + s, 0.0));
+            y += s;
+        }
+        x += s;
+    }
+    g.aabb(Vec3::new(200.0, -100.0, 0.0), Vec3::new(400.0, 100.0, 22.0));
+    g.aabb(Vec3::new(200.0, 900.0, 0.0), Vec3::new(400.0, 1100.0, 23.0));
+    g.aabb(Vec3::new(200.0, 1800.0, 0.0), Vec3::new(700.0, 2200.0, 60.0));
+    g.aabb(Vec3::new(-3000.0, 2500.0, 0.0), Vec3::new(-2000.0, 3500.0, 100.0));
+    Collision::build(g.pos, &g.idx)
+}
+
+fn inp(forward: f32, right: f32) -> Input {
+    Input { forward, right, ..Default::default() }
+}
+
+fn hspeed(p: &Player) -> f32 {
+    p.vel.truncate().length()
+}
+
+fn settle(col: &Collision, pos: Vec3) -> Player {
+    let mut p = Player::new(pos);
+    for _ in 0..10 {
+        sim::simulate(&mut p, &Input::default(), TICK, col);
+    }
+    p
+}
+
+fn run(p: &mut Player, col: &Collision, ticks: usize, i: Input) {
+    for _ in 0..ticks {
+        sim::simulate(p, &i, TICK, col);
+    }
+}
+
+/// Holding W into the 60u ledge's wall, then W+jump until the mantle starts. Returns ticks until it did.
+fn start_mantle(col: &Collision, sprint_tap: bool) -> Player {
+    let mut p = settle(col, Vec3::new(120.0, 2000.0, 0.1));
+    if sprint_tap {
+        sim::simulate(&mut p, &Input { sprint: true, forward: 1.0, ..Default::default() }, TICK, col);
+    }
+    run(&mut p, col, 30, inp(1.0, 0.0));
+    sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, col);
+    p
+}
+
+fn main() {
+    let mut c = Checks { fails: 0, n: 0 };
+    let col = test_world();
+    println!("test world: {} triangles", col.tri_count());
+
+    // ------------------------------------------------------------ settings match the game files
+    check_settings_file(&mut c);
+
+    // ------------------------------------------------------------ ground speeds
+    let start = Vec3::new(-1500.0, -2000.0, 0.1);
+    let mut p = settle(&col, start);
+    c.truth("spawn settles on the floor", p.on_ground && p.pos.z < 0.1, format!("z {:.3} ground {}", p.pos.z, p.on_ground));
+    run(&mut p, &col, 180, inp(1.0, 0.0));
+    c.near("walk speed (speed 173.5)", hspeed(&p), 173.5, 0.5);
+    let mut p = settle(&col, start);
+    let mut t200 = None;
+    let mut t_sprint = None;
+    for i in 0..240 {
+        sim::simulate(&mut p, &Input { forward: 1.0, sprint: true, ..Default::default() }, TICK, &col);
+        if t200.is_none() && hspeed(&p) >= 200.0 {
+            t200 = Some(i as f32 * TICK);
+        }
+        if t_sprint.is_none() && hspeed(&p) >= 259.0 {
+            t_sprint = Some(i as f32 * TICK);
+        }
+    }
+    c.near("sprint speed (sprintspeed 260)", hspeed(&p), 260.0, 0.5);
+    c.range("sprint: time 0 -> 200 u/s (lowAccel/accel/sprintAccel)", t200.unwrap_or(99.0), 0.2, 0.7);
+    c.range("sprint: time 0 -> 259 u/s", t_sprint.unwrap_or(99.0), 0.8, 1.6);
+    // sprint latch: one tap of shift, then W only
+    let mut p = settle(&col, start);
+    sim::simulate(&mut p, &Input { forward: 1.0, sprint: true, ..Default::default() }, TICK, &col);
+    run(&mut p, &col, 180, inp(1.0, 0.0));
+    c.near("sprint latches after one tap (W only)", hspeed(&p), 260.0, 0.5);
+    run(&mut p, &col, 60, inp(0.0, 0.0));
+    run(&mut p, &col, 180, inp(1.0, 0.0));
+    c.near("stopping ends the latch", hspeed(&p), 173.5, 0.5);
+    let mut p = settle(&col, start);
+    run(&mut p, &col, 180, Input { forward: -1.0, sprint: true, ..Default::default() });
+    c.near("no sprinting backwards", hspeed(&p), 173.5, 0.5);
+    let mut p = settle(&col, start);
+    p.speed_scale = 1.15;
+    run(&mut p, &col, 240, Input { forward: 1.0, sprint: true, ..Default::default() });
+    c.near("holstered sprint (speed scale 1.15) = 299", hspeed(&p), 299.0, 0.5);
+    // stopping distance
+    let mut p = settle(&col, start);
+    run(&mut p, &col, 240, Input { forward: 1.0, sprint: true, ..Default::default() });
+    let mut ts = 0.0;
+    while hspeed(&p) > 0.0 && ts < 2.0 {
+        sim::simulate(&mut p, &Input::default(), TICK, &col);
+        ts += TICK;
+    }
+    c.range("sprint -> stop time (deceleration 1250)", ts, 0.15, 0.3);
+    // crouch walk
+    let mut p = settle(&col, start);
+    run(&mut p, &col, 180, Input { forward: 1.0, crouch: true, ..Default::default() });
+    c.near("crouch-walk speed (crouch speed 80)", hspeed(&p), 80.0, 0.5);
+    c.truth("crouched hull 47 after 400 ms", p.ducked && p.hull().1.z == 47.0, format!("ducked {} z {}", p.ducked, p.hull().1.z));
+    c.near("crouched eye height", p.eye().z - p.pos.z, 32.0, 0.01);
+    let mut p2 = p;
+    run(&mut p2, &col, 12, inp(1.0, 0.0));
+    c.range("unduck: eye eases up (mid-transition)", p2.eye().z - p2.pos.z, 33.0, 59.0);
+    run(&mut p2, &col, 30, inp(1.0, 0.0));
+    c.near("unduck: standing eye height", p2.eye().z - p2.pos.z, 60.0, 0.01);
+    // unduck blocked under a low ceiling: crouch under the 60 ledge? use a box: stand at y 2000 x 1000 is open;
+    // instead check CanUnduck through the step's underside: none. (covered by the 47-hull check above)
+
+    // ------------------------------------------------------------ jump
+    let mut p = settle(&col, start);
+    run(&mut p, &col, 60, Input::default());
+    let z0 = p.pos.z;
+    let mut peak = z0;
+    sim::simulate(&mut p, &Input { jump: true, ..Default::default() }, TICK, &col);
+    let vz_jump = p.vel.z;
+    for _ in 0..90 {
+        sim::simulate(&mut p, &Input { jump: true, ..Default::default() }, TICK, &col);
+        peak = peak.max(p.pos.z);
+    }
+    c.near("jump: takeoff vz = sqrt(2*750*56) - 3 half gravities", vz_jump, (2.0f32 * 750.0 * 56.0).sqrt() - 3.0 * 0.5 * 750.0 * TICK, 0.1);
+    c.range("jump apex height (jumpHeight 56)", peak - z0, 53.0, 56.5);
+    c.truth("holding jump does not re-jump (no auto-hop)", p.on_ground && p.vel.z.abs() < 1.0, format!("ground {} vz {:.1}", p.on_ground, p.vel.z));
+    // anti multi-jump: jump again right after landing
+    let mut p = settle(&col, start);
+    run(&mut p, &col, 60, Input::default());
+    sim::simulate(&mut p, &Input { jump: true, ..Default::default() }, TICK, &col);
+    while !p.on_ground {
+        sim::simulate(&mut p, &Input::default(), TICK, &col);
+    }
+    let z0 = p.pos.z;
+    let mut peak = z0;
+    sim::simulate(&mut p, &Input { jump: true, ..Default::default() }, TICK, &col);
+    for _ in 0..60 {
+        sim::simulate(&mut p, &Input::default(), TICK, &col);
+        peak = peak.max(p.pos.z);
+    }
+    c.range("instant re-jump: anti-multi-jump height (0.3 x 56)", peak - z0, 14.0, 17.5);
+    run(&mut p, &col, 60, Input::default());
+    let z0 = p.pos.z;
+    let mut peak = z0;
+    sim::simulate(&mut p, &Input { jump: true, ..Default::default() }, TICK, &col);
+    for _ in 0..60 {
+        sim::simulate(&mut p, &Input::default(), TICK, &col);
+        peak = peak.max(p.pos.z);
+    }
+    c.range("re-jump after 1 s: full height", peak - z0, 53.0, 56.5);
+    // bhop skip: land fast, jump within 1 s -> -100 u/s above sprint speed
+    let mut p = settle(&col, start);
+    p.pos.z = 30.0;
+    p.vel = Vec3::new(500.0, 0.0, 0.0);
+    while !p.on_ground {
+        sim::simulate(&mut p, &Input::default(), TICK, &col);
+    }
+    let before = hspeed(&p);
+    sim::simulate(&mut p, &Input { jump: true, ..Default::default() }, TICK, &col);
+    c.near("bhop within 1 s of landing: speed - skip_speed_reduce 100", hspeed(&p), before - 100.0, 1.0);
+    // coyote time
+    let mut p = settle(&col, Vec3::new(-2100.0, 3000.0, 100.1));
+    let mut left = None;
+    for i in 0..200 {
+        sim::simulate(&mut p, &inp(1.0, 0.0), TICK, &col);
+        if !p.on_ground && p.pos.z > 50.0 {
+            left = Some(i);
+            break;
+        }
+    }
+    let mut q = p;
+    run(&mut q, &col, 6, inp(1.0, 0.0));
+    sim::simulate(&mut q, &Input { jump: true, forward: 1.0, ..Default::default() }, TICK, &col);
+    c.truth("coyote jump 0.1 s after walking off a ledge (adds 290 to vz)", left.is_some() && q.vel.z > 150.0, format!("vz {:.0}", q.vel.z));
+    let mut q = p;
+    run(&mut q, &col, 15, inp(1.0, 0.0));
+    sim::simulate(&mut q, &Input { jump: true, forward: 1.0, ..Default::default() }, TICK, &col);
+    c.truth("no jump 0.25 s after leaving the ledge", q.vel.z < 0.0, format!("vz {:.0}", q.vel.z));
+    // landing slowdown from a big fall
+    let mut p = settle(&col, start);
+    p.pos.z = 900.0;
+    p.vel = Vec3::new(200.0, 0.0, 0.0);
+    sim::simulate(&mut p, &Input::default(), TICK, &col);
+    while !p.on_ground {
+        sim::simulate(&mut p, &Input::default(), TICK, &col);
+    }
+    c.near("hard landing (900u fall >= landSlowdownHeightMax): h-speed killed", hspeed(&p), 0.0, 1.0);
+    let mut p = settle(&col, start);
+    p.pos.z = 200.0;
+    p.vel = Vec3::new(200.0, 0.0, 0.0);
+    sim::simulate(&mut p, &Input::default(), TICK, &col);
+    while !p.on_ground {
+        sim::simulate(&mut p, &Input::default(), TICK, &col);
+    }
+    c.range("soft landing (200u fall < landSlowdownHeightMin 300): speed kept", hspeed(&p), 170.0, 200.0);
+
+    // ------------------------------------------------------------ air control
+    let mut p = settle(&col, start);
+    run(&mut p, &col, 240, Input { forward: 1.0, sprint: true, ..Default::default() });
+    sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, &col);
+    let v0 = hspeed(&p);
+    run(&mut p, &col, 20, inp(1.0, 0.0));
+    c.near("air: holding W does not add speed past the 60 wish", hspeed(&p), v0, 0.5);
+    // classic strafe: hold A, turn left 3 deg/tick
+    let mut p = settle(&col, start);
+    run(&mut p, &col, 240, Input { forward: 1.0, sprint: true, ..Default::default() });
+    let mut yaw = 0.0f32;
+    sim::simulate(&mut p, &Input { forward: 1.0, jump: true, yaw, ..Default::default() }, TICK, &col);
+    let v0 = hspeed(&p);
+    for _ in 0..40 {
+        yaw += 2.0;
+        sim::simulate(&mut p, &Input { right: -1.0, yaw, ..Default::default() }, TICK, &col);
+    }
+    let gain = hspeed(&p) - v0;
+    c.range("air strafe (A + turning 120 deg/s): speed gain in 0.67 s", gain, 5.0, 120.0);
+    // tap-strafe: a new key press in the 0.5 s keyboard grace rotates the velocity, keeping speed
+    let mut p = settle(&col, start);
+    run(&mut p, &col, 240, Input { forward: 1.0, sprint: true, ..Default::default() });
+    sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, &col);
+    run(&mut p, &col, 5, inp(1.0, 0.0));
+    let before = p.vel;
+    sim::simulate(&mut p, &inp(0.0, 1.0), TICK, &col);
+    let ang = before.truncate().angle_to(p.vel.truncate()).to_degrees();
+    c.range("tap-strafe at 0.1 s: velocity turned toward the key (deg)", -ang, 20.0, 60.0);
+    c.range("tap-strafe: change capped at 0.7 x 260 per press (speed)", hspeed(&p), 200.0, 261.0);
+    let mut p = settle(&col, start);
+    run(&mut p, &col, 240, Input { forward: 1.0, sprint: true, ..Default::default() });
+    sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, &col);
+    run(&mut p, &col, 35, inp(1.0, 0.0));
+    let before = p.vel;
+    sim::simulate(&mut p, &inp(0.0, 1.0), TICK, &col);
+    let ang = before.truncate().angle_to(p.vel.truncate()).to_degrees().abs();
+    c.range("no keyboard grace 0.6 s after the jump (deg, air accel only)", ang, 0.0, 3.0);
+
+    // ------------------------------------------------------------ slide
+    let mut p = settle(&col, start);
+    run(&mut p, &col, 240, Input { forward: 1.0, sprint: true, ..Default::default() });
+    sim::simulate(&mut p, &Input { forward: 1.0, crouch: true, ..Default::default() }, TICK, &col);
+    c.truth("crouch while sprinting starts a slide", p.sliding && p.ducked, format!("sliding {} ducked {}", p.sliding, p.ducked));
+    c.range("slide boost: 260 + 150 capped at 400", hspeed(&p), 390.0, 400.0);
+    let slide_start = p;
+    let mut speeds = vec![];
+    let mut stop_t = None;
+    for i in 0..240 {
+        sim::simulate(&mut p, &Input { forward: 1.0, crouch: true, ..Default::default() }, TICK, &col);
+        if i == 29 || i == 59 {
+            speeds.push(hspeed(&p));
+        }
+        if stop_t.is_none() && !p.sliding {
+            stop_t = Some(i as f32 * TICK);
+        }
+    }
+    c.range("slide speed after 0.5 s (decel 100 + 0.7^t decay)", speeds[0], 270.0, 330.0);
+    c.range("slide speed after 1.0 s", speeds[1], 170.0, 230.0);
+    c.range("slide ends below slideStopSpeed 125 (s)", stop_t.unwrap_or(99.0), 1.2, 3.0);
+    c.near("then crouch-walk speed", hspeed(&p), 80.0, 1.0);
+    // cooldown: a second slide within 2 s of the first gets no boost
+    let mut p = slide_start;
+    run(&mut p, &col, 30, Input { forward: 1.0, sprint: true, ..Default::default() }); // stand up, keep running
+    run(&mut p, &col, 60, Input { forward: 1.0, sprint: true, ..Default::default() });
+    let pre = hspeed(&p);
+    sim::simulate(&mut p, &Input { forward: 1.0, crouch: true, ..Default::default() }, TICK, &col);
+    c.truth("slide again 1.5 s later: no boost (2 s cooldown)", p.sliding && hspeed(&p) <= pre + 1.0, format!("{pre:.0} -> {:.0}", hspeed(&p)));
+    run(&mut p, &col, 150, Input { forward: 1.0, sprint: true, ..Default::default() });
+    sim::simulate(&mut p, &Input { forward: 1.0, crouch: true, ..Default::default() }, TICK, &col);
+    c.range("slide after the cooldown: boosted again", hspeed(&p), 390.0, 400.0);
+    // slide jump inside 0.4 s: boost refunded
+    let mut p = slide_start;
+    run(&mut p, &col, 5, Input { forward: 1.0, crouch: true, ..Default::default() });
+    let pre = hspeed(&p);
+    sim::simulate(&mut p, &Input { forward: 1.0, crouch: true, jump: true, ..Default::default() }, TICK, &col);
+    c.near("slide jump within 0.4 s: speed - the boost (140) given at slide start", hspeed(&p), pre - 140.0, 1.5);
+    c.range("slide jump vz (slideJumpHeight 50: 273.9 - gravity)", p.vel.z, 254.0, 260.0);
+    // slide jump later at 300..350 snaps to slideMaxJumpSpeed
+    let mut p = settle(&col, start);
+    p.speed_scale = 1.15; // holstered: the slide boost reaches 460, so the slide passes 300..350 after 0.4 s
+    run(&mut p, &col, 240, Input { forward: 1.0, sprint: true, ..Default::default() });
+    sim::simulate(&mut p, &Input { forward: 1.0, crouch: true, ..Default::default() }, TICK, &col);
+    let t_slide = p.time();
+    let mut pre = 0.0;
+    for _ in 0..240 {
+        let s = hspeed(&p);
+        let j = p.sliding && s < 345.0 && s > 300.0 && p.time() > t_slide + 0.42;
+        pre = s;
+        sim::simulate(&mut p, &Input { forward: 1.0, crouch: true, jump: j, ..Default::default() }, TICK, &col);
+        if j {
+            break;
+        }
+    }
+    println!("     (slide jump taken at {pre:.0} u/s)");
+    c.near("slide jump at 300..350 u/s snaps to slideMaxJumpSpeed 350", hspeed(&p), 350.0, 0.5);
+    // can't stand up from a fast slide
+    let mut p = slide_start;
+    run(&mut p, &col, 3, inp(1.0, 0.0));
+    c.truth("releasing crouch above slideMaxStopSpeed keeps the slide", p.sliding, format!("speed {:.0}", hspeed(&p)));
+    // walking speed is too slow to slide
+    let mut p = settle(&col, start);
+    run(&mut p, &col, 180, inp(1.0, 0.0));
+    sim::simulate(&mut p, &Input { forward: 1.0, crouch: true, ..Default::default() }, TICK, &col);
+    c.truth("no slide from walk speed (< slideRequiredStartSpeed 200)", !p.sliding, format!("speed {:.0}", hspeed(&p)));
+
+    // ------------------------------------------------------------ steps
+    let mut p = settle(&col, Vec3::new(100.0, 0.0, 0.1));
+    run(&mut p, &col, 60, inp(1.0, 0.0));
+    c.truth("walks up a 22u step", p.pos.z > 21.9 && p.pos.x > 220.0 && hspeed(&p) > 173.0, format!("({:.0}, z {:.2})", p.pos.x, p.pos.z));
+    c.range("step-up view smoothing: eye lags the 22u step, then catches up", p.step_smooth.z, -0.5, 0.0);
+    let mut p = settle(&col, Vec3::new(100.0, 1000.0, 0.1));
+    run(&mut p, &col, 120, inp(1.0, 0.0));
+    c.truth("blocked by a 23u step", p.pos.z < 1.0 && p.pos.x < 184.1, format!("({:.1}, z {:.2})", p.pos.x, p.pos.z));
+    let mut p = settle(&col, Vec3::new(300.0, 0.0, 22.1));
+    run(&mut p, &col, 60, inp(1.0, 0.0));
+    c.truth("walks down off the 22u step (StayOnGround)", p.on_ground && p.pos.z < 0.1 && p.pos.x > 420.0, format!("({:.0}, z {:.2})", p.pos.x, p.pos.z));
+
+    // ------------------------------------------------------------ mantle (native TraversalMove exits)
+    mantle_checks(&mut c, &col);
+
+    // ------------------------------------------------------------ real map + perf
+    real_map(&mut c);
+
+    println!("\n{} / {} checks passed", c.n - c.fails, c.n);
+    if c.fails > 0 {
+        std::process::exit(1);
+    }
+}
+
+fn mantle_checks(c: &mut Checks, col: &Collision) {
+    let native = |mut p: Player| {
+        p.cvars.mantle_boost_enabled = false;
+        p
+    };
+    // plain mantle onto the 60u ledge, W held (walk exit speed)
+    let mut p = start_mantle(col, false);
+    c.truth("W + jump at a 60u ledge starts a mantle", p.mantling(), format!("{:?} z {:.1}", p.move_type, p.pos.z));
+    let t0 = p.time();
+    let mut n = 0;
+    while p.mantling() && n < 200 {
+        sim::simulate(&mut p, &inp(1.0, 0.0), TICK, col);
+        n += 1;
+    }
+    let dur = (p.time() - t0) as f32;
+    c.near("mantle ends on the ledge (z)", p.pos.z, 60.0, 0.1);
+    c.range("mantle duration (mantleDurationLevel 0.6 path)", dur, 0.35, 0.7);
+    c.near("finish with W: exit speed = walk speed 173.5", hspeed(&p), 173.5, 0.5);
+    c.truth("finish exit direction = input (+X)", p.vel.x > 170.0 && p.vel.y.abs() < 0.5, format!("{:.1?}", p.vel));
+    // with the sprint latch the finish speed is sprint speed
+    let mut p = start_mantle(col, true);
+    while p.mantling() {
+        sim::simulate(&mut p, &inp(1.0, 0.0), TICK, col);
+    }
+    c.near("finish with sprint latched: exit speed = 260", hspeed(&p), 260.0, 0.5);
+    run(&mut p, col, 10, inp(1.0, 0.0));
+    c.truth("standing on the ledge after the mantle", p.on_ground && p.pos.z > 59.9 && p.pos.x > 230.0, format!("({:.0}, z {:.2})", p.pos.x, p.pos.z));
+
+    // native mantle jump past the corner: press jump with P > 0.5 and P >= C
+    let mantle_until = |p: &mut Player, pred: &dyn Fn(&Player) -> bool, i: Input| {
+        while p.mantling() && !pred(p) {
+            sim::simulate(p, &i, TICK, col);
+        }
+    };
+    let mut p = native(start_mantle(col, true));
+    mantle_until(&mut p, &|p| p.traversal.p > 0.75 && p.traversal.p >= p.traversal.c, inp(1.0, 0.0));
+    sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, col);
+    c.truth("native mantle jump-off past the corner leaves the mantle", !p.mantling(), format!("{:?}", p.move_type));
+    c.near("mantle jump: h-speed = 260 sprint cap + 30 stale contact-plane push", hspeed(&p), 290.0, 0.5);
+    c.truth("mantle jump direction = input (+X)", p.vel.y.abs() < 0.01 && p.vel.x > 0.0, format!("{:.1?}", p.vel));
+    c.near("mantle jump: vz = jump (56)", p.vel.z, (2.0f32 * 750.0 * 56.0).sqrt() - 0.5 * 750.0 * TICK, 0.5);
+    let jumpoff = p;
+    // superglide (native): crouch on the very next tick -> slide start with the stale ground normal + boost
+    let mut p = jumpoff;
+    sim::simulate(&mut p, &Input { forward: 1.0, crouch: true, ..Default::default() }, TICK, col);
+    c.truth("superglide (crouch the tick after the jump-off): slide starts in the air", p.sliding, format!("sliding {}", p.sliding));
+    c.near("superglide exit h-speed (290 + slide boost 150, cap 400)", hspeed(&p), 400.0, 0.5);
+    let mut p = jumpoff;
+    run(&mut p, col, 1, inp(1.0, 0.0));
+    sim::simulate(&mut p, &Input { forward: 1.0, crouch: true, ..Default::default() }, TICK, col);
+    c.truth("crouch two ticks late: no superglide", !p.sliding && hspeed(&p) < 291.0, format!("sliding {} {:.0}", p.sliding, hspeed(&p)));
+    // jump press on the vertical leg with W held is dropped (spec B6.1)
+    let mut p = native(start_mantle(col, true));
+    run(&mut p, col, 2, inp(1.0, 0.0));
+    sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, col);
+    c.truth("jump on the vertical leg with W held is ignored", p.mantling() && p.traversal.jump_time == 0.0, format!("{:?}", p.move_type));
+    // hop-back: jump press below the corner without forward input -> wallrunJumpOutward/Up
+    let mut p = native(start_mantle(col, false));
+    run(&mut p, col, 2, inp(1.0, 0.0));
+    sim::simulate(&mut p, &Input { jump: true, ..Default::default() }, TICK, col);
+    let mut n = 0;
+    while p.mantling() && n < 30 {
+        sim::simulate(&mut p, &Input::default(), TICK, col);
+        n += 1;
+    }
+    c.near("hop-back: away from the wall at wallrunJumpOutwardSpeed 188", -p.vel.x, 188.0, 0.5);
+    c.near("hop-back: up at wallrunJumpUpSpeed 240", p.vel.z, 240.0, 0.5);
+    c.near("hop-back fires after automantle_jumpoff_duration 0.1 s", n as f32 * TICK, 0.1, 0.02);
+    // cancel: let go of W early -> traversal ends, you drop
+    let mut p = native(start_mantle(col, false));
+    run(&mut p, col, 2, inp(1.0, 0.0));
+    sim::simulate(&mut p, &Input::default(), TICK, col);
+    c.truth("releasing W below the rest fraction cancels the mantle", !p.mantling() && p.vel.length() < 1.0, format!("{:?} v {:.0}", p.move_type, p.vel.length()));
+    let mut p = native(start_mantle(col, false));
+    run(&mut p, col, 2, inp(1.0, 0.0));
+    sim::simulate(&mut p, &inp(-1.0, 0.0), TICK, col);
+    c.truth("pulling back (S) cancels the mantle", !p.mantling(), format!("{:?}", p.move_type));
+    // past the rest fraction the climb finishes on its own
+    let mut p = native(start_mantle(col, false));
+    mantle_until(&mut p, &|p| p.traversal.p > 0.45, inp(1.0, 0.0));
+    run(&mut p, col, 60, Input::default());
+    c.truth("past the rest fraction the mantle completes without input", !p.mantling() && p.pos.z > 59.9, format!("z {:.1}", p.pos.z));
+    // air mantle: jump at the wall from a few units back, no jump held while rising into it
+    let mut p = settle(col, Vec3::new(150.0, 2000.0, 0.1));
+    sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, col);
+    let mut mantled = false;
+    for _ in 0..60 {
+        sim::simulate(&mut p, &inp(1.0, 0.0), TICK, col);
+        mantled |= p.mantling();
+    }
+    c.truth("jumping into the ledge mantles automatically in the air", mantled && p.pos.z > 59.9, format!("z {:.1}", p.pos.z));
+
+    // ------------------------------------------------------------ mantle boost (default on)
+    let sweet = |p: &Player| p.traversal.rate > 0.0 && (1.0 - p.traversal.p) / p.traversal.rate <= 0.1 && p.traversal.p > 0.5;
+    let mut p = start_mantle(col, false);
+    mantle_until(&mut p, &sweet, inp(1.0, 0.0));
+    let sweet_frac = p.mantle_boost.sweet_spot_frac;
+    sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, col);
+    c.truth("mantle boost: jump in the sweet spot arms state 4, climb continues", p.mantle_boost.state == 4 && p.mantling(), format!("state {} {:?}", p.mantle_boost.state, p.move_type));
+    let mut p_done = p;
+    while p_done.mantling() {
+        sim::simulate(&mut p_done, &inp(1.0, 0.0), TICK, col);
+    }
+    c.near("mantle boost exit h-speed = 260 x 1.3", hspeed(&p_done), 338.0, 0.5);
+    c.near("mantle boost vz = sqrt(2*750*90)", p_done.vel.z, (2.0f32 * 750.0 * 90.0).sqrt(), 0.5);
+    c.truth("mantle boost: exit along the input (+X), slide granted", p_done.vel.x > 337.0 && p_done.sliding, format!("{:.1?} sliding {}", p_done.vel, p_done.sliding));
+    c.range("sweet spot opens late in the climb (frac)", sweet_frac, 0.8, 0.98);
+    // boost suppresses tap-strafes until landing
+    let mut q = p_done;
+    run(&mut q, col, 5, inp(1.0, 0.0));
+    let mut r = q;
+    r.mantle_boost.state = 0; // same flight without the suppression
+    let before = q.vel;
+    sim::simulate(&mut q, &inp(0.0, 1.0), TICK, col);
+    sim::simulate(&mut r, &inp(0.0, 1.0), TICK, col);
+    let ang = before.truncate().angle_to(q.vel.truncate()).to_degrees().abs();
+    let ang_free = before.truncate().angle_to(r.vel.truncate()).to_degrees().abs();
+    c.range("no tap-strafe after a mantle boost (deg, air accel only)", ang, 0.0, 3.0);
+    c.range("  (same press without the boost state: tap-strafe turns, deg)", ang_free, 15.0, 60.0);
+    // press outside the sweet spot: plain mantle jump (state 3)
+    let mut p = start_mantle(col, false);
+    mantle_until(&mut p, &|p| p.traversal.p > 0.3, inp(1.0, 0.0));
+    sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, col);
+    c.truth("jump outside the sweet spot latches state 3", p.mantle_boost.state == 3, format!("state {}", p.mantle_boost.state));
+    while p.mantling() {
+        sim::simulate(&mut p, &inp(1.0, 0.0), TICK, col);
+    }
+    c.near("state 3 exit h-speed = sprintspeed 260", hspeed(&p), 260.0, 0.5);
+    c.near("state 3 vz = sqrt(2*750*56)", p.vel.z, (2.0f32 * 750.0 * 56.0).sqrt(), 0.5);
+    c.truth("state 3: no slide granted", !p.sliding, format!("sliding {}", p.sliding));
+    // no press: ordinary finish
+    let mut p = start_mantle(col, false);
+    while p.mantling() {
+        sim::simulate(&mut p, &inp(1.0, 0.0), TICK, col);
+    }
+    c.truth("no press: plain finish, boost state 0", p.mantle_boost.state == 0 && (hspeed(&p) - 173.5).abs() < 0.5, format!("state {} {:.1}", p.mantle_boost.state, hspeed(&p)));
+}
+
+/// Settings consts vs the game's own file (tolerant line regex `"key": value`; poseSettings blocks in order).
+fn check_settings_file(c: &mut Checks) {
+    let cfg = shared::assets::Config::load();
+    let path = cfg.assets_root().join("data/settings/player/mp/pilot_survival_firesupport.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        println!("SKIP settings file check ({} not found)", path.display());
+        return;
+    };
+    let mut stances: Vec<Vec<(String, String)>> = vec![];
+    let mut top: Vec<(String, String)> = vec![];
+    let mut in_pose = false;
+    let mut cur = vec![];
+    for line in text.lines() {
+        let l = line.trim();
+        if l.starts_with("\"poseSettings\"") {
+            in_pose = true;
+            continue;
+        }
+        if in_pose && l.starts_with(']') {
+            in_pose = false;
+            continue;
+        }
+        if in_pose && l.starts_with('}') {
+            stances.push(std::mem::take(&mut cur));
+            continue;
+        }
+        if let Some((k, v)) = l.split_once(':') {
+            let k = k.trim().trim_matches('"').to_string();
+            let v = v.trim().trim_end_matches(',').trim_matches('"').to_string();
+            if in_pose { cur.push((k, v)) } else { top.push((k, v)) }
+        }
+    }
+    let num = |kv: &[(String, String)], k: &str| -> f32 {
+        kv.iter().find(|(a, _)| a == k).map(|(_, v)| v.trim_start_matches('<').split(',').last().unwrap().trim_end_matches('>').parse().unwrap_or(f32::NAN)).unwrap_or(f32::NAN)
+    };
+    let s = STOCK;
+    let mut bad = vec![];
+    for (i, st) in [s.stand, s.crouch].iter().enumerate() {
+        let kv = &stances[i];
+        for (k, v) in [
+            ("hull_max", st.hull_max.z),
+            ("viewheight", st.viewheight),
+            ("lowSpeed", st.low_speed),
+            ("speed", st.speed),
+            ("sprintspeed", st.sprintspeed),
+            ("acceleration", st.acceleration),
+            ("deceleration", st.deceleration),
+            ("lowAcceleration", st.low_acceleration),
+            ("sprintAcceleration", st.sprint_acceleration),
+            ("sprintDeceleration", st.sprint_deceleration),
+        ] {
+            if num(kv, k) != v {
+                bad.push(format!("pose{i}.{k}"));
+            }
+        }
+    }
+    for (k, v) in [
+        ("stepHeight", s.step_height),
+        ("airSpeed", s.air_speed),
+        ("airAcceleration", s.air_acceleration),
+        ("jumpHeight", s.jump_height),
+        ("slideJumpHeight", s.slide_jump_height),
+        ("antiMultiJumpHeightFrac", s.anti_multi_jump_height_frac),
+        ("antiMultiJumpTimeMin", s.anti_multi_jump_time_min),
+        ("antiMultiJumpTimeMax", s.anti_multi_jump_time_max),
+        ("landSlowdownDuration", s.land_slowdown_duration),
+        ("landSlowdownHeightMin", s.land_slowdown_height_min),
+        ("landSlowdownHeightMax", s.land_slowdown_height_max),
+        ("landSlowdownNoSprintFrac", s.land_slowdown_no_sprint_frac),
+        ("mantleHeight", s.mantle_height),
+        ("mantleDurationBelow", s.mantle_duration_below),
+        ("mantleDurationLevel", s.mantle_duration_level),
+        ("mantleDurationAbove", s.mantle_duration_above),
+        ("mantleDurationHigh", s.mantle_duration_high),
+        ("player_slideBoostCooldown", s.slide_boost_cooldown),
+        ("slideDecel", s.slide_decel),
+        ("slideWantToStopDecel", s.slide_want_to_stop_decel),
+        ("slideVelocityDecay", s.slide_velocity_decay),
+        ("slideAccel", s.slide_accel),
+        ("slideRequiredStartSpeed", s.slide_required_start_speed),
+        ("slideRequiredStartSpeedAir", s.slide_required_start_speed_air),
+        ("slideStopSpeed", s.slide_stop_speed),
+        ("slideMaxStopSpeed", s.slide_max_stop_speed),
+        ("slideMaxJumpSpeed", s.slide_max_jump_speed),
+        ("slideSpeedBoost", s.slide_speed_boost),
+        ("slideSpeedBoostCap", s.slide_speed_boost_cap),
+        ("wallrunJumpUpSpeed", s.wallrun_jump_up_speed),
+        ("wallrunJumpOutwardSpeed", s.wallrun_jump_outward_speed),
+        ("gravityScale", s.gravity_scale),
+    ] {
+        if num(&top, k) != v {
+            bad.push(k.to_string());
+        }
+    }
+    c.truth("settings consts == pilot_survival_firesupport.json", bad.is_empty(), if bad.is_empty() { "all match".into() } else { bad.join(",") });
+}
+
+fn real_map(c: &mut Checks) {
+    use shared::{assets::Config, glb};
+    let cfg = Config::load();
+    let Ok(w) = glb::load_world(&cfg.world_glb(), glb::Mode::Geometry, true) else {
+        println!("SKIP real map (world.glb not found)");
+        return;
+    };
+    let idx: Vec<u32> = w
+        .draws
+        .iter()
+        .filter(|d| w.materials[d.material as usize].solid())
+        .flat_map(|d| w.indices[d.first_index as usize..(d.first_index + d.index_count) as usize].iter().copied())
+        .collect();
+    let col = Collision::build(w.positions.clone(), &idx);
+    println!("real map: {} triangles, BVH {:.0} ms", col.tri_count(), col.build_ms);
+    let spawn = sim::find_free(&col, Vec3::new(-11740.0, 512.0, 1584.0));
+    let mut p = Player::new(spawn);
+    run(&mut p, &col, 30, Input::default());
+    c.truth("real map: spawn lands on the floor", p.on_ground, format!("z {:.2}", p.pos.z));
+    let mut q = p;
+    run(&mut q, &col, 600, Input { forward: 1.0, sprint: true, ..Default::default() });
+    let moved = (q.pos - p.pos).truncate().length();
+    c.range("real map: 10 s sprint down the spawn corridor + ramp (horizontal units)", moved, 2200.0, 2600.0);
+    c.truth("real map: on the ground at the end", q.on_ground, format!("({:.0},{:.0},{:.0})", q.pos.x, q.pos.y, q.pos.z));
+    let z0 = p.pos.z;
+    let t = Instant::now();
+    let mut worst = 0.0f64;
+    let ticks = 600;
+    for i in 0..ticks {
+        let jump = i % 50 == 25;
+        let crouch = (i / 120) % 2 == 1 && i % 120 < 30;
+        let ti = Instant::now();
+        sim::simulate(&mut p, &Input { forward: 1.0, sprint: true, jump, crouch, right: if (i / 90) % 2 == 0 { 0.0 } else { 0.3 }, ..Default::default() }, TICK, &col);
+        worst = worst.max(ti.elapsed().as_secs_f64());
+    }
+    let avg_us = t.elapsed().as_secs_f64() * 1e6 / ticks as f64;
+    c.truth("real map: still above the floor (no fall-through)", p.pos.z > z0 - 200.0 && p.move_type == MoveType::Walk, format!("z {:.0} (start {:.0})", p.pos.z, z0));
+    c.range("real map: avg tick cost (us)", avg_us as f32, 0.0, 1000.0);
+    println!("     real map tick: avg {avg_us:.1} us, worst {:.1} us, ended at ({:.0},{:.0},{:.0}) {}", worst * 1e6, p.pos.x, p.pos.y, p.pos.z, p.state_name());
+}

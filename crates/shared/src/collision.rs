@@ -11,6 +11,26 @@ pub const RADIUS: f32 = 16.0;
 /// Capsule axis runs from feet+RADIUS to feet+RADIUS+AXIS_LEN (total height 72).
 pub const AXIS_LEN: f32 = 40.0;
 pub const WALKABLE_Z: f32 = 0.7;
+/// Source/Apex DIST_EPSILON: hull traces stop this far short of a surface (along its normal).
+pub const DIST_EPSILON: f32 = 1.0 / 32.0;
+
+/// Result of [`Collision::trace_hull`] (the fields of Source's trace_t that movement reads).
+#[derive(Clone, Copy, Debug)]
+pub struct Trace {
+    /// 0..1 of the move completed
+    pub fraction: f32,
+    pub endpos: Vec3,
+    /// hit plane normal (unit, pointing back at the box); zero when nothing was hit
+    pub normal: Vec3,
+    pub startsolid: bool,
+    pub allsolid: bool,
+}
+
+impl Trace {
+    pub fn hit(&self) -> bool {
+        self.fraction < 1.0
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Node {
@@ -369,6 +389,82 @@ impl Collision {
         best
     }
 
+    /// Swept axis-aligned box (Apex's TraceHull): moves the box `mins..maxs` (relative to the origin) from `start`
+    /// to `end` against every solid triangle and returns where it stops, Source-style:
+    /// - the box stops `DIST_EPSILON` (1/32) short of the surface along the hit normal, so a box resting on a
+    ///   floor sits 1/32 above it and sliding along that floor is not a hit;
+    /// - a triangle the box already overlaps at `start` sets `startsolid` and does not block, unless the move
+    ///   goes deeper into its plane (then it blocks at fraction 0, so an embedded floor can't be fallen through);
+    ///   `allsolid` is set when such a triangle blocks the whole move;
+    /// - exact separating-axis test (3 box axes, the triangle normal, 9 edge crosses), two-sided.
+    ///   A zero-length trace is a pure overlap test.
+    pub fn trace_hull(&self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3) -> Trace {
+        let half = (maxs - mins) * 0.5;
+        let c0 = start + (mins + maxs) * 0.5;
+        let d = end - start;
+        let mut out = Trace { fraction: 1.0, endpos: end, normal: Vec3::ZERO, startsolid: false, allsolid: false };
+        let pad = Vec3::splat(DIST_EPSILON + 0.01);
+        let lo = c0.min(c0 + d) - half - pad;
+        let hi = c0.max(c0 + d) + half + pad;
+        let mut best = 1.0f32;
+        let mut best_n = Vec3::ZERO;
+        let mut hit = false;
+        let mut stack = [0u32; 64];
+        let mut sp = 1usize;
+        while sp > 0 {
+            sp -= 1;
+            let idx = stack[sp];
+            let node = &self.nodes[idx as usize];
+            if node.min[0] > hi.x || node.max[0] < lo.x || node.min[1] > hi.y || node.max[1] < lo.y || node.min[2] > hi.z || node.max[2] < lo.z {
+                continue;
+            }
+            if node.n == 0 {
+                stack[sp] = node.a;
+                stack[sp + 1] = idx + 1;
+                sp += 2;
+                continue;
+            }
+            for s in node.a..node.a + node.n {
+                let [a, b, c] = self.tri(s);
+                // cheap per-triangle AABB reject
+                let tmn = a.min(b).min(c);
+                let tmx = a.max(b).max(c);
+                if tmn.x > hi.x || tmx.x < lo.x || tmn.y > hi.y || tmx.y < lo.y || tmn.z > hi.z || tmx.z < lo.z {
+                    continue;
+                }
+                match sweep_box_tri(a - c0, b - c0, c - c0, half, d) {
+                    Sweep::Miss => {}
+                    Sweep::Start { blocks } => {
+                        out.startsolid = true;
+                        if let Some(n) = blocks {
+                            // moving deeper into an embedded triangle: no motion at all
+                            if !hit || best > 0.0 || n.z > best_n.z {
+                                best = 0.0;
+                                best_n = n;
+                                hit = true;
+                                out.allsolid = true;
+                            }
+                        }
+                    }
+                    Sweep::Hit(f, n) => {
+                        // ties (common on flat floors made of many triangles) prefer the most upward normal
+                        if !hit || f < best - 1e-6 || (f <= best + 1e-6 && n.z > best_n.z) {
+                            best = if f < best { f } else { best };
+                            best_n = n;
+                            hit = true;
+                        }
+                    }
+                }
+            }
+        }
+        if hit {
+            out.fraction = best;
+            out.normal = best_n;
+            out.endpos = start + d * best;
+        }
+        out
+    }
+
     /// Debug: every triangle the capsule at `pos` overlaps, with its push-out vector.
     pub fn contacts(&self, pos: Vec3) -> Vec<([Vec3; 3], Vec3)> {
         let lo = Vec3::new(pos.x - RADIUS - 6.0, pos.y - RADIUS - 6.0, pos.z - 6.0);
@@ -527,4 +623,93 @@ fn capsule_tri(a: Vec3, b: Vec3, r: f32, tri: &[Vec3; 3]) -> Option<Vec3> {
         -n
     };
     Some(dir * (r - d))
+}
+
+enum Sweep {
+    Miss,
+    /// overlapping at the start; `blocks` = the plane normal when the move goes deeper into the triangle
+    Start { blocks: Option<Vec3> },
+    Hit(f32, Vec3),
+}
+
+/// Swept separating-axis test of an axis-aligned box (half extents `h`, centre at the origin, moving by `d`)
+/// against the triangle p0 p1 p2 (relative to the box centre). Entry happens when the box comes within
+/// DIST_EPSILON along the separating axis, so the returned fraction already includes Source's back-off.
+fn sweep_box_tri(p0: Vec3, p1: Vec3, p2: Vec3, h: Vec3, d: Vec3) -> Sweep {
+    let e = [p1 - p0, p2 - p1, p0 - p2];
+    let tn = e[0].cross(p2 - p0);
+    let mut axes = [Vec3::ZERO; 13];
+    axes[0] = Vec3::X;
+    axes[1] = Vec3::Y;
+    axes[2] = Vec3::Z;
+    axes[3] = tn;
+    let mut k = 4;
+    for ei in e {
+        axes[k] = ei.cross(Vec3::X);
+        axes[k + 1] = ei.cross(Vec3::Y);
+        axes[k + 2] = ei.cross(Vec3::Z);
+        k += 3;
+    }
+    let mut t_enter = f32::NEG_INFINITY;
+    let mut t_exit = f32::INFINITY;
+    let mut enter_n = Vec3::ZERO;
+    let mut solid_now = true;
+    for a in axes.iter() {
+        let l2 = a.length_squared();
+        if l2 < 1e-12 {
+            continue;
+        }
+        let a = *a / l2.sqrt();
+        let r = h.x * a.x.abs() + h.y * a.y.abs() + h.z * a.z.abs();
+        let (q0, q1, q2) = (p0.dot(a), p1.dot(a), p2.dot(a));
+        let lo = q0.min(q1).min(q2) - r;
+        let hi = q0.max(q1).max(q2) + r;
+        let da = d.dot(a);
+        if lo >= 0.0 {
+            // triangle lies ahead along +a: only reachable by moving +a
+            solid_now = false;
+            if da <= 0.0 {
+                return Sweep::Miss;
+            }
+            let te = (lo - DIST_EPSILON) / da;
+            if te > t_enter {
+                t_enter = te;
+                enter_n = -a;
+            }
+            t_exit = t_exit.min((hi + DIST_EPSILON) / da);
+        } else if hi <= 0.0 {
+            solid_now = false;
+            if da >= 0.0 {
+                return Sweep::Miss;
+            }
+            let te = (hi + DIST_EPSILON) / da;
+            if te > t_enter {
+                t_enter = te;
+                enter_n = a;
+            }
+            t_exit = t_exit.min((lo - DIST_EPSILON) / da);
+        } else if da > 0.0 {
+            t_exit = t_exit.min((hi + DIST_EPSILON) / da);
+        } else if da < 0.0 {
+            t_exit = t_exit.min((lo - DIST_EPSILON) / da);
+        }
+    }
+    if solid_now {
+        // embedded: block only a move that goes deeper into the triangle's plane (towards it from the side the
+        // box centre is on), so an embedded box can still walk out but can't fall through a floor
+        let l2 = tn.length_squared();
+        if l2 > 1e-12 {
+            let n = tn / l2.sqrt();
+            let side = if p0.dot(n) > 0.0 { -1.0 } else { 1.0 }; // centre is at the origin
+            let n = n * side;
+            if d.dot(n) < -1e-4 {
+                return Sweep::Start { blocks: Some(n) };
+            }
+        }
+        return Sweep::Start { blocks: None };
+    }
+    if t_enter >= t_exit || t_enter > 1.0 || t_exit <= 0.0 {
+        return Sweep::Miss;
+    }
+    Sweep::Hit(t_enter.max(0.0), enter_n)
 }

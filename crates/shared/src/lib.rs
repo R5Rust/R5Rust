@@ -6,6 +6,7 @@ pub mod assets;
 pub mod bsplight;
 pub mod collision;
 pub mod glb;
+pub mod settings;
 pub mod sim;
 
 pub use glam::{Vec2, Vec3};
