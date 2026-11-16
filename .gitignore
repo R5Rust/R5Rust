@@ -2,3 +2,5 @@ target/
 /r5rust.toml
 /play/
 /r5rust_settings.toml
+tools/r5f-probe/out/
+.claude/worktrees/

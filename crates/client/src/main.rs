@@ -328,10 +328,12 @@ impl App {
             if let (Some(w), Some(g)) = (&self.window, &self.game) {
                 let p = g.player.pos;
                 w.set_title(&format!(
-                    "R5Rust  |  {fps:.0} fps  |  {:.0}, {:.0}, {:.0}  |  {:.0} u/s  |  {}{}",
+                    "R5Rust  |  {fps:.0} fps  |  {:.0}, {:.0}, {:.0}  ang {:.1} {:.1}  |  {:.0} u/s  |  {}{}",
                     p.x,
                     p.y,
                     p.z,
+                    g.pitch,
+                    g.yaw,
                     g.player.vel.truncate().length(),
                     g.player.state_name(),
                     if self.menu.as_ref().is_some_and(|m| m.open) { "  |  settings (Esc to resume)" } else if self.grabbed { "  |  Esc: settings" } else { "  |  click to play" }
