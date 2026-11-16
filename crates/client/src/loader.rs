@@ -183,7 +183,7 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     let probe_ix = lighting::assign_probes(&bsp, &world.vertices, &world.indices, &world.draws, |m| world.materials[m as usize].lightmapped);
     let probe_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("probe vb"), contents: bytemuck::cast_slice(&probe_ix), usage: wgpu::BufferUsages::VERTEX });
     drop(probe_ix);
-    let light = GpuLighting::new(device, queue, &bsp);
+    let light = GpuLighting::new(device, queue, &bsp, &cfg.map_dir().join("cubemaps.dds"));
     drop(bsp);
     let t_light = t0.elapsed().as_secs_f64();
 

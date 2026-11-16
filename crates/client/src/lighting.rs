@@ -51,6 +51,68 @@ pub struct GpuLighting {
     pub sky_color: [f32; 3],
     pub light_count: usize,
     pub probe_count: usize,
+    /// the map's baked reflection cubemaps (BC6H HDR), one cube per BSP cubemap record
+    pub cubes: wgpu::TextureView,
+    /// per cubemap: 1 / luminance of its average (CUBEMAPS_AMBIENT_RCP stand-in; the shipped lump is zeros)
+    pub cube_ambient: wgpu::Buffer,
+}
+
+const CUBE_AMBIENT_WGSL: &str = r#"
+@group(0) @binding(0) var cubes: texture_cube_array<f32>;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var<storage, read_write> outv: array<f32>;
+@compute @workgroup_size(16)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let n = textureNumLayers(cubes);
+    if (id.x >= n) { return; }
+    let lvl = f32(textureNumLevels(cubes) - 1);
+    var c = vec3<f32>(0.0);
+    let dirs = array<vec3<f32>, 6>(vec3(1.0, 0.0, 0.0), vec3(-1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0), vec3(0.0, -1.0, 0.0), vec3(0.0, 0.0, 1.0), vec3(0.0, 0.0, -1.0));
+    for (var k = 0; k < 6; k++) {
+        c += textureSampleLevel(cubes, samp, dirs[k], i32(id.x), lvl).rgb;
+    }
+    let l = dot(c / 6.0, vec3<f32>(0.2126, 0.7152, 0.0722));
+    outv[id.x] = 1.0 / max(l, 1e-3);
+}
+"#;
+
+fn load_cubes(device: &wgpu::Device, queue: &wgpu::Queue, path: &std::path::Path, count: usize) -> (wgpu::TextureView, wgpu::Buffer) {
+    let n = count.max(1);
+    let tex = match crate::dds::load(path) {
+        Ok(d) if d.layers as usize >= 6 => crate::dds::upload(device, queue, &d, "cubemaps"),
+        r => {
+            if let Err(e) = r {
+                log::warn!("cubemaps: {e}; reflections off");
+            }
+            let d = crate::dds::Dds { width: 4, height: 4, mips: 1, layers: 6, format: wgpu::TextureFormat::Bc6hRgbUfloat, data: vec![0; 16 * 6] };
+            crate::dds::upload(device, queue, &d, "cubemaps (none)")
+        }
+    };
+    let layers = tex.depth_or_array_layers();
+    let view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::CubeArray), array_layer_count: Some(layers / 6 * 6), ..Default::default() });
+    let buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("cube ambient"), size: (n.max((layers / 6) as usize) * 4) as u64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+    let samp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+    let sh = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("cube ambient"), source: wgpu::ShaderSource::Wgsl(CUBE_AMBIENT_WGSL.into()) });
+    let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("cube ambient"), layout: None, module: &sh, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("cube ambient"),
+        layout: &pipe.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&samp) },
+            wgpu::BindGroupEntry { binding: 2, resource: buf.as_entire_binding() },
+        ],
+    });
+    let mut enc = device.create_command_encoder(&Default::default());
+    {
+        let mut cp = enc.begin_compute_pass(&Default::default());
+        cp.set_pipeline(&pipe);
+        cp.set_bind_group(0, &bg, &[]);
+        cp.dispatch_workgroups((layers / 6).div_ceil(16), 1, 1);
+    }
+    queue.submit([enc.finish()]);
+    log::info!("cubemaps: {} ({}x{}, {} mips)", layers / 6, tex.width(), tex.height(), tex.mip_level_count());
+    (view, buf)
 }
 
 fn tex(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, format: wgpu::TextureFormat, data: &[u8], bytes_per_row: u32, rows: u32, label: &str) -> wgpu::TextureView {
@@ -106,7 +168,7 @@ fn gpu_light(l: &WorldLight) -> GpuLight {
 }
 
 impl GpuLighting {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, bsp: &BspLighting) -> Self {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, bsp: &BspLighting, cube_path: &std::path::Path) -> Self {
         let (aw, ah) = (bsp.sky0.width, bsp.sky0.height);
         let lm0 = tex(device, queue, aw, ah, wgpu::TextureFormat::Rgba8Unorm, &bsp.sky0.rgba, aw * 4, ah, "lm0");
         let lm1 = tex(device, queue, aw, ah, wgpu::TextureFormat::Rgba8Unorm, &bsp.sky1.rgba, aw * 4, ah, "lm1");
@@ -179,6 +241,7 @@ impl GpuLighting {
         }
         let probes = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("probes"), contents: bytemuck::cast_slice(&gp), usage: wgpu::BufferUsages::STORAGE });
 
+        let (cubes, cube_ambient) = load_cubes(device, queue, cube_path, bsp.cubemaps.len());
         let sun = bsp.lights.iter().find(|l| l.emit_type == 3);
         let sky = bsp.lights.iter().find(|l| l.emit_type == 5);
         let sun_color = sun.map(|l| l.intensity).unwrap_or([1.5, 1.4, 1.2]);
@@ -192,13 +255,13 @@ impl GpuLighting {
             sun_dir,
             sky_color
         );
-        GpuLighting { lm0, lm1, rtl_ids, rtl_vis, lights, rtl_index, probes, sun_color, sun_dir, sky_color, light_count: gl.len(), probe_count: gp.len() }
+        GpuLighting { lm0, lm1, rtl_ids, rtl_vis, lights, rtl_index, probes, sun_color, sun_dir, sky_color, light_count: gl.len(), probe_count: gp.len(), cubes, cube_ambient }
     }
 }
 
 /// One probe per static-prop instance, like the game: instances aren't kept in world.glb, so each connected
 /// component of a non-lightmapped draw stands in for one, and takes the probe nearest its centre.
-/// Returns a per-vertex probe index (u32::MAX = none / lightmapped).
+/// Returns per vertex: probe index in bits 0-23 (0xFFFFFF = none / lightmapped), cubemap index in bits 24-31.
 pub fn assign_probes(bsp: &BspLighting, vertices: &[shared::glb::Vertex], indices: &[u32], draws: &[shared::glb::Draw], lightmapped: impl Fn(u32) -> bool) -> Vec<u32> {
     let n = vertices.len();
     let mut parent: Vec<u32> = (0..n as u32).collect();
@@ -245,8 +308,20 @@ pub fn assign_probes(bsp: &BspLighting, vertices: &[shared::glb::Vertex], indice
         .map(|(&r, (s, c))| {
             let c = *c as f64;
             let p = [(s[0] / c) as f32, (s[1] / c) as f32, (s[2] / c) as f32];
-            (r, bsp.nearest_probe(p).unwrap_or(u32::MAX))
+            let packed = match bsp.nearest_probe(p) {
+                Some(r) => (r.probe & 0xFFFFFF) | ((r.cube_index as u32 & 0xFF) << 24),
+                None => 0xFFFFFF | (bsp.nearest_cubemap(p) << 24),
+            };
+            (r, packed)
         })
         .collect();
-    (0..n).map(|v| if prop_vertex[v] { probe_of.get(&find(&mut parent, v as u32)).copied().unwrap_or(u32::MAX) } else { u32::MAX }).collect()
+    let roots: Vec<u32> = (0..n).map(|v| if prop_vertex[v] { find(&mut parent, v as u32) } else { u32::MAX }).collect();
+    use rayon::prelude::*;
+    (0..n)
+        .into_par_iter()
+        .map(|v| match roots[v] {
+            u32::MAX => 0xFFFFFF | (bsp.nearest_cubemap(vertices[v].pos) << 24),
+            r => probe_of.get(&r).copied().unwrap_or(0xFFFFFF | (bsp.nearest_cubemap(vertices[v].pos) << 24)),
+        })
+        .collect()
 }

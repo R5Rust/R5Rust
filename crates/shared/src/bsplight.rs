@@ -183,9 +183,21 @@ impl BspLighting {
     }
 
     /// Nearest probe in the leaf containing `p` (index into `probes`), if any.
-    pub fn nearest_probe(&self, p: [f32; 3]) -> Option<u32> {
+    pub fn nearest_probe(&self, p: [f32; 3]) -> Option<ProbeRef> {
         let d2 = |r: &ProbeRef| (0..3).map(|k| (r.origin[k] - p[k]).powi(2)).sum::<f32>();
-        self.probe_leaf(p).iter().min_by(|a, b| d2(a).total_cmp(&d2(b))).map(|r| r.probe)
+        self.probe_leaf(p).iter().min_by(|a, b| d2(a).total_cmp(&d2(b))).copied()
+    }
+
+    /// Index of the cubemap closest to `p` (stand-in for the world vertex CUBEMAP_ID the export dropped).
+    pub fn nearest_cubemap(&self, p: [f32; 3]) -> u32 {
+        let mut best = (f32::MAX, 0u32);
+        for (i, c) in self.cubemaps.iter().enumerate() {
+            let d = (0..3).map(|k| (c.origin[k] as f32 - p[k]).powi(2)).sum::<f32>();
+            if d < best.0 {
+                best = (d, i as u32);
+            }
+        }
+        best.1
     }
 }
 

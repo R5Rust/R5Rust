@@ -228,6 +228,8 @@ impl Gfx {
                 layout_entry(9, storage_ty()),
                 layout_entry(10, storage_ty()),
                 layout_entry(11, storage_ty()),
+                layout_entry(12, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::CubeArray, multisampled: false }),
+                layout_entry(13, storage_ty()),
             ],
         });
         let mat_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -461,6 +463,8 @@ impl Gfx {
                 wgpu::BindGroupEntry { binding: 9, resource: world.light.lights.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 10, resource: world.light.rtl_index.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: world.light.probes.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(&world.light.cubes) },
+                wgpu::BindGroupEntry { binding: 13, resource: world.light.cube_ambient.as_entire_binding() },
             ],
         }));
         self.csm.invalidate();

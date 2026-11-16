@@ -6,6 +6,7 @@
 //!          [--hold w,shift,space] [--fly]
 
 mod csm;
+mod dds;
 mod lighting;
 mod texcache;
 mod gfx;

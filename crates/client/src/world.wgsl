@@ -52,6 +52,8 @@ struct Probe {
 @group(0) @binding(9) var<storage, read> lights: array<Light>;
 @group(0) @binding(10) var<storage, read> rtl_index: array<u32>;
 @group(0) @binding(11) var<storage, read> probes: array<Probe>;
+@group(0) @binding(12) var cubes: texture_cube_array<f32>;
+@group(0) @binding(13) var<storage, read> cube_ambient: array<f32>;
 
 struct Mat {
     color: vec4<f32>,
@@ -266,12 +268,16 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
     // ---- baked indirect + baked sun visibility
     var indirect = vec3<f32>(0.0);
     var sun_baked = 1.0;
+    var env_ambient_src = fr.sky.rgb * 0.5;
+    var env_sky_len = 0.0;
     let ndnv = clamp(dot(n, nv), 0.0, 1.0);
     if (mt.params.y > 0.5) {
         let baked = lm0.rgb * (lm0.a * 3.984375 + 0.015625);
         let sky_vec = lm1.rgb * 2.007874 - 1.0;
         indirect = baked * ndnv + sky_term(n, sky_vec) * fr.sky.rgb;
         sun_baked = lm1.a;
+        env_ambient_src = baked;
+        env_sky_len = length(sky_vec);
         // real-time lights from the lightmap's light-ID page, masked by their baked visibility
         let dims = vec2<f32>(textureDimensions(rtl_ids));
         let id = textureLoad(rtl_ids, vec2<i32>(min(i.uv1 * dims, dims - 1.0)), 0).r;
@@ -283,11 +289,13 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
             let li = rtl_index[grp * 63u + slot];
             eval_light(&acc, s, li, wp, vis4[k]);
         }
-    } else if (i.probe != 0xffffffffu) {
-        let p = probes[i.probe];
+    } else if ((i.probe & 0xffffffu) != 0xffffffu) {
+        let p = probes[i.probe & 0xffffffu];
         let sh = max(vec3<f32>(dot(n, p.sh[0].xyz) + p.sh[0].w, dot(n, p.sh[1].xyz) + p.sh[1].w, dot(n, p.sh[2].xyz) + p.sh[2].w), vec3<f32>(0.0));
         indirect = sh * ndnv + sky_term(n, p.sky.xyz) * fr.sky.rgb;
         sun_baked = p.sky.w;
+        env_ambient_src = vec3<f32>(p.sh[0].w, p.sh[1].w, p.sh[2].w);
+        env_sky_len = length(p.sky.xyz);
         for (var k = 0; k < 4; k++) {
             if (p.idx[k] >= 0 && p.wts[k] > 0.0) {
                 eval_light(&acc, s, u32(p.idx[k]), wp, p.wts[k]);
@@ -308,7 +316,21 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
     // ---- composite (section 7); no cubemap reflections yet, no fog (level params unknown)
     var ao = 1.0;
     if (mt.params2.x > 0.5) { ao = floor(ao_s * 255.0) / 255.0; }
-    var c = albedo * (acc.diff + albedo * acc.multi) + acc.spec + albedo * indirect * ao + emis;
+    // ---- environment specular from the baked cubemap (section 5)
+    let cube = i32(i.probe >> 24u);
+    let rv = -s.v + 2.0 * s.nov * n;
+    let r2 = r * r;
+    let mip_a = 22.6 * r2 * r2 - 44.9 * r2 * r + 26.8 * r2 + 3.69 * r - 0.185;
+    let mip_b = -11.0 * r2 * r2 + 23.5 * r2 * r - 11.4 * r2 + 3.55 * r - 0.0882;
+    let mip = clamp(mip_a + sq(1.0 - s.nov) * (mip_b - mip_a), 0.0, 8.0);
+    let env = textureSampleLevel(cubes, mat_samp, rv, cube, mip).rgb;
+    let fe = f0 + (1.0 - f0) * pow5(1.0 - s.nov);
+    let kr = 1.0 - 0.5 * clamp(2.0 * r - 1.0, 0.0, 1.0);
+    let horizon = clamp(1.0 + 1.3 * dot(rv, nv), 0.0, 1.0);
+    let occ = clamp((lum(env_ambient_src) + env_sky_len * lum(fr.sky.rgb)) * cube_ambient[cube], 0.0, 1.0) * horizon;
+    let env_spec = env * fe * kr * occ * (4.0 * s.nov * s.nov) / (2.0 * max(2.0 * s.nov * mix(s.nov, 1.0, s.a), 0.00125));
+
+    var c = albedo * (acc.diff + albedo * acc.multi) + acc.spec + env_spec + albedo * indirect * ao + emis;
 
     let dbg = fr.misc.w;
     if (dbg > 0.5 && dbg < 1.5) { c = vec3<f32>(sun); }
@@ -316,6 +338,8 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
     if (dbg > 2.5 && dbg < 3.5) { c = albedo; }
     if (dbg > 3.5 && dbg < 4.5) { c = n * 0.5 + 0.5; }
     if (dbg > 4.5 && dbg < 5.5) { c = acc.diff + acc.spec; }
+    if (dbg > 5.5 && dbg < 6.5) { c = env_spec; }
+    if (dbg > 6.5 && dbg < 7.5) { c = env; }
 
     var a = base.a * mt.color.a;
     if (mt.params.z > 0.5 && mt.params.z < 1.5) {
