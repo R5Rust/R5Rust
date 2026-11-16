@@ -407,15 +407,22 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let icon = image::load_from_memory(include_bytes!("../../../assets/logo.png")).ok().and_then(|i| {
-            let i = i.resize(128, 128, image::imageops::FilterType::Triangle).to_rgba8();
-            let (w, h) = i.dimensions();
-            Icon::from_rgba(i.into_raw(), w, h).ok()
-        });
+        // square icon (tools/make_icon.py): small = title bar, big = taskbar / Alt-Tab
+        let icon = |px: u32| {
+            image::load_from_memory(include_bytes!("../../../assets/icon.png")).ok().and_then(|i| {
+                let i = i.resize_exact(px, px, image::imageops::FilterType::Lanczos3).to_rgba8();
+                Icon::from_rgba(i.into_raw(), px, px).ok()
+            })
+        };
         let mut attrs = Window::default_attributes()
             .with_title("R5Rust  |  loading Firing Range")
             .with_inner_size(winit::dpi::PhysicalSize::new(self.cfg.width, self.cfg.height))
-            .with_window_icon(icon);
+            .with_window_icon(icon(32));
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs = attrs.with_taskbar_icon(icon(256));
+        }
         if self.cfg.fullscreen {
             attrs = attrs.with_fullscreen(Some(Fullscreen::Borderless(None)));
         }
