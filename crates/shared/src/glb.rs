@@ -43,7 +43,9 @@ pub struct ImageRef {
     pub png: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+/// GPU-ready layout (32 bytes, no padding).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     pub pos: [f32; 3],
     pub nrm: [i8; 4],
@@ -83,6 +85,8 @@ pub struct Meta {
     pub player_spawns: Vec<[f32; 4]>,
     pub sun_dir: [f32; 3],
     pub sun_color: [f32; 3],
+    /// sky/ambient colour (linear)
+    pub sun_ambient: [f32; 3],
     pub bounds: [f32; 6],
     pub sky_camera: [f32; 3],
 }
@@ -95,7 +99,7 @@ pub fn load_meta(path: &Path) -> Result<Meta, String> {
     let s = std::fs::read_to_string(path).map_err(|e| format!("meta.json: {e}"))?;
     let v: Value = serde_json::from_str(&s).map_err(|e| format!("meta.json parse: {e}"))?;
     let arr = |x: &Value, n: usize| -> Vec<f32> {
-        x.as_array().map(|a| a.iter().map(f).collect()).unwrap_or_default().into_iter().chain(std::iter::repeat(0.0)).take(n).collect()
+        x.as_array().map(|a| a.iter().map(f).collect::<Vec<f32>>()).unwrap_or_default().into_iter().chain(std::iter::repeat(0.0)).take(n).collect()
     };
     let mut spawns = vec![];
     if let Some(a) = v.get("playerSpawns").and_then(|x| x.as_array()) {
@@ -107,12 +111,14 @@ pub fn load_meta(path: &Path) -> Result<Meta, String> {
     let sun = v.get("sun").cloned().unwrap_or(Value::Null);
     let d = arr(sun.get("dir").unwrap_or(&Value::Null), 3);
     let c = arr(sun.get("color").unwrap_or(&Value::Null), 3);
+    let am = arr(sun.get("ambient").unwrap_or(&Value::Null), 3);
     let b = arr(v.get("bounds").unwrap_or(&Value::Null), 6);
     let sc = arr(v.get("skyCamera").unwrap_or(&Value::Null), 3);
     Ok(Meta {
         player_spawns: spawns,
         sun_dir: if d.iter().all(|x| *x == 0.0) { [-0.53, 0.34, -0.78] } else { [d[0], d[1], d[2]] },
         sun_color: if c.iter().all(|x| *x == 0.0) { [0.8, 0.78, 0.72] } else { [c[0], c[1], c[2]] },
+        sun_ambient: if am.iter().all(|x| *x == 0.0) { [0.42, 0.61, 0.8] } else { [am[0], am[1], am[2]] },
         bounds: [b[0], b[1], b[2], b[3], b[4], b[5]],
         sky_camera: [sc[0], sc[1], sc[2]],
     })

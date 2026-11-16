@@ -1,0 +1,534 @@
+//! wgpu device, render targets, pipelines and the per-frame draw.
+//! World pass: 4x MSAA HDR (Rgba16Float) + reverse-Z depth, sky first, then opaque / alpha-tested
+//! (alpha-to-coverage) / blended draws. Post pass: ACES tonemap, or the loading screen.
+
+use crate::loader::{upload_rgba, LoadedWorld};
+use glam::{Mat4, Vec3};
+use shared::assets::Config;
+use std::sync::Arc;
+use winit::window::Window;
+
+pub const MSAA: u32 = 4;
+const HDR: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+pub const SHOT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+pub struct FrameUniform {
+    pub view_proj: [[f32; 4]; 4],
+    pub inv_view_proj: [[f32; 4]; 4],
+    pub cam_pos: [f32; 4],
+    pub to_sun: [f32; 4],
+    pub sun_color: [f32; 4],
+    pub sky: [f32; 4],
+    pub ground: [f32; 4],
+    pub fog: [f32; 4],
+    pub misc: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+struct PostUniform {
+    params: [f32; 4],
+    screen: [f32; 4],
+}
+
+pub struct Camera {
+    pub pos: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+    /// horizontal FOV at 4:3, like Source / Apex
+    pub fov: f32,
+}
+
+pub struct Gfx {
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    pub adapter_name: String,
+    surface: Option<(wgpu::Surface<'static>, wgpu::SurfaceConfiguration)>,
+    out_format: wgpu::TextureFormat,
+    out_srgb: bool,
+    pub width: u32,
+    pub height: u32,
+    frame_layout: wgpu::BindGroupLayout,
+    pub mat_layout: wgpu::BindGroupLayout,
+    post_layout: wgpu::BindGroupLayout,
+    world_pipes: Vec<wgpu::RenderPipeline>,
+    sky_pipe: wgpu::RenderPipeline,
+    post_pipe: wgpu::RenderPipeline,
+    frame_ub: wgpu::Buffer,
+    post_ub: wgpu::Buffer,
+    lm_samp: wgpu::Sampler,
+    mat_samp: wgpu::Sampler,
+    post_samp: wgpu::Sampler,
+    msaa_view: wgpu::TextureView,
+    hdr_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+    load_view: wgpu::TextureView,
+    load_size: (u32, u32),
+    post_bg: wgpu::BindGroup,
+    frame_bg: Option<wgpu::BindGroup>,
+    offscreen: Option<wgpu::TextureView>,
+}
+
+fn backends(name: &str) -> wgpu::Backends {
+    match name.to_ascii_lowercase().as_str() {
+        "vulkan" | "vk" => wgpu::Backends::VULKAN,
+        "dx12" | "d3d12" => wgpu::Backends::DX12,
+        "gl" | "opengl" => wgpu::Backends::GL,
+        _ => wgpu::Backends::all(),
+    }
+}
+
+fn targets(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::TextureView, wgpu::TextureView, wgpu::TextureView) {
+    let mk = |format, samples, usage, label| {
+        device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default())
+    };
+    (
+        mk(HDR, MSAA, wgpu::TextureUsages::RENDER_ATTACHMENT, "msaa"),
+        mk(HDR, 1, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, "hdr"),
+        mk(DEPTH, MSAA, wgpu::TextureUsages::RENDER_ATTACHMENT, "depth"),
+    )
+}
+
+fn layout_entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT, ty, count: None }
+}
+fn uniform_ty() -> wgpu::BindingType {
+    wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }
+}
+fn tex_ty() -> wgpu::BindingType {
+    wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }
+}
+fn samp_ty() -> wgpu::BindingType {
+    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)
+}
+
+impl Gfx {
+    /// `window` = None renders offscreen only (screenshot mode).
+    pub fn new(window: Option<Arc<Window>>, width: u32, height: u32, cfg: &Config, loadscreen: Option<image::RgbaImage>) -> Result<Gfx, String> {
+        let mut order = vec![backends(&cfg.backend)];
+        for b in [wgpu::Backends::VULKAN, wgpu::Backends::DX12, wgpu::Backends::GL] {
+            if !order.contains(&b) {
+                order.push(b);
+            }
+        }
+        let mut found = None;
+        for b in order {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: b, ..wgpu::InstanceDescriptor::new_without_display_handle() });
+            let surface = match &window {
+                Some(w) => match instance.create_surface(w.clone()) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        log::warn!("{b:?}: surface: {e}");
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: surface.as_ref(),
+            }));
+            match adapter {
+                Ok(a) => {
+                    found = Some((instance, surface, a));
+                    break;
+                }
+                Err(e) => log::warn!("{b:?}: no adapter: {e}"),
+            }
+        }
+        let (_instance, surface, adapter) = found.ok_or("no usable GPU backend (tried Vulkan, DX12, GL)")?;
+        let info = adapter.get_info();
+        let adapter_name = format!("{} ({:?})", info.name, info.backend);
+        log::info!("GPU: {adapter_name}");
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("r5rust"),
+            required_features: wgpu::Features::empty(),
+            required_limits: adapter.limits(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
+        .map_err(|e| format!("request_device: {e}"))?;
+
+        let (surface, out_format) = match surface {
+            Some(s) => {
+                let caps = s.get_capabilities(&adapter);
+                let fmt = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+                let present_mode = if cfg.vsync { wgpu::PresentMode::AutoVsync } else if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) { wgpu::PresentMode::Mailbox } else { wgpu::PresentMode::AutoNoVsync };
+                let config = wgpu::SurfaceConfiguration {
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    format: fmt,
+                    width: width.max(1),
+                    height: height.max(1),
+                    present_mode,
+                    desired_maximum_frame_latency: 2,
+                    alpha_mode: caps.alpha_modes[0],
+                    view_formats: vec![],
+                };
+                s.configure(&device, &config);
+                (Some((s, config)), fmt)
+            }
+            None => (None, SHOT_FORMAT),
+        };
+        let out_srgb = out_format.is_srgb();
+
+        let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("frame"),
+            entries: &[layout_entry(0, uniform_ty()), layout_entry(1, tex_ty()), layout_entry(2, samp_ty()), layout_entry(3, samp_ty())],
+        });
+        let mat_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("mat"), entries: &[layout_entry(0, uniform_ty()), layout_entry(1, tex_ty())] });
+        let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("post"),
+            entries: &[layout_entry(0, uniform_ty()), layout_entry(1, tex_ty()), layout_entry(2, tex_ty()), layout_entry(3, samp_ty())],
+        });
+
+        let world_sh = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("world"), source: wgpu::ShaderSource::Wgsl(include_str!("world.wgsl").into()) });
+        let post_sh = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("post"), source: wgpu::ShaderSource::Wgsl(include_str!("post.wgsl").into()) });
+
+        let world_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("world"), bind_group_layouts: &[Some(&frame_layout), Some(&mat_layout)], immediate_size: 0 });
+        let sky_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("sky"), bind_group_layouts: &[Some(&frame_layout)], immediate_size: 0 });
+        let post_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("post"), bind_group_layouts: &[Some(&post_layout)], immediate_size: 0 });
+
+        let vattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Float32x2, 3 => Unorm16x2, 4 => Unorm8x4];
+        let vlayout = wgpu::VertexBufferLayout { array_stride: 32, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vattrs };
+
+        // key = alpha_mode * 2 + double_sided
+        let mut world_pipes = Vec::new();
+        for key in 0..6u8 {
+            let alpha = key / 2;
+            let double = key % 2 == 1;
+            world_pipes.push(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("world"),
+                layout: Some(&world_pl),
+                vertex: wgpu::VertexState { module: &world_sh, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[vlayout.clone()] },
+                primitive: wgpu::PrimitiveState { cull_mode: if double { None } else { Some(wgpu::Face::Back) }, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH,
+                    depth_write_enabled: Some(alpha != 2),
+                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: alpha == 1 },
+                fragment: Some(wgpu::FragmentState {
+                    module: &world_sh,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format: HDR, blend: if alpha == 2 { Some(wgpu::BlendState::ALPHA_BLENDING) } else { None }, write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            }));
+        }
+        let sky_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sky"),
+            layout: Some(&sky_pl),
+            vertex: wgpu::VertexState { module: &world_sh, entry_point: Some("vs_sky"), compilation_options: Default::default(), buffers: &[] },
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
+            multisample: wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false },
+            fragment: Some(wgpu::FragmentState { module: &world_sh, entry_point: Some("fs_sky"), compilation_options: Default::default(), targets: &[Some(HDR.into())] }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let post_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("post"),
+            layout: Some(&post_pl),
+            vertex: wgpu::VertexState { module: &post_sh, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[] },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState { module: &post_sh, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(out_format.into())] }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let frame_ub = device.create_buffer(&wgpu::BufferDescriptor { label: Some("frame"), size: std::mem::size_of::<FrameUniform>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let post_ub = device.create_buffer(&wgpu::BufferDescriptor { label: Some("post"), size: std::mem::size_of::<PostUniform>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+
+        let lin = |addr, aniso: u16, mip| wgpu::SamplerDescriptor {
+            address_mode_u: addr,
+            address_mode_v: addr,
+            address_mode_w: addr,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: mip,
+            anisotropy_clamp: aniso,
+            ..Default::default()
+        };
+        let lm_samp = device.create_sampler(&lin(wgpu::AddressMode::ClampToEdge, 1, wgpu::MipmapFilterMode::Nearest));
+        let mat_samp = device.create_sampler(&lin(wgpu::AddressMode::Repeat, 16, wgpu::MipmapFilterMode::Linear));
+        let post_samp = device.create_sampler(&lin(wgpu::AddressMode::ClampToEdge, 1, wgpu::MipmapFilterMode::Nearest));
+
+        let ls = loadscreen.unwrap_or_else(|| image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 10, 12, 255])));
+        let load_size = ls.dimensions();
+        let load_view = upload_rgba(&device, &queue, &[ls], wgpu::TextureFormat::Rgba8UnormSrgb, "loadscreen").create_view(&Default::default());
+
+        let (msaa_view, hdr_view, depth_view) = targets(&device, width.max(1), height.max(1));
+        let post_bg = Self::make_post_bg(&device, &post_layout, &post_ub, &hdr_view, &load_view, &post_samp);
+
+        Ok(Gfx {
+            device,
+            queue,
+            adapter_name,
+            surface,
+            out_format,
+            out_srgb,
+            width: width.max(1),
+            height: height.max(1),
+            frame_layout,
+            mat_layout,
+            post_layout,
+            world_pipes,
+            sky_pipe,
+            post_pipe,
+            frame_ub,
+            post_ub,
+            lm_samp,
+            mat_samp,
+            post_samp,
+            msaa_view,
+            hdr_view,
+            depth_view,
+            load_view,
+            load_size,
+            post_bg,
+            frame_bg: None,
+            offscreen: None,
+        })
+    }
+
+    fn make_post_bg(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, ub: &wgpu::Buffer, hdr: &wgpu::TextureView, load: &wgpu::TextureView, samp: &wgpu::Sampler) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("post"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(hdr) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(load) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(samp) },
+            ],
+        })
+    }
+
+    pub fn resize(&mut self, w: u32, h: u32) {
+        if w == 0 || h == 0 || (w == self.width && h == self.height) {
+            return;
+        }
+        self.width = w;
+        self.height = h;
+        if let Some((s, c)) = &mut self.surface {
+            c.width = w;
+            c.height = h;
+            s.configure(&self.device, c);
+        }
+        let (m, hd, d) = targets(&self.device, w, h);
+        self.msaa_view = m;
+        self.hdr_view = hd;
+        self.depth_view = d;
+        self.post_bg = Self::make_post_bg(&self.device, &self.post_layout, &self.post_ub, &self.hdr_view, &self.load_view, &self.post_samp);
+    }
+
+    pub fn set_world(&mut self, world: &LoadedWorld) {
+        self.frame_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("frame"),
+            layout: &self.frame_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.frame_ub.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&world.lightmap) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.lm_samp) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.mat_samp) },
+            ],
+        }));
+    }
+
+    pub fn frame_uniform(&self, cam: &Camera, world: &LoadedWorld, time: f32) -> FrameUniform {
+        let aspect = self.width as f32 / self.height as f32;
+        let vfov = 2.0 * ((cam.fov.to_radians() * 0.5).tan() * 0.75).atan();
+        let fwd = shared::sim::forward_vec(cam.yaw, cam.pitch);
+        let view = Mat4::look_to_rh(Vec3::ZERO, fwd, Vec3::Z);
+        let proj = Mat4::perspective_infinite_reverse_rh(vfov, aspect, 4.0);
+        let vp = proj * view;
+        let m = &world.meta;
+        let to_sun = -Vec3::from(m.sun_dir).normalize_or(Vec3::Z);
+        let amb = m.sun_ambient.map(|c| (c * 1.3).min(1.0));
+        FrameUniform {
+            view_proj: vp.to_cols_array_2d(),
+            inv_view_proj: vp.inverse().to_cols_array_2d(),
+            cam_pos: [cam.pos.x, cam.pos.y, cam.pos.z, 0.0],
+            to_sun: [to_sun.x, to_sun.y, to_sun.z, 0.0],
+            sun_color: [m.sun_color[0], m.sun_color[1], m.sun_color[2], 2.4 / std::f32::consts::PI],
+            sky: [amb[0], amb[1], amb[2], 1.1 / std::f32::consts::PI],
+            ground: [0.147, 0.102, 0.064, 0.0],
+            fog: [0.347, 0.456, 0.578, 20000.0],
+            misc: [90000.0, time, 1.0, 0.0],
+        }
+    }
+
+    /// Draws one frame into `target` (the swapchain image or a screenshot texture).
+    /// `world` = None draws the loading screen with `progress`.
+    pub fn draw(&self, target: &wgpu::TextureView, world: Option<(&LoadedWorld, &FrameUniform)>, progress: f32) {
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        let mode = if let (Some((w, fu)), Some(fbg)) = (world, &self.frame_bg) {
+            self.queue.write_buffer(&self.frame_ub, 0, bytemuck::bytes_of(*fu));
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("world"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.msaa_view,
+                    depth_slice: None,
+                    resolve_target: Some(&self.hdr_view),
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Discard },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_bind_group(0, fbg, &[]);
+            rp.set_pipeline(&self.sky_pipe);
+            rp.draw(0..3, 0..1);
+            rp.set_vertex_buffer(0, w.vbuf.slice(..));
+            rp.set_index_buffer(w.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            let mut cur_key = 255u8;
+            for d in &w.draws {
+                if d.key != cur_key {
+                    cur_key = d.key;
+                    rp.set_pipeline(&self.world_pipes[d.key as usize]);
+                }
+                rp.set_bind_group(1, &w.mat_groups[d.material as usize], &[]);
+                rp.draw_indexed(d.first_index..d.first_index + d.index_count, 0, 0..1);
+            }
+            1.0
+        } else {
+            0.0
+        };
+        let pu = PostUniform {
+            params: [mode, progress, 1.0, if self.out_srgb { 1.0 } else { 0.0 }],
+            screen: [self.width as f32, self.height as f32, self.load_size.0 as f32, self.load_size.1 as f32],
+        };
+        self.queue.write_buffer(&self.post_ub, 0, bytemuck::bytes_of(&pu));
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("post"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: target, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&self.post_pipe);
+            rp.set_bind_group(0, &self.post_bg, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        self.queue.submit([enc.finish()]);
+    }
+
+    /// Draws to the window. Returns false if the frame was skipped.
+    pub fn present(&mut self, world: Option<(&LoadedWorld, &FrameUniform)>, progress: f32) -> bool {
+        let Some((s, c)) = &self.surface else { return false };
+        let tex = match s.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => t,
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                s.configure(&self.device, c);
+                t
+            }
+            _ => {
+                s.configure(&self.device, c);
+                return false;
+            }
+        };
+        let view = tex.texture.create_view(&Default::default());
+        self.draw(&view, world, progress);
+        tex.present();
+        true
+    }
+
+    /// Renders one frame offscreen and writes it as a PNG.
+    pub fn screenshot(&self, path: &std::path::Path, world: Option<(&LoadedWorld, &FrameUniform)>, progress: f32) -> Result<(), String> {
+        assert_eq!(self.out_format, SHOT_FORMAT, "screenshots need the offscreen (no window) Gfx");
+        let (w, h) = (self.width, self.height);
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shot"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SHOT_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        self.draw(&tex.create_view(&Default::default()), world, progress);
+        let row = (w * 4).div_ceil(256) * 256;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("shot"), size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) } },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([enc.finish()]);
+        let slice = buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| format!("poll: {e}"))?;
+        let data = slice.get_mapped_range();
+        let mut img = image::RgbaImage::new(w, h);
+        for y in 0..h {
+            let src = &data[(y * row) as usize..(y * row + w * 4) as usize];
+            img.as_mut()[(y * w * 4) as usize..((y + 1) * w * 4) as usize].copy_from_slice(src);
+        }
+        drop(data);
+        buf.unmap();
+        if let Some(d) = path.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        img.save(path).map_err(|e| format!("save {}: {e}", path.display()))
+    }
+
+    /// Draws a frame offscreen without reading it back (GPU timing in screenshot mode).
+    pub fn screenshot_free_draw(&mut self, world: &LoadedWorld, fu: &FrameUniform) {
+        if self.offscreen.is_none() {
+            self.offscreen = Some(
+                self.device
+                    .create_texture(&wgpu::TextureDescriptor {
+                        label: Some("offscreen"),
+                        size: wgpu::Extent3d { width: self.width, height: self.height, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: SHOT_FORMAT,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        view_formats: &[],
+                    })
+                    .create_view(&Default::default()),
+            );
+        }
+        let v = self.offscreen.take().unwrap();
+        self.draw(&v, Some((world, fu)), 1.0);
+        self.offscreen = Some(v);
+    }
+
+    /// Blocks until the GPU is idle (for timing in screenshot mode).
+    pub fn wait(&self) {
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+}
