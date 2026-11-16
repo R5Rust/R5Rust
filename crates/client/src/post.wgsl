@@ -9,6 +9,13 @@ struct Post {
 @group(0) @binding(1) var hdr_tex: texture_2d<f32>;
 @group(0) @binding(2) var load_tex: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
+struct Expo {
+    exposure: f32,
+    sum: i32,
+    count: u32,
+    avg_log: f32,
+};
+@group(0) @binding(4) var<storage, read> expo: Expo;
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
@@ -64,5 +71,5 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
         return out_color(c);
     }
     let h = textureSampleLevel(hdr_tex, samp, i.uv, 0.0).rgb;
-    return out_color(aces(h * pp.params.z));
+    return out_color(aces(h * pp.params.z * max(expo.exposure, 1e-3)));
 }

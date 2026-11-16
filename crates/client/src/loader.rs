@@ -5,6 +5,9 @@
 use rayon::prelude::*;
 use shared::assets::Config;
 use shared::collision::Collision;
+use crate::lighting::{self, GpuLighting};
+use crate::texcache::{self, Kind};
+use shared::bsplight::BspLighting;
 use shared::glb::{self, Meta};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -73,7 +76,9 @@ pub struct LoadedWorld {
     pub ibuf: wgpu::Buffer,
     pub draws: Vec<DrawCmd>,
     pub mat_groups: Vec<wgpu::BindGroup>,
-    pub lightmap: wgpu::TextureView,
+    /// per-vertex light probe index (u32::MAX = lightmapped / none), vertex stream 1
+    pub probe_vbuf: wgpu::Buffer,
+    pub light: GpuLighting,
     pub collision: Collision,
     pub meta: Meta,
     pub stats: String,
@@ -93,7 +98,20 @@ impl Progress {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MatUniform {
     color: [f32; 4],
+    /// x = alpha cutoff, y = lightmapped, z = alpha mode, w = world surface (uses vertex colour)
     params: [f32; 4],
+    /// x = has AO texture, y = has emissive texture
+    params2: [f32; 4],
+}
+
+const TEX_SLOTS: [(&str, Kind); 6] = [("albedo", Kind::Albedo), ("normal", Kind::Normal), ("gloss", Kind::Gloss), ("spec", Kind::Spec), ("ao", Kind::Ao), ("emissive", Kind::Emissive)];
+
+fn tv(b: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry { binding: b, resource: wgpu::BindingResource::TextureView(v) }
+}
+
+fn solid(device: &wgpu::Device, queue: &wgpu::Queue, rgba: [u8; 4], format: wgpu::TextureFormat, label: &str) -> wgpu::TextureView {
+    upload_rgba(device, queue, &[image::RgbaImage::from_pixel(4, 4, image::Rgba(rgba))], format, label).create_view(&Default::default())
 }
 
 fn mip_chain(img: image::RgbaImage, max: u32) -> Vec<image::RgbaImage> {
@@ -160,6 +178,15 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     }
     let col_thread = std::thread::spawn(move || Collision::build(positions, &col_idx));
 
+    // Baked lighting from the raw BSP lumps + one probe per static prop.
+    let bsp = BspLighting::load(&cfg.bsp_dir())?;
+    let probe_ix = lighting::assign_probes(&bsp, &world.vertices, &world.indices, &world.draws, |m| world.materials[m as usize].lightmapped);
+    let probe_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("probe vb"), contents: bytemuck::cast_slice(&probe_ix), usage: wgpu::BufferUsages::VERTEX });
+    drop(probe_ix);
+    let light = GpuLighting::new(device, queue, &bsp);
+    drop(bsp);
+    let t_light = t0.elapsed().as_secs_f64();
+
     // Geometry buffers (index buffer re-ordered into spatial chunks).
     let (chunk_idx, draws) = chunk_draws(&world);
     world.indices = chunk_idx;
@@ -171,70 +198,101 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     world.indices = Vec::new();
     progress.set(0.3);
 
-    // Textures: only the base-colour images the materials actually use.
-    let mut used: Vec<u32> = world.materials.iter().filter_map(|m| m.base_tex).collect();
+    // The game's own material textures (materials.json from tools/build_materials.py), block-compressed + cached.
+    let mats_json: serde_json::Value = std::fs::read_to_string(cfg.map_dir().join("materials.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| {
+            log::warn!("no materials.json (run tools/build_materials.py): using world.glb base colours only");
+            serde_json::Value::Null
+        });
+    let root = cfg.assets_root();
+    let cache = root.parent().unwrap_or(&root).join("_cache").join("tex");
+    let cap = cfg.max_texture_size.max(16);
+    let mut wanted: Vec<(String, Kind)> = Vec::new();
+    for m in &world.materials {
+        let e = &mats_json[&m.name];
+        for (k, kind) in TEX_SLOTS {
+            if kind == Kind::Albedo && m.alpha_mode != 0 {
+                continue; // cut-out / blended surfaces keep the glb albedo, which carries their alpha
+            }
+            if let Some(rel) = e[k].as_str() {
+                wanted.push((rel.to_string(), kind));
+            }
+        }
+    }
+    wanted.sort_by(|a, b| a.0.cmp(&b.0).then((a.1 as u8).cmp(&(b.1 as u8))));
+    wanted.dedup();
+    let done = AtomicU32::new(0);
+    let total = wanted.len().max(1) as f32;
+    let mat_tex: HashMap<(String, u8), wgpu::TextureView> = wanted
+        .par_iter()
+        .filter_map(|(rel, kind)| {
+            let e = texcache::load(&root, &cache, rel, *kind, cap)?;
+            let t = texcache::upload(device, queue, &e);
+            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+            progress.set(0.3 + 0.5 * n as f32 / total);
+            Some(((rel.clone(), *kind as u8), t.create_view(&Default::default())))
+        })
+        .collect();
+
+    // glb base colours: fallback albedo, and the alpha source for cut-outs
+    let mut used: Vec<u32> = world.materials.iter().filter(|m| m.alpha_mode != 0 || mats_json[&m.name]["albedo"].as_str().is_none()).filter_map(|m| m.base_tex).collect();
     used.sort();
     used.dedup();
-    let done = AtomicU32::new(0);
-    let total = used.len().max(1) as f32;
     let max = cfg.max_texture_size.max(16);
     let views: HashMap<u32, wgpu::TextureView> = used
         .par_iter()
         .filter_map(|&ii| {
             let bytes = world.image_bytes(ii)?;
-            let img = match image::load_from_memory(bytes) {
-                Ok(i) => i.to_rgba8(),
-                Err(e) => {
-                    log::warn!("image {ii}: {e}");
-                    return None;
-                }
-            };
-            let mips = mip_chain(img, max);
-            let tex = upload_rgba(device, queue, &mips, wgpu::TextureFormat::Rgba8UnormSrgb, "base");
-            let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            progress.set(0.3 + 0.6 * n as f32 / total);
+            let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+            let tex = upload_rgba(device, queue, &mip_chain(img, max), wgpu::TextureFormat::Rgba8UnormSrgb, "base");
             Some((ii, tex.create_view(&wgpu::TextureViewDescriptor::default())))
         })
         .collect();
     let t_tex = t0.elapsed().as_secs_f64();
 
-    // Lightmap: linear data, no mips (the atlas packs unrelated islands next to each other).
-    let lightmap = match world.lightmap_image.and_then(|i| world.image_bytes(i)).and_then(|b| image::load_from_memory(b).ok()) {
-        Some(img) => {
-            let img = img.to_rgba8();
-            log::info!("lightmap {}x{}", img.width(), img.height());
-            upload_rgba(device, queue, &[img], wgpu::TextureFormat::Rgba8Unorm, "lightmap")
-        }
-        None => {
-            log::warn!("no lightmap in the GLB; lighting falls back to sun + sky");
-            upload_rgba(device, queue, &[image::RgbaImage::from_pixel(1, 1, image::Rgba([64, 64, 64, 255]))], wgpu::TextureFormat::Rgba8Unorm, "lightmap")
-        }
-    }
-    .create_view(&wgpu::TextureViewDescriptor::default());
-
-    let white = upload_rgba(device, queue, &[image::RgbaImage::from_pixel(1, 1, image::Rgba([255; 4]))], wgpu::TextureFormat::Rgba8UnormSrgb, "white").create_view(&wgpu::TextureViewDescriptor::default());
+    use wgpu::TextureFormat as F;
+    let white = solid(device, queue, [255; 4], F::Rgba8UnormSrgb, "white");
+    let flat_n = solid(device, queue, [128, 128, 0, 255], F::Rgba8Unorm, "flat normal");
+    let def_gloss = solid(device, queue, [64, 64, 64, 255], F::Rgba8Unorm, "gloss");
+    let def_spec = solid(device, queue, [56, 56, 56, 255], F::Rgba8UnormSrgb, "spec 0.04");
+    let one = solid(device, queue, [255; 4], F::Rgba8Unorm, "ao 1");
+    let black = solid(device, queue, [0, 0, 0, 255], F::Rgba8UnormSrgb, "black");
 
     let mat_groups: Vec<wgpu::BindGroup> = world
         .materials
         .iter()
         .map(|m| {
+            let e = &mats_json[&m.name];
+            let get = |k: &str, kind: Kind| e[k].as_str().and_then(|r| mat_tex.get(&(r.to_string(), kind as u8)));
+            let albedo = if m.alpha_mode == 0 { get("albedo", Kind::Albedo) } else { None }.or_else(|| m.base_tex.and_then(|t| views.get(&t))).unwrap_or(&white);
+            let normal = get("normal", Kind::Normal).unwrap_or(&flat_n);
+            let gloss = get("gloss", Kind::Gloss).unwrap_or(&def_gloss);
+            let spec = get("spec", Kind::Spec).unwrap_or(&def_spec);
+            let ao = get("ao", Kind::Ao);
+            let emis = get("emissive", Kind::Emissive);
             let u = MatUniform {
                 color: m.base_color,
-                params: [m.alpha_cutoff, if m.lightmapped { 1.0 } else { 0.0 }, m.alpha_mode as f32, 0.0],
+                params: [m.alpha_cutoff, if m.lightmapped { 1.0 } else { 0.0 }, m.alpha_mode as f32, if m.name.starts_with("world/") { 1.0 } else { 0.0 }],
+                params2: [ao.is_some() as u32 as f32, emis.is_some() as u32 as f32, 0.0, 0.0],
             };
             let ub = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mat"), contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM });
-            let view = m.base_tex.and_then(|t| views.get(&t)).unwrap_or(&white);
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("mat"),
                 layout: mat_layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view) },
+                    tv(1, albedo),
+                    tv(2, normal),
+                    tv(3, gloss),
+                    tv(4, spec),
+                    tv(5, ao.unwrap_or(&one)),
+                    tv(6, emis.unwrap_or(&black)),
                 ],
             })
         })
         .collect();
-
 
     progress.set(0.95);
     let collision = col_thread.join().map_err(|_| "collision build panicked".to_string())?;
@@ -243,18 +301,22 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     progress.set(1.0);
     let stats = format!(
-        "{:.1} M tris, {} draws, {} textures, VB {:.0} MB, BVH {} nodes ({:.0} ms); glb {:.1}s, textures {:.1}s, total {:.1}s",
+        "{:.1} M tris, {} draws, {} material textures + {} glb, {} lights, {} probes, VB {:.0} MB, BVH {} nodes ({:.0} ms); glb {:.1}s, lighting {:.1}s, textures {:.1}s, total {:.1}s",
         tris as f64 / 1e6,
         draws.len(),
+        mat_tex.len(),
         views.len(),
+        light.light_count,
+        light.probe_count,
         vb_mb,
         collision.node_count(),
         collision.build_ms,
         t_glb,
-        t_tex - t_glb,
+        t_light - t_glb,
+        t_tex - t_light,
         t0.elapsed().as_secs_f64()
     );
     log::info!("{stats}");
-    Ok(LoadedWorld { vbuf, ibuf, draws, mat_groups, lightmap, collision, meta, stats })
+    Ok(LoadedWorld { vbuf, ibuf, draws, mat_groups, probe_vbuf, light, collision, meta, stats })
 }
 

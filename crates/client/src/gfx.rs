@@ -75,6 +75,19 @@ pub struct Gfx {
     post_bg: wgpu::BindGroup,
     frame_bg: Option<wgpu::BindGroup>,
     pub csm: Csm,
+    expo_state: wgpu::Buffer,
+    expo_params: wgpu::Buffer,
+    expo_layout: wgpu::BindGroupLayout,
+    expo_bg: wgpu::BindGroup,
+    expo_lum: wgpu::ComputePipeline,
+    expo_adapt: wgpu::ComputePipeline,
+    expo_last: std::cell::Cell<std::time::Instant>,
+    /// snap exposure every frame (screenshot mode)
+    pub instant_exposure: bool,
+    /// target average luminance for auto exposure
+    pub exposure_key: f32,
+    /// linear multiplier before the tonemap
+    pub exposure: f32,
     pub drawn: std::cell::Cell<u32>,
     offscreen: Option<wgpu::TextureView>,
 }
@@ -118,6 +131,9 @@ fn uniform_ty() -> wgpu::BindingType {
 }
 fn tex_ty() -> wgpu::BindingType {
     wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }
+}
+fn storage_ty() -> wgpu::BindingType {
+    wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }
 }
 fn samp_ty() -> wgpu::BindingType {
     wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)
@@ -166,7 +182,7 @@ impl Gfx {
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("r5rust"),
-            required_features: wgpu::Features::empty(),
+            required_features: wgpu::Features::TEXTURE_COMPRESSION_BC,
             required_limits: adapter.limits(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
@@ -202,16 +218,25 @@ impl Gfx {
             entries: &[
                 layout_entry(0, uniform_ty()),
                 layout_entry(1, tex_ty()),
-                layout_entry(2, samp_ty()),
-                layout_entry(3, samp_ty()),
-                layout_entry(4, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }),
-                layout_entry(5, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison)),
+                layout_entry(2, tex_ty()),
+                layout_entry(3, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }),
+                layout_entry(4, tex_ty()),
+                layout_entry(5, samp_ty()),
+                layout_entry(6, samp_ty()),
+                layout_entry(7, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }),
+                layout_entry(8, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison)),
+                layout_entry(9, storage_ty()),
+                layout_entry(10, storage_ty()),
+                layout_entry(11, storage_ty()),
             ],
         });
-        let mat_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("mat"), entries: &[layout_entry(0, uniform_ty()), layout_entry(1, tex_ty())] });
+        let mat_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mat"),
+            entries: &[layout_entry(0, uniform_ty()), layout_entry(1, tex_ty()), layout_entry(2, tex_ty()), layout_entry(3, tex_ty()), layout_entry(4, tex_ty()), layout_entry(5, tex_ty()), layout_entry(6, tex_ty())],
+        });
         let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("post"),
-            entries: &[layout_entry(0, uniform_ty()), layout_entry(1, tex_ty()), layout_entry(2, tex_ty()), layout_entry(3, samp_ty())],
+            entries: &[layout_entry(0, uniform_ty()), layout_entry(1, tex_ty()), layout_entry(2, tex_ty()), layout_entry(3, samp_ty()), layout_entry(4, storage_ty())],
         });
 
         let world_sh = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("world"), source: wgpu::ShaderSource::Wgsl(include_str!("world.wgsl").into()) });
@@ -223,6 +248,8 @@ impl Gfx {
 
         let vattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Snorm8x4, 2 => Float32x2, 3 => Unorm16x2, 4 => Unorm8x4];
         let vlayout = wgpu::VertexBufferLayout { array_stride: 32, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vattrs };
+        let pattrs = wgpu::vertex_attr_array![5 => Uint32];
+        let player = wgpu::VertexBufferLayout { array_stride: 4, step_mode: wgpu::VertexStepMode::Vertex, attributes: &pattrs };
 
         // key = alpha_mode * 2 + double_sided
         let mut world_pipes = Vec::new();
@@ -232,7 +259,7 @@ impl Gfx {
             world_pipes.push(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("world"),
                 layout: Some(&world_pl),
-                vertex: wgpu::VertexState { module: &world_sh, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[Some(vlayout.clone())] },
+                vertex: wgpu::VertexState { module: &world_sh, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[Some(vlayout.clone()), Some(player.clone())] },
                 primitive: wgpu::PrimitiveState { cull_mode: if double { None } else { Some(wgpu::Face::Back) }, ..Default::default() },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH,
@@ -299,7 +326,23 @@ impl Gfx {
         let load_view = upload_rgba(&device, &queue, &[ls], wgpu::TextureFormat::Rgba8UnormSrgb, "loadscreen").create_view(&Default::default());
 
         let (msaa_view, hdr_view, depth_view) = targets(&device, width.max(1), height.max(1));
-        let post_bg = Self::make_post_bg(&device, &post_layout, &post_ub, &hdr_view, &load_view, &post_samp);
+        let expo_state = device.create_buffer(&wgpu::BufferDescriptor { label: Some("expo"), size: 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let expo_params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("expo params"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let cs = wgpu::ShaderStages::COMPUTE;
+        let expo_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("expo"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: cs, ty: tex_ty(), count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: cs, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: cs, ty: uniform_ty(), count: None },
+            ],
+        });
+        let expo_sh = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("expo"), source: wgpu::ShaderSource::Wgsl(include_str!("expo.wgsl").into()) });
+        let expo_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("expo"), bind_group_layouts: &[Some(&expo_layout)], immediate_size: 0 });
+        let mkc = |e: &str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("expo"), layout: Some(&expo_pl), module: &expo_sh, entry_point: Some(e), compilation_options: Default::default(), cache: None });
+        let (expo_lum, expo_adapt) = (mkc("lum"), mkc("adapt"));
+        let expo_bg = Self::make_expo_bg(&device, &expo_layout, &hdr_view, &expo_state, &expo_params);
+        let post_bg = Self::make_post_bg(&device, &post_layout, &post_ub, &hdr_view, &load_view, &post_samp, &expo_state);
 
         Ok(Gfx {
             device,
@@ -329,12 +372,46 @@ impl Gfx {
             post_bg,
             frame_bg: None,
             csm,
+            expo_state,
+            expo_params,
+            expo_layout,
+            expo_bg,
+            expo_lum,
+            expo_adapt,
+            expo_last: std::cell::Cell::new(std::time::Instant::now()),
+            instant_exposure: false,
+            exposure_key: cfg.exposure_key,
+            exposure: cfg.exposure,
             drawn: std::cell::Cell::new(0),
             offscreen: None,
         })
     }
 
-    fn make_post_bg(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, ub: &wgpu::Buffer, hdr: &wgpu::TextureView, load: &wgpu::TextureView, samp: &wgpu::Sampler) -> wgpu::BindGroup {
+    fn make_expo_bg(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, hdr: &wgpu::TextureView, st: &wgpu::Buffer, pr: &wgpu::Buffer) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("expo"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(hdr) },
+                wgpu::BindGroupEntry { binding: 1, resource: st.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: pr.as_entire_binding() },
+            ],
+        })
+    }
+
+    /// (current exposure, average log2 luminance) read back from the GPU. Screenshot mode only (blocks).
+    pub fn read_exposure(&self) -> (f32, f32) {
+        let b = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("expo rb"), size: 16, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(&self.expo_state, 0, &b, 0, 16);
+        self.queue.submit([enc.finish()]);
+        b.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let v = b.slice(..).get_mapped_range().map(|d| (f32::from_le_bytes(d[0..4].try_into().unwrap()), f32::from_le_bytes(d[12..16].try_into().unwrap()))).unwrap_or((0.0, 0.0));
+        v
+    }
+
+    fn make_post_bg(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, ub: &wgpu::Buffer, hdr: &wgpu::TextureView, load: &wgpu::TextureView, samp: &wgpu::Sampler, expo: &wgpu::Buffer) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("post"),
             layout,
@@ -343,6 +420,7 @@ impl Gfx {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(hdr) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(load) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(samp) },
+                wgpu::BindGroupEntry { binding: 4, resource: expo.as_entire_binding() },
             ],
         })
     }
@@ -362,7 +440,8 @@ impl Gfx {
         self.msaa_view = m;
         self.hdr_view = hd;
         self.depth_view = d;
-        self.post_bg = Self::make_post_bg(&self.device, &self.post_layout, &self.post_ub, &self.hdr_view, &self.load_view, &self.post_samp);
+        self.post_bg = Self::make_post_bg(&self.device, &self.post_layout, &self.post_ub, &self.hdr_view, &self.load_view, &self.post_samp, &self.expo_state);
+        self.expo_bg = Self::make_expo_bg(&self.device, &self.expo_layout, &self.hdr_view, &self.expo_state, &self.expo_params);
     }
 
     pub fn set_world(&mut self, world: &LoadedWorld) {
@@ -371,11 +450,17 @@ impl Gfx {
             layout: &self.frame_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: self.frame_ub.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&world.lightmap) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.lm_samp) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.mat_samp) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.csm.array_view) },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.csm.cmp_samp) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&world.light.lm0) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&world.light.lm1) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&world.light.rtl_ids) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&world.light.rtl_vis) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.lm_samp) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.mat_samp) },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&self.csm.array_view) },
+                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(&self.csm.cmp_samp) },
+                wgpu::BindGroupEntry { binding: 9, resource: world.light.lights.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: world.light.rtl_index.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: world.light.probes.as_entire_binding() },
             ],
         }));
         self.csm.invalidate();
@@ -383,7 +468,7 @@ impl Gfx {
 
     /// Per-frame work before drawing: re-renders the shadow cascades the camera has moved away from.
     pub fn prepare(&mut self, cam: &Camera, world: &LoadedWorld) -> u32 {
-        let to_sun = -Vec3::from(world.meta.sun_dir).normalize_or(Vec3::Z);
+        let to_sun = Vec3::from(world.light.sun_dir).normalize_or(Vec3::Z);
         self.csm.update(&self.device, &self.queue, cam.pos, to_sun, world)
     }
 
@@ -394,19 +479,18 @@ impl Gfx {
         let view = glam::camera::rh::view::look_to_mat4(Vec3::ZERO, fwd, Vec3::Z);
         let proj = glam::camera::rh::proj::directx::perspective_infinite_reverse(vfov, aspect, 4.0);
         let vp = proj * view;
-        let m = &world.meta;
-        let to_sun = -Vec3::from(m.sun_dir).normalize_or(Vec3::Z);
-        let amb = m.sun_ambient.map(|c| (c * 1.3).min(1.0));
+        let l = &world.light;
+        let to_sun = Vec3::from(l.sun_dir).normalize_or(Vec3::Z);
         FrameUniform {
             view_proj: vp.to_cols_array_2d(),
             inv_view_proj: vp.inverse().to_cols_array_2d(),
             cam_pos: [cam.pos.x, cam.pos.y, cam.pos.z, 0.0],
             to_sun: [to_sun.x, to_sun.y, to_sun.z, 0.0],
-            sun_color: [m.sun_color[0], m.sun_color[1], m.sun_color[2], 3.2],
-            sky: [amb[0], amb[1], amb[2], 0.9],
-            ground: [0.147, 0.102, 0.064, 0.0],
-            fog: [0.347, 0.456, 0.578, 20000.0],
-            misc: [90000.0, time, 1.0, cam.debug],
+            sun_color: [l.sun_color[0], l.sun_color[1], l.sun_color[2], 1.0],
+            sky: [l.sky_color[0], l.sky_color[1], l.sky_color[2], 1.0],
+            ground: [0.0; 4],
+            fog: [0.0; 4],
+            misc: [0.0, time, self.exposure, cam.debug],
             shadow_vp: self.csm.mats.map(|m| m.to_cols_array_2d()),
             cascade_r: csm::RADII,
         }
@@ -439,6 +523,7 @@ impl Gfx {
             rp.set_pipeline(&self.sky_pipe);
             rp.draw(0..3, 0..1);
             rp.set_vertex_buffer(0, w.vbuf.slice(..));
+            rp.set_vertex_buffer(1, w.probe_vbuf.slice(..));
             rp.set_index_buffer(w.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             let mut cur_key = 255u8;
             let planes = frustum_planes(&Mat4::from_cols_array_2d(&fu.view_proj));
@@ -457,12 +542,24 @@ impl Gfx {
                 rp.draw_indexed(d.first_index..d.first_index + d.index_count, 0, 0..1);
             }
             self.drawn.set(drawn);
+            drop(rp);
+            let now = std::time::Instant::now();
+            let dt = if self.instant_exposure { 1.0 } else { (now - self.expo_last.get()).as_secs_f32().min(0.5) };
+            self.expo_last.set(now);
+            self.queue.write_buffer(&self.expo_params, 0, bytemuck::cast_slice(&[dt, self.exposure_key, 0.25, 6.0]));
+            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("expo"), timestamp_writes: None });
+            cp.set_bind_group(0, &self.expo_bg, &[]);
+            cp.set_pipeline(&self.expo_lum);
+            cp.dispatch_workgroups(128 / 16, 72 / 8, 1);
+            cp.set_pipeline(&self.expo_adapt);
+            cp.dispatch_workgroups(1, 1, 1);
+            drop(cp);
             1.0
         } else {
             0.0
         };
         let pu = PostUniform {
-            params: [mode, progress, 1.0, if self.out_srgb { 1.0 } else { 0.0 }],
+            params: [mode, progress, self.exposure, if self.out_srgb { 1.0 } else { 0.0 }],
             screen: [self.width as f32, self.height as f32, self.load_size.0 as f32, self.load_size.1 as f32],
         };
         self.queue.write_buffer(&self.post_ub, 0, bytemuck::bytes_of(&pu));

@@ -89,10 +89,8 @@ pub struct BspLighting {
     pub sky0: Atlas,
     /// image 1 of every sky page
     pub sky1: Atlas,
-    /// real-time-light pages: the 2-byte-per-(padded)-texel part, as R16 (unpadded, atlas layout)
-    pub rtl_a: Atlas,
-    /// real-time-light pages: the 4-byte-per-texel part (atlas layout)
-    pub rtl_b: Atlas,
+    /// raw lump 0x69: per page, R32 light IDs (w*h) then BC5 visibility (w x 2h)
+    pub rtl_raw: Vec<u8>,
     pub rtl_index: Vec<u16>,
     pub lights: Vec<WorldLight>,
     pub probes: Vec<LightProbe>,
@@ -137,9 +135,7 @@ impl BspLighting {
         let rtl = lump(dir, 0x69);
         let mut sky0 = Atlas::new(aw, ah, 4);
         let mut sky1 = Atlas::new(aw, ah, 4);
-        let mut rtl_a = Atlas::new(aw, ah, 2);
-        let mut rtl_b = Atlas::new(aw, ah, 4);
-        let (mut at_s, mut at_r, mut x) = (0usize, 0usize, 0u32);
+        let (mut at_s, mut x) = (0usize, 0u32);
         for h in &headers {
             if h.kind != 1 && h.kind != 10 {
                 return Err(format!("lightmap page type {} not supported", h.kind));
@@ -151,16 +147,6 @@ impl BspLighting {
                 blit(&mut sky1, x, &sky[at_s + n..at_s + 2 * n], h.width, h.height, w * 4, 4);
             }
             at_s += 2 * n;
-            // RTL page: 2 bytes per texel at the 4-aligned size, then 4 bytes per texel
-            let pw = w.div_ceil(4) * 4;
-            let ph = hh.div_ceil(4) * 4;
-            let na = 2 * pw * ph;
-            let nb = 4 * w * hh;
-            if at_r + na + nb <= rtl.len() {
-                blit(&mut rtl_a, x, &rtl[at_r..at_r + na], h.width, h.height, pw * 2, 2);
-                blit(&mut rtl_b, x, &rtl[at_r + na..at_r + na + nb], h.width, h.height, w * 4, 4);
-            }
-            at_r += na + nb;
             x += h.width;
         }
 
@@ -176,7 +162,7 @@ impl BspLighting {
                 Cubemap { origin: [i(0), i(4), i(8)], guid: i(12) as u32 }
             })
             .collect();
-        Ok(BspLighting { headers, sky0, sky1, rtl_a, rtl_b, rtl_index, lights, probes, probe_tree, probe_refs, cubemaps })
+        Ok(BspLighting { headers, sky0, sky1, rtl_raw: rtl, rtl_index, lights, probes, probe_tree, probe_refs, cubemaps })
     }
 
     /// Probe references whose k-d tree leaf contains `p` (the game then picks/blends among them).

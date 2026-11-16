@@ -22,6 +22,10 @@ pub struct Config {
     pub fly_speed: f32,
     pub backend: String,
     pub port: u16,
+    /// linear exposure before the tonemap
+    pub exposure: f32,
+    /// auto-exposure target: average scene luminance is scaled to this
+    pub exposure_key: f32,
 }
 
 impl Default for Config {
@@ -39,6 +43,8 @@ impl Default for Config {
             fly_speed: 1200.0,
             backend: "vulkan".into(),
             port: 37015,
+            exposure: 1.0,
+            exposure_key: 0.18,
         }
     }
 }

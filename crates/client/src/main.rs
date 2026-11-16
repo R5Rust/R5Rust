@@ -6,6 +6,8 @@
 //!          [--hold w,shift,space] [--fly]
 
 mod csm;
+mod lighting;
+mod texcache;
 mod gfx;
 mod loader;
 
@@ -139,6 +141,7 @@ fn run_headless(cfg: Config, args: Args) -> Result<(), String> {
     }
     let world = rx.recv().map_err(|e| e.to_string())??;
     let mut gfx = gfx;
+    gfx.instant_exposure = true;
     gfx.set_world(&world);
     let (mut player, yaw, pitch) = spawn(&world, &args);
     player.fly_speed = cfg.fly_speed;
@@ -176,6 +179,8 @@ fn run_headless(cfg: Config, args: Args) -> Result<(), String> {
     gfx.screenshot(&path, Some((&world, &fu)), 1.0)?;
     println!("{}", world.stats);
     println!("chunks drawn: {} of {}", gfx.drawn.get(), world.draws.len());
+    let (e, avg) = gfx.read_exposure();
+    println!("auto exposure {e:.3} (avg log2 lum {avg:.2}, avg lum {:.3})", avg.exp2());
     println!("GPU: {}  {}x{}  {:.2} ms/frame ({:.0} fps)", gfx.adapter_name, gfx.width, gfx.height, ms, 1000.0 / ms);
     println!(
         "spawn ({:.0},{:.0},{:.0}) -> after {} ticks ({:.0},{:.0},{:.0}) ground={} fly={} moved {:.0}u",
