@@ -35,7 +35,7 @@ fn chunk_draws(world: &glb::World) -> (Vec<u32>, Vec<DrawCmd>) {
     let mut cmds = Vec::new();
     for d in &world.draws {
         let m = &world.materials[d.material as usize];
-        let key = m.alpha_mode * 2 + m.double_sided as u8;
+        let key = if m.sky { 6 } else { m.alpha_mode * 2 + m.double_sided as u8 };
         let tris = &world.indices[d.first_index as usize..(d.first_index + d.index_count) as usize];
         let mut cells: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
         let split = d.index_count / 3 >= MIN_SPLIT_TRIS;
@@ -79,6 +79,9 @@ pub struct LoadedWorld {
     /// per-vertex light probe index (u32::MAX = lightmapped / none), vertex stream 1
     pub probe_vbuf: wgpu::Buffer,
     pub light: GpuLighting,
+    /// the sky material's cube texture (Firing Range: projected 'fake sky')
+    pub sky_cube: wgpu::TextureView,
+    pub fog: crate::fog::Fog,
     pub collision: Collision,
     pub meta: Meta,
     pub stats: String,
@@ -102,9 +105,67 @@ struct MatUniform {
     params: [f32; 4],
     /// x = has AO texture, y = has emissive texture
     params2: [f32; 4],
+    /// c_L0_albedoTint (rgb)
+    albedo_tint: [f32; 4],
+    /// c_L0_emissiveTint (rgb)
+    emissive_tint: [f32; 4],
+    /// c_emissiveEdgeFade exponent, inner, outer
+    emissive_edge: [f32; 4],
 }
 
 const TEX_SLOTS: [(&str, Kind); 6] = [("albedo", Kind::Albedo), ("normal", Kind::Normal), ("gloss", Kind::Gloss), ("spec", Kind::Spec), ("ao", Kind::Ao), ("emissive", Kind::Emissive)];
+
+/// Six faces `<leaf>_albedoTexture_000..005.png` (D3D face order) of the sky material, as one cube texture.
+fn load_sky_cube(device: &wgpu::Device, queue: &wgpu::Queue, root: &std::path::Path, map_dir: &std::path::Path, sky_mat: Option<&str>) -> wgpu::TextureView {
+    // The game's HDR original (BC6H cube from the map pak). The extracted PNG faces are clipped to 8 bits.
+    if let Ok(d) = crate::dds::load(&map_dir.join("skycube.dds")) {
+        if d.layers == 6 {
+            let t = crate::dds::upload(device, queue, &d, "sky cube (hdr)");
+            log::info!("sky cube: HDR {}x{} BC6H", d.width, d.height);
+            return t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::Cube), ..Default::default() });
+        }
+    }
+    let faces: Option<Vec<image::RgbaImage>> = sky_mat.and_then(|name| {
+        let leaf = name.rsplit('/').next()?;
+        (0..6)
+            .map(|i| image::open(root.join(format!("images/textures/other/skies/{leaf}_albedoTexture_{i:03}.png"))).ok().map(|im| image::imageops::resize(&im.to_rgba8(), 1024, 1024, image::imageops::FilterType::Triangle)))
+            .collect()
+    });
+    let faces = faces.unwrap_or_else(|| {
+        log::warn!("no sky material faces; sky surfaces draw black");
+        (0..6).map(|_| image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 255]))).collect()
+    });
+    let size = faces[0].width();
+    let mips = 32 - size.leading_zeros();
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("sky cube"),
+        size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 6 },
+        mip_level_count: mips,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for (f, img) in faces.into_iter().enumerate() {
+        for (lvl, m) in mip_chain(img, size).iter().enumerate() {
+            let (w, h) = m.dimensions();
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: lvl as u32, origin: wgpu::Origin3d { x: 0, y: 0, z: f as u32 }, aspect: wgpu::TextureAspect::All },
+                m.as_raw(),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * w), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        }
+    }
+    tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::Cube), ..Default::default() })
+}
+
+fn tint(v: &serde_json::Value) -> [f32; 4] {
+    let a = v.as_array();
+    let c = |i: usize| a.and_then(|a| a.get(i)).and_then(|x| x.as_f64()).unwrap_or(1.0) as f32;
+    [c(0), c(1), c(2), 1.0]
+}
 
 fn tv(b: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry { binding: b, resource: wgpu::BindingResource::TextureView(v) }
@@ -252,6 +313,8 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
         .collect();
     let t_tex = t0.elapsed().as_secs_f64();
 
+    let sky_cube = load_sky_cube(device, queue, &root, &cfg.map_dir(), world.materials.iter().find(|m| m.sky).map(|m| m.name.as_str()));
+
     use wgpu::TextureFormat as F;
     let white = solid(device, queue, [255; 4], F::Rgba8UnormSrgb, "white");
     let flat_n = solid(device, queue, [128, 128, 0, 255], F::Rgba8Unorm, "flat normal");
@@ -271,11 +334,20 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
             let gloss = get("gloss", Kind::Gloss).unwrap_or(&def_gloss);
             let spec = get("spec", Kind::Spec).unwrap_or(&def_spec);
             let ao = get("ao", Kind::Ao);
+            // two-layer blend materials use vertex alpha as the blend factor, not the RGB as a tint
+            let is_blend = e["all"].get("layerBlendTexture").is_some() || e["all"].get("bm").is_some();
             let emis = get("emissive", Kind::Emissive);
             let u = MatUniform {
                 color: m.base_color,
-                params: [m.alpha_cutoff, if m.lightmapped { 1.0 } else { 0.0 }, m.alpha_mode as f32, if m.name.starts_with("world/") { 1.0 } else { 0.0 }],
+                params: [m.alpha_cutoff, if m.lightmapped { 1.0 } else { 0.0 }, m.alpha_mode as f32, if m.name.starts_with("world/") && !is_blend { 1.0 } else { 0.0 }],
                 params2: [ao.is_some() as u32 as f32, emis.is_some() as u32 as f32, 0.0, 0.0],
+                albedo_tint: tint(&e["albedo_tint"]),
+                emissive_tint: tint(&e["emissive_tint"]),
+                emissive_edge: {
+                    let a = e["emissive_edge"].as_array();
+                    let c = |i: usize, d: f32| a.and_then(|a| a.get(i)).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(d);
+                    [c(0, 0.0), c(1, 1.0), c(2, 1.0), 0.0]
+                },
             };
             let ub = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mat"), contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM });
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -317,6 +389,7 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
         t0.elapsed().as_secs_f64()
     );
     log::info!("{stats}");
-    Ok(LoadedWorld { vbuf, ibuf, draws, mat_groups, probe_vbuf, light, collision, meta, stats })
+    let fog = crate::fog::Fog::from_map(&cfg.bsp_dir(), light.sun_dir);
+    Ok(LoadedWorld { vbuf, ibuf, draws, mat_groups, probe_vbuf, light, sky_cube, fog, collision, meta, stats })
 }
 

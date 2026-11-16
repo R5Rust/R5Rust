@@ -14,6 +14,7 @@ struct Frame {
     misc: vec4<f32>,       // y = time, z = exposure, w = debug view
     shadow_vp: array<mat4x4<f32>, 4>,
     cascade_r: vec4<f32>,
+    fog_k: array<vec4<f32>, 5>,
 };
 
 struct Light {
@@ -54,11 +55,15 @@ struct Probe {
 @group(0) @binding(11) var<storage, read> probes: array<Probe>;
 @group(0) @binding(12) var cubes: texture_cube_array<f32>;
 @group(0) @binding(13) var<storage, read> cube_ambient: array<f32>;
+@group(0) @binding(14) var sky_cube: texture_cube<f32>;
 
 struct Mat {
     color: vec4<f32>,
     params: vec4<f32>,   // x alpha cutoff, y lightmapped, z alpha mode, w world surface (vertex colour)
     params2: vec4<f32>,  // x has AO, y has emissive
+    albedo_tint: vec4<f32>,
+    emissive_tint: vec4<f32>,
+    emissive_edge: vec4<f32>,  // exponent, inner, outer
 };
 @group(1) @binding(0) var<uniform> mt: Mat;
 @group(1) @binding(1) var albedo_tex: texture_2d<f32>;
@@ -209,6 +214,27 @@ fn eval_light(acc: ptr<function, Acc>, s: Surf, li: u32, wp: vec3<f32>, vis: f32
     brdf(acc, s, ld, ld, a, L.color, L.spec_int);
 }
 
+// Apex height fog (apex-lighting.md section 7), k0..k4 = c_fogParams
+fn fog(c: vec3<f32>, rel: vec3<f32>) -> vec3<f32> {
+    let k0 = fr.fog_k[0]; let k1 = fr.fog_k[1]; let k2 = fr.fog_k[2]; let k3 = fr.fog_k[3]; let k4 = fr.fog_k[4];
+    if (k0.w <= 0.0) { return c; }
+    let wp = rel + fr.cam_pos.xyz;
+    let dist = max(length(rel) + k1.w, 1e-5);
+    let z_lo = min(wp.z, fr.cam_pos.z);
+    let dz = max(max(wp.z, fr.cam_pos.z) - z_lo, 1e-5);
+    let f = clamp((k4.xy - vec2<f32>(z_lo)) / dz, vec2<f32>(0.0), vec2<f32>(1.0));
+    let a = f.x * dist;
+    let b = dist * f.y - a;
+    let cc = dist - dist * f.y;
+    let dens0 = clamp((z_lo - k4.x) * k4.z, 0.0, 1.0) * k0.z + k0.x;
+    let grad = clamp(dz * k4.z, 0.0, 1.0) * k0.z / dist;
+    let od = (b * grad * 0.5 + dens0) * b + (cc * k0.y + k0.x * a);
+    let amt = (1.0 - exp(-od)) * k0.w;
+    let view = normalize(rel);
+    let lobe = sq(clamp((dot(k3.xyz, view) - k2.w) * k3.w, 0.0, 1.0));
+    return mix(c, k1.rgb + k2.rgb * lobe, amt);
+}
+
 // wrapped sky term from a visibility-scaled bent normal (section 2)
 fn sky_term(n: vec3<f32>, sky_vec: vec3<f32>) -> f32 {
     let len2 = dot(sky_vec, sky_vec);
@@ -220,15 +246,17 @@ fn sky_term(n: vec3<f32>, sky_vec: vec3<f32>) -> f32 {
 fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     // ---- material (section 1)
     let base = textureSample(albedo_tex, mat_samp, i.uv0);
-    var albedo = base.rgb * mt.color.rgb;
+    var albedo = base.rgb * mt.color.rgb * mt.albedo_tint.rgb;
+    var vtx = vec3<f32>(1.0);
     if (mt.params.w > 0.5) {
-        albedo *= pow(abs(i.col.rgb), vec3<f32>(2.2));
+        vtx = pow(abs(i.col.rgb), vec3<f32>(2.2));
+        albedo *= vtx;
     }
     let n2 = textureSample(normal_tex, mat_samp, i.uv0).rg * 2.867661 - 1.439453;
     let gloss = textureSample(gloss_tex, mat_samp, i.uv0).r;
     let f0 = textureSample(spec_tex, mat_samp, i.uv0).rgb;
     let ao_s = textureSample(ao_tex, mat_samp, i.uv0).r;
-    let emis = textureSample(emis_tex, mat_samp, i.uv0).rgb;
+    let emis_t = textureSample(emis_tex, mat_samp, i.uv0).rgb;
     let lm0 = textureSample(lm0_tex, lm_samp, i.uv1);
     let lm1 = textureSample(lm1_tex, lm_samp, i.uv1);
     let vis_a = textureSample(rtl_vis, lm_samp, vec2<f32>(i.uv1.x, i.uv1.y * 0.5)).rg;
@@ -330,7 +358,10 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
     let occ = clamp((lum(env_ambient_src) + env_sky_len * lum(fr.sky.rgb)) * cube_ambient[cube], 0.0, 1.0) * horizon;
     let env_spec = env * fe * kr * occ * (4.0 * s.nov * s.nov) / (2.0 * max(2.0 * s.nov * mix(s.nov, 1.0, s.a), 0.00125));
 
+    // emissive = emissiveTexture * c_L0_emissiveTint * vertex colour (world emissive PS, 0xBA8A6B19D28B0FA2)
+    let emis = emis_t * mt.emissive_tint.rgb * vtx * mt.params2.y;
     var c = albedo * (acc.diff + albedo * acc.multi) + acc.spec + env_spec + albedo * indirect * ao + emis;
+    c = fog(c, i.rel);
 
     let dbg = fr.misc.w;
     if (dbg > 0.5 && dbg < 1.5) { c = vec3<f32>(sun); }
@@ -349,6 +380,18 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
         a = 1.0;
     }
     return vec4<f32>(c, a);
+}
+
+// Sky-shaded surfaces (sky shader set 0xE273F3D2055B839F, PS 0x926A177354932726): unlit
+//   colour = cube(viewDir) * albedoTint + emissiveTex * emissiveTint * lerp(inner, outer, pow(1 - |N.V|, exponent))
+@fragment
+fn fs_skymat(i: VOut) -> @location(0) vec4<f32> {
+    let v = normalize(i.rel);
+    var c = textureSample(sky_cube, mat_samp, v).rgb * mt.albedo_tint.rgb;
+    let n = normalize(i.nrm + vec3<f32>(0.0, 0.0, 1e-6));
+    let edge = max(mix(mt.emissive_edge.y, mt.emissive_edge.z, pow(max(1.0 - abs(dot(n, -v)), 0.0), mt.emissive_edge.x)), 0.0);
+    c += textureSample(emis_tex, mat_samp, i.uv0).rgb * mt.emissive_tint.rgb * edge * mt.params2.y;
+    return vec4<f32>(fog(c, i.rel), 1.0);
 }
 
 // Sky: fullscreen triangle at the far plane (reverse-Z: depth 0), drawn first.

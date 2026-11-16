@@ -28,13 +28,15 @@ pub struct Material {
     pub alpha_cutoff: f32,
     pub double_sided: bool,
     pub lightmapped: bool,
+    /// sky-shaded surface (unlit, samples the sky cubemap by view direction)
+    pub sky: bool,
 }
 
 impl Material {
     /// Does this surface block the player? Grass, leaves, bushes, wires, cables and decals don't
     /// (tree trunks, stumps and logs do). Blended (glass/fx) surfaces never do.
     pub fn solid(&self) -> bool {
-        if self.alpha_mode == 2 {
+        if self.alpha_mode == 2 || self.sky {
             return false;
         }
         let n = self.name.to_ascii_lowercase();
@@ -238,6 +240,7 @@ fn parse_materials(j: &Value) -> Vec<Material> {
             alpha_cutoff: m["alphaCutoff"].as_f64().unwrap_or(0.5) as f32,
             double_sided: m["doubleSided"].as_bool().unwrap_or(false),
             lightmapped: m["extras"]["lightmapped"].as_bool().unwrap_or(false),
+            sky: m["extras"]["sky"].as_bool().unwrap_or(false),
         });
     }
     out

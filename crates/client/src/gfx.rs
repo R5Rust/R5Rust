@@ -2,6 +2,7 @@
 //! World pass: 4x MSAA HDR (Rgba16Float) + reverse-Z depth, sky first, then opaque / alpha-tested
 //! (alpha-to-coverage) / blended draws. Post pass: ACES tonemap, or the loading screen.
 
+use crate::bloom::Bloom;
 use crate::csm::{self, Csm};
 use crate::loader::{upload_rgba, LoadedWorld};
 use glam::{Mat4, Vec3, Vec4};
@@ -29,6 +30,8 @@ pub struct FrameUniform {
     pub shadow_vp: [[[f32; 4]; 4]; csm::N],
     /// cascade half-widths
     pub cascade_r: [f32; 4],
+    /// Apex height fog c_fogParams k0..k4 (see world.wgsl fog())
+    pub fog_k: [[f32; 4]; 5],
 }
 
 #[repr(C)]
@@ -36,6 +39,8 @@ pub struct FrameUniform {
 struct PostUniform {
     params: [f32; 4],
     screen: [f32; 4],
+    /// x = bloom amount
+    bloom: [f32; 4],
 }
 
 pub struct Camera {
@@ -75,6 +80,8 @@ pub struct Gfx {
     post_bg: wgpu::BindGroup,
     frame_bg: Option<wgpu::BindGroup>,
     pub csm: Csm,
+    bloom: Bloom,
+    pub bloom_amount: f32,
     expo_state: wgpu::Buffer,
     expo_params: wgpu::Buffer,
     expo_layout: wgpu::BindGroupLayout,
@@ -84,8 +91,10 @@ pub struct Gfx {
     expo_last: std::cell::Cell<std::time::Instant>,
     /// snap exposure every frame (screenshot mode)
     pub instant_exposure: bool,
-    /// target average luminance for auto exposure
-    pub exposure_key: f32,
+    /// auto-exposure settings (Apex mat_autoexposure_* equivalents)
+    pub expo: shared::assets::AutoExposure,
+    /// fixed exposure (calibration), bypasses the meter
+    pub forced_exposure: Option<f32>,
     /// linear multiplier before the tonemap
     pub exposure: f32,
     pub drawn: std::cell::Cell<u32>,
@@ -230,6 +239,7 @@ impl Gfx {
                 layout_entry(11, storage_ty()),
                 layout_entry(12, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::CubeArray, multisampled: false }),
                 layout_entry(13, storage_ty()),
+                layout_entry(14, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::Cube, multisampled: false }),
             ],
         });
         let mat_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -238,7 +248,7 @@ impl Gfx {
         });
         let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("post"),
-            entries: &[layout_entry(0, uniform_ty()), layout_entry(1, tex_ty()), layout_entry(2, tex_ty()), layout_entry(3, samp_ty()), layout_entry(4, storage_ty())],
+            entries: &[layout_entry(0, uniform_ty()), layout_entry(1, tex_ty()), layout_entry(2, tex_ty()), layout_entry(3, samp_ty()), layout_entry(4, storage_ty()), layout_entry(5, tex_ty())],
         });
 
         let world_sh = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("world"), source: wgpu::ShaderSource::Wgsl(include_str!("world.wgsl").into()) });
@@ -281,6 +291,18 @@ impl Gfx {
                 cache: None,
             }));
         }
+        // key 6: sky-shaded surfaces (unlit cube lookup + edge-faded emissive), opaque, no culling
+        world_pipes.push(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sky material"),
+            layout: Some(&world_pl),
+            vertex: wgpu::VertexState { module: &world_sh, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[Some(vlayout.clone()), Some(player.clone())] },
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::GreaterEqual), stencil: Default::default(), bias: Default::default() }),
+            multisample: wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false },
+            fragment: Some(wgpu::FragmentState { module: &world_sh, entry_point: Some("fs_skymat"), compilation_options: Default::default(), targets: &[Some(HDR.into())] }),
+            multiview_mask: None,
+            cache: None,
+        }));
         let sky_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("sky"),
             layout: Some(&sky_pl),
@@ -329,7 +351,7 @@ impl Gfx {
 
         let (msaa_view, hdr_view, depth_view) = targets(&device, width.max(1), height.max(1));
         let expo_state = device.create_buffer(&wgpu::BufferDescriptor { label: Some("expo"), size: 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let expo_params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("expo params"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let expo_params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("expo params"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let cs = wgpu::ShaderStages::COMPUTE;
         let expo_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("expo"),
@@ -344,7 +366,9 @@ impl Gfx {
         let mkc = |e: &str| device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("expo"), layout: Some(&expo_pl), module: &expo_sh, entry_point: Some(e), compilation_options: Default::default(), cache: None });
         let (expo_lum, expo_adapt) = (mkc("lum"), mkc("adapt"));
         let expo_bg = Self::make_expo_bg(&device, &expo_layout, &hdr_view, &expo_state, &expo_params);
-        let post_bg = Self::make_post_bg(&device, &post_layout, &post_ub, &hdr_view, &load_view, &post_samp, &expo_state);
+        let mut bloom = Bloom::new(&device, cfg.bloom_cutoff, cfg.bloom_clamp);
+        bloom.resize(&device, &queue, &hdr_view, &expo_state, width.max(1), height.max(1));
+        let post_bg = Self::make_post_bg(&device, &post_layout, &post_ub, &hdr_view, &load_view, &post_samp, &expo_state, &bloom.output);
 
         Ok(Gfx {
             device,
@@ -374,6 +398,8 @@ impl Gfx {
             post_bg,
             frame_bg: None,
             csm,
+            bloom,
+            bloom_amount: cfg.bloom_amount,
             expo_state,
             expo_params,
             expo_layout,
@@ -382,7 +408,8 @@ impl Gfx {
             expo_adapt,
             expo_last: std::cell::Cell::new(std::time::Instant::now()),
             instant_exposure: false,
-            exposure_key: cfg.exposure_key,
+            expo: cfg.auto_exposure.clone(),
+            forced_exposure: None,
             exposure: cfg.exposure,
             drawn: std::cell::Cell::new(0),
             offscreen: None,
@@ -413,7 +440,7 @@ impl Gfx {
         v
     }
 
-    fn make_post_bg(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, ub: &wgpu::Buffer, hdr: &wgpu::TextureView, load: &wgpu::TextureView, samp: &wgpu::Sampler, expo: &wgpu::Buffer) -> wgpu::BindGroup {
+    fn make_post_bg(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, ub: &wgpu::Buffer, hdr: &wgpu::TextureView, load: &wgpu::TextureView, samp: &wgpu::Sampler, expo: &wgpu::Buffer, bloom: &wgpu::TextureView) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("post"),
             layout,
@@ -423,6 +450,7 @@ impl Gfx {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(load) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(samp) },
                 wgpu::BindGroupEntry { binding: 4, resource: expo.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(bloom) },
             ],
         })
     }
@@ -442,7 +470,8 @@ impl Gfx {
         self.msaa_view = m;
         self.hdr_view = hd;
         self.depth_view = d;
-        self.post_bg = Self::make_post_bg(&self.device, &self.post_layout, &self.post_ub, &self.hdr_view, &self.load_view, &self.post_samp, &self.expo_state);
+        self.bloom.resize(&self.device, &self.queue, &self.hdr_view, &self.expo_state, w, h);
+        self.post_bg = Self::make_post_bg(&self.device, &self.post_layout, &self.post_ub, &self.hdr_view, &self.load_view, &self.post_samp, &self.expo_state, &self.bloom.output);
         self.expo_bg = Self::make_expo_bg(&self.device, &self.expo_layout, &self.hdr_view, &self.expo_state, &self.expo_params);
     }
 
@@ -465,6 +494,7 @@ impl Gfx {
                 wgpu::BindGroupEntry { binding: 11, resource: world.light.probes.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(&world.light.cubes) },
                 wgpu::BindGroupEntry { binding: 13, resource: world.light.cube_ambient.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(&world.sky_cube) },
             ],
         }));
         self.csm.invalidate();
@@ -497,6 +527,7 @@ impl Gfx {
             misc: [0.0, time, self.exposure, cam.debug],
             shadow_vp: self.csm.mats.map(|m| m.to_cols_array_2d()),
             cascade_r: csm::RADII,
+            fog_k: world.fog.k,
         }
     }
 
@@ -534,7 +565,7 @@ impl Gfx {
             let cam = Vec3::new(fu.cam_pos[0], fu.cam_pos[1], fu.cam_pos[2]);
             let mut drawn = 0;
             for d in &w.draws {
-                if !visible(&planes, Vec3::from(d.min) - cam, Vec3::from(d.max) - cam) {
+                if !visible(&planes, Vec3::from(d.min) - cam, Vec3::from(d.max) - cam) || (d.key == 6 && std::env::var_os("R5_NOSKYMAT").is_some()) {
                     continue;
                 }
                 drawn += 1;
@@ -548,9 +579,12 @@ impl Gfx {
             self.drawn.set(drawn);
             drop(rp);
             let now = std::time::Instant::now();
-            let dt = if self.instant_exposure { 1.0 } else { (now - self.expo_last.get()).as_secs_f32().min(0.5) };
+            let dt = (now - self.expo_last.get()).as_secs_f32().min(0.5);
             self.expo_last.set(now);
-            self.queue.write_buffer(&self.expo_params, 0, bytemuck::cast_slice(&[dt, self.exposure_key, 0.25, 6.0]));
+            let x = &self.expo;
+            let rate = if self.instant_exposure || self.forced_exposure.is_some() { 1e6 } else { x.rate * dt };
+            let (emin, emax) = match self.forced_exposure { Some(f) => (f, f), None => (x.min, x.max) };
+            self.queue.write_buffer(&self.expo_params, 0, bytemuck::cast_slice(&[rate, x.target_min, x.target_max, x.compensation, emin, emax, x.spot, x.max_lum]));
             let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("expo"), timestamp_writes: None });
             cp.set_bind_group(0, &self.expo_bg, &[]);
             cp.set_pipeline(&self.expo_lum);
@@ -558,6 +592,7 @@ impl Gfx {
             cp.set_pipeline(&self.expo_adapt);
             cp.dispatch_workgroups(1, 1, 1);
             drop(cp);
+            self.bloom.encode(&mut enc);
             1.0
         } else {
             0.0
@@ -565,6 +600,7 @@ impl Gfx {
         let pu = PostUniform {
             params: [mode, progress, self.exposure, if self.out_srgb { 1.0 } else { 0.0 }],
             screen: [self.width as f32, self.height as f32, self.load_size.0 as f32, self.load_size.1 as f32],
+            bloom: [self.bloom_amount, 0.0, 0.0, 0.0],
         };
         self.queue.write_buffer(&self.post_ub, 0, bytemuck::bytes_of(&pu));
         {

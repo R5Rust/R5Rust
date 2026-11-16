@@ -24,8 +24,37 @@ pub struct Config {
     pub port: u16,
     /// linear exposure before the tonemap
     pub exposure: f32,
-    /// auto-exposure target: average scene luminance is scaled to this
-    pub exposure_key: f32,
+    pub auto_exposure: AutoExposure,
+    /// bloom added to the scene before exposure (c_bloomAmount)
+    pub bloom_amount: f32,
+    /// exposed luminance where bloom starts (c_bloomCutoff)
+    pub bloom_cutoff: f32,
+    /// cap on exposed luminance that blooms (c_bloomClamp)
+    pub bloom_clamp: f32,
+}
+
+/// Apex-style auto exposure (mat_autoexposure_*): dead band on the centre-spot mean luminance.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct AutoExposure {
+    pub target_min: f32,
+    pub target_max: f32,
+    /// EV stops
+    pub compensation: f32,
+    pub min: f32,
+    pub max: f32,
+    /// relative change per second
+    pub rate: f32,
+    /// fraction of the screen metered (centred)
+    pub spot: f32,
+    /// per-pixel luminance clamp before averaging
+    pub max_lum: f32,
+}
+
+impl Default for AutoExposure {
+    fn default() -> Self {
+        Self { target_min: 0.18, target_max: 0.18, compensation: 0.0, min: 0.1, max: 8.0, rate: 1.5, spot: 0.6, max_lum: 20.0 }
+    }
 }
 
 impl Default for Config {
@@ -44,7 +73,10 @@ impl Default for Config {
             backend: "vulkan".into(),
             port: 37015,
             exposure: 1.0,
-            exposure_key: 0.18,
+            auto_exposure: AutoExposure::default(),
+            bloom_amount: 0.12,
+            bloom_cutoff: 1.0,
+            bloom_clamp: 20.0,
         }
     }
 }

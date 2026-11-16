@@ -5,8 +5,10 @@
 //!   r5rust --screenshot out.png [--frames 120] [--loadshot load.png] [--pos x,y,z] [--yaw d] [--pitch d]
 //!          [--hold w,shift,space] [--fly]
 
+mod bloom;
 mod csm;
 mod dds;
+mod fog;
 mod lighting;
 mod texcache;
 mod gfx;
@@ -44,6 +46,8 @@ struct Args {
     hold: Vec<String>,
     fly: bool,
     debug: f32,
+    fov: Option<f32>,
+    exposure: Option<f32>,
 }
 
 fn parse_args() -> Args {
@@ -70,6 +74,8 @@ fn parse_args() -> Args {
             "--hold" => a.hold = next(&mut i).split(',').map(|s| s.trim().to_ascii_lowercase()).collect(),
             "--fly" => a.fly = true,
             "--debug" => a.debug = next(&mut i).parse().unwrap_or(0.0),
+            "--fov" => a.fov = next(&mut i).parse().ok(),
+            "--exposure" => a.exposure = next(&mut i).parse().ok(),
             other => log::warn!("unknown arg {other}"),
         }
         i += 1;
@@ -143,6 +149,7 @@ fn run_headless(cfg: Config, args: Args) -> Result<(), String> {
     let world = rx.recv().map_err(|e| e.to_string())??;
     let mut gfx = gfx;
     gfx.instant_exposure = true;
+    gfx.forced_exposure = args.exposure;
     gfx.set_world(&world);
     let (mut player, yaw, pitch) = spawn(&world, &args);
     player.fly_speed = cfg.fly_speed;
@@ -181,7 +188,7 @@ fn run_headless(cfg: Config, args: Args) -> Result<(), String> {
     println!("{}", world.stats);
     println!("chunks drawn: {} of {}", gfx.drawn.get(), world.draws.len());
     let (e, avg) = gfx.read_exposure();
-    println!("auto exposure {e:.3} (avg log2 lum {avg:.2}, avg lum {:.3})", avg.exp2());
+    println!("auto exposure {e:.3} (spot mean lum {avg:.4})");
     println!("GPU: {}  {}x{}  {:.2} ms/frame ({:.0} fps)", gfx.adapter_name, gfx.width, gfx.height, ms, 1000.0 / ms);
     println!(
         "spawn ({:.0},{:.0},{:.0}) -> after {} ticks ({:.0},{:.0},{:.0}) ground={} fly={} moved {:.0}u",
@@ -423,8 +430,11 @@ impl ApplicationHandler for App {
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,naga=warn")).init();
-    let cfg = Config::load();
+    let mut cfg = Config::load();
     let args = parse_args();
+    if let Some(f) = args.fov {
+        cfg.fov = f;
+    }
     if args.screenshot.is_some() {
         if let Err(e) = run_headless(cfg, args) {
             eprintln!("error: {e}");

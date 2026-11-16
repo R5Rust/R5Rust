@@ -166,7 +166,7 @@ impl Csm {
             let mut cur = 255u8;
             for d in &world.draws {
                 let alpha = d.key / 2;
-                if alpha == 2 || !overlaps(&view, r, d.min, d.max) {
+                if alpha >= 2 || !overlaps(&view, r, d.min, d.max) {
                     continue;
                 }
                 if alpha != cur {

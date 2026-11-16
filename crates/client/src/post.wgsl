@@ -3,6 +3,7 @@
 struct Post {
     params: vec4<f32>, // x = mode, y = progress 0..1, z = exposure, w = output gamma (1 = surface is sRGB)
     screen: vec4<f32>, // xy = target size, zw = loadscreen image size
+    bloom: vec4<f32>,  // x = amount
 };
 
 @group(0) @binding(0) var<uniform> pp: Post;
@@ -16,6 +17,7 @@ struct Expo {
     avg_log: f32,
 };
 @group(0) @binding(4) var<storage, read> expo: Expo;
+@group(0) @binding(5) var bloom_tex: texture_2d<f32>;
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
@@ -70,6 +72,7 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
         }
         return out_color(c);
     }
-    let h = textureSampleLevel(hdr_tex, samp, i.uv, 0.0).rgb;
+    // Apex composite: (scene + bloom) * exposure -> tonemap   (bloom added before exposure)
+    let h = textureSampleLevel(hdr_tex, samp, i.uv, 0.0).rgb + textureSampleLevel(bloom_tex, samp, i.uv, 0.0).rgb * pp.bloom.x;
     return out_color(aces(h * pp.params.z * max(expo.exposure, 1e-3)));
 }

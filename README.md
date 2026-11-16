@@ -66,6 +66,12 @@ Settles for 30 ticks, holds `--hold` keys for `--frames` ticks (60/s), renders, 
 GPU ms/frame, where the player ended up and the jump peak. `--debug`: 1 = sun visibility (lightmap A),
 2 = baked indirect light, 3 = albedo only.
 
+## Re-exporting the map
+
+`tools/export-map` (Rust, standalone) rebuilds `world.glb` + `meta.json` from the game's paks; `tools/build_materials.py`
+maps materials to the extracted textures + constants (`materials.json`). Lighting lumps live in `<map>/bsp/`,
+cubemaps in `cubemaps.dds`, the sky in `skycube.dds`. Compressed texture cache: `D:\R5Rust\_cache	ex`.
+
 ## Layout
 
 - `crates/shared`: GLB loader, BVH capsule collision, deterministic `sim::simulate()` (movement), config

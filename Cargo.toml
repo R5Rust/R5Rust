@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/shared", "crates/server", "crates/client"]
+exclude = ["tools/export-map"]
 
 [workspace.package]
 version = "0.1.0"
