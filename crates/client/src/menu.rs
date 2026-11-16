@@ -10,6 +10,7 @@ use winit::window::Window;
 enum Tab {
     Controls,
     Mouse,
+    Gameplay,
 }
 
 pub struct Menu {
@@ -39,7 +40,12 @@ impl Menu {
         let ctx = egui::Context::default();
         ctx.set_visuals(egui::Visuals::dark());
         let renderer = egui_wgpu::Renderer::new(device, format, egui_wgpu::RendererOptions::default());
-        Menu { ctx, state: None, renderer, open: true, tab: Tab::Controls, listening: None, settings, dirty: false, quit_requested: false }
+        let tab = match std::env::var("R5_MENU_TAB").as_deref() {
+            Ok("mouse") => Tab::Mouse,
+            Ok("gameplay") => Tab::Gameplay,
+            _ => Tab::Controls,
+        };
+        Menu { ctx, state: None, renderer, open: true, tab, listening: None, settings, dirty: false, quit_requested: false }
     }
 
     pub fn is_listening(&self) -> bool {
@@ -117,11 +123,13 @@ impl Menu {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.tab, Tab::Controls, "Controls");
                     ui.selectable_value(&mut self.tab, Tab::Mouse, "Mouse & View");
+                    ui.selectable_value(&mut self.tab, Tab::Gameplay, "Gameplay");
                 });
                 ui.separator();
                 match self.tab {
                     Tab::Controls => self.controls_tab(ui),
                     Tab::Mouse => self.mouse_tab(ui),
+                    Tab::Gameplay => self.gameplay_tab(ui),
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -168,6 +176,13 @@ impl Menu {
             self.listening = None;
             self.dirty = true;
         }
+    }
+
+    fn gameplay_tab(&mut self, ui: &mut egui::Ui) {
+        if ui.checkbox(&mut self.settings.mantle_boost, "Mantle Boost").changed() {
+            self.dirty = true;
+        }
+        ui.label("Jump in the sweet spot at the end of a mantle to launch out of it. With it off, every jump during a mantle                   is Apex's normal jump-off / hop-back, and superglides (crouch + jump at the end of the mantle) work.");
     }
 
     fn mouse_tab(&mut self, ui: &mut egui::Ui) {

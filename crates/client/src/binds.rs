@@ -293,11 +293,13 @@ pub struct UserSettings {
     /// horizontal FOV at 4:3, like Apex's slider
     pub fov: f32,
     pub invert_y: bool,
+    /// Apex's mantle boost (playlist var mantle_boost_enabled, on by default)
+    pub mantle_boost: bool,
 }
 
 impl Default for UserSettings {
     fn default() -> Self {
-        UserSettings { binds: Binds::default(), sensitivity: 1.6, fov: 100.0, invert_y: false }
+        UserSettings { binds: Binds::default(), sensitivity: 1.6, fov: 100.0, invert_y: false, mantle_boost: true }
     }
 }
 

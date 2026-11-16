@@ -284,12 +284,13 @@ impl App {
         }
 
         let gfx = self.gfx.as_mut().unwrap();
-        let (binds, fov, menu_open) = match &self.menu {
-            Some(m) => (m.settings.binds.clone(), m.settings.fov, m.open),
-            None => (Binds::default(), self.cfg.fov, false),
+        let (binds, fov, menu_open, mantle_boost) = match &self.menu {
+            Some(m) => (m.settings.binds.clone(), m.settings.fov, m.open, m.settings.mantle_boost),
+            None => (Binds::default(), self.cfg.fov, false, true),
         };
         let frame = gfx.begin_frame();
         if let Some(g) = &mut self.game {
+            g.player.cvars.mantle_boost_enabled = mantle_boost;
             g.accum += dt;
             while g.accum >= TICK {
                 self.input.begin_tick();
