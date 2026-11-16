@@ -5,6 +5,7 @@
 //!   r5rust --screenshot out.png [--frames 120] [--loadshot load.png] [--pos x,y,z] [--yaw d] [--pitch d]
 //!          [--hold w,shift,space] [--fly]
 
+mod csm;
 mod gfx;
 mod loader;
 
@@ -154,6 +155,10 @@ fn run_headless(cfg: Config, args: Args) -> Result<(), String> {
     }
     println!("peak height above start: {:.0}u", max_z - start.z);
     let cam = Camera { pos: player.eye(), yaw, pitch, fov: cfg.fov, debug: args.debug };
+    let tc = Instant::now();
+    let nc = gfx.prepare(&cam, &world);
+    gfx.wait();
+    println!("shadow cascades: {nc} rendered in {:.1} ms", tc.elapsed().as_secs_f64() * 1000.0);
     let fu = gfx.frame_uniform(&cam, &world, args.frames as f32 * TICK);
     // GPU timing: a few warm-up frames, then average
     for _ in 0..5 {
@@ -170,6 +175,7 @@ fn run_headless(cfg: Config, args: Args) -> Result<(), String> {
     let path = args.screenshot.clone().unwrap();
     gfx.screenshot(&path, Some((&world, &fu)), 1.0)?;
     println!("{}", world.stats);
+    println!("chunks drawn: {} of {}", gfx.drawn.get(), world.draws.len());
     println!("GPU: {}  {}x{}  {:.2} ms/frame ({:.0} fps)", gfx.adapter_name, gfx.width, gfx.height, ms, 1000.0 / ms);
     println!(
         "spawn ({:.0},{:.0},{:.0}) -> after {} ticks ({:.0},{:.0},{:.0}) ground={} fly={} moved {:.0}u",
@@ -263,6 +269,7 @@ impl App {
             let alpha = g.accum / TICK;
             let eye = g.prev_eye.lerp(g.player.eye(), alpha);
             let cam = Camera { pos: eye, yaw: g.yaw, pitch: g.pitch, fov: self.cfg.fov, debug: self.args.debug };
+            gfx.prepare(&cam, &g.world);
             let fu = gfx.frame_uniform(&cam, &g.world, self.start.elapsed().as_secs_f32());
             gfx.present(Some((&g.world, &fu)), 1.0);
         } else {

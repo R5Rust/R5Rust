@@ -11,13 +11,43 @@ struct Frame {
     sky: vec4<f32>,        // hemisphere sky colour, w = intensity
     ground: vec4<f32>,     // hemisphere ground colour
     fog: vec4<f32>,        // rgb, w = start distance
-    misc: vec4<f32>,       // x = fog end, y = time, z = exposure
+    misc: vec4<f32>,       // x = fog end, y = time, z = exposure, w = debug view
+    shadow_vp: array<mat4x4<f32>, 4>,
+    cascade_r: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> fr: Frame;
 @group(0) @binding(1) var lm_tex: texture_2d<f32>;
 @group(0) @binding(2) var lm_samp: sampler;
 @group(0) @binding(3) var mat_samp: sampler;
+@group(0) @binding(4) var shadow_tex: texture_depth_2d_array;
+@group(0) @binding(5) var shadow_samp: sampler_comparison;
+
+const SHADOW_RES: f32 = 2048.0;
+
+/// Sun visibility from the cascades: -1 when outside every cascade.
+fn csm_visibility(world_pos: vec3<f32>, n: vec3<f32>) -> f32 {
+    for (var i = 0; i < 4; i++) {
+        let texel = 2.0 * fr.cascade_r[i] / SHADOW_RES;
+        // normal offset: push the lookup off the surface by ~1.5 texels
+        let p = world_pos + n * texel * 1.5;
+        let c = fr.shadow_vp[i] * vec4<f32>(p, 1.0);
+        let uv = vec2<f32>(c.x * 0.5 + 0.5, 0.5 - c.y * 0.5);
+        let m = 2.0 / SHADOW_RES;
+        if (all(uv > vec2<f32>(m)) && all(uv < vec2<f32>(1.0 - m)) && c.z < 1.0) {
+            // 3x3 bilinear-PCF taps
+            var sum = 0.0;
+            for (var y = -1; y <= 1; y++) {
+                for (var x = -1; x <= 1; x++) {
+                    let o = vec2<f32>(f32(x), f32(y)) / SHADOW_RES;
+                    sum += textureSampleCompareLevel(shadow_tex, shadow_samp, uv + o, i, c.z);
+                }
+            }
+            return sum / 9.0;
+        }
+    }
+    return -1.0;
+}
 
 struct Mat {
     color: vec4<f32>,
@@ -74,17 +104,20 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
     let ndl = max(dot(n, fr.to_sun.xyz), 0.0);
     // lightmapped: the bake already holds sky + bounce light, so no hemisphere fill on top
     var light = mix(fr.ground.rgb, fr.sky.rgb, n.z * 0.5 + 0.5) * fr.sky.w;
-    var sun_vis = 1.0;
+    let csm = csm_visibility(i.rel + fr.cam_pos.xyz, n);
+    var sun_vis = select(1.0, csm, csm >= 0.0);
     if (mt.params.y > 0.5) {
         // + a little hemisphere fill: the bake has no interior lights, so indoors would go black
         light = lm.rgb * 4.0 + light * 0.45;
-        sun_vis = smoothstep(0.3, 0.6, lm.a);
+        let baked = smoothstep(0.3, 0.6, lm.a);
+        sun_vis = select(baked, min(baked, csm), csm >= 0.0);
     }
     light += fr.sun_color.rgb * fr.sun_color.w * ndl * sun_vis;
     var c = fog_mix(albedo.rgb * light, i.rel);
     if (fr.misc.w > 0.5 && fr.misc.w < 1.5) { c = vec3<f32>(lm.a); }
     if (fr.misc.w > 1.5 && fr.misc.w < 2.5) { c = lm.rgb * 4.0; }
-    if (fr.misc.w > 2.5) { c = albedo.rgb; }
+    if (fr.misc.w > 2.5 && fr.misc.w < 3.5) { c = albedo.rgb; }
+    if (fr.misc.w > 3.5) { c = vec3<f32>(select(0.5, csm, csm >= 0.0)); }
 
     var a = albedo.a;
     if (mt.params.z > 0.5 && mt.params.z < 1.5) {

@@ -110,3 +110,10 @@ fn first_png(dir: &Path) -> Option<PathBuf> {
     v.sort();
     v.into_iter().next()
 }
+
+impl Config {
+    /// Raw lighting lumps copied from the map's BSP (`bsp/<lump hex>.bin`).
+    pub fn bsp_dir(&self) -> PathBuf {
+        self.map_dir().join("bsp")
+    }
+}

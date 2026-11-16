@@ -8,7 +8,6 @@ use shared::collision::Collision;
 use shared::glb::{self, Meta};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
 use wgpu::util::DeviceExt;
 
@@ -18,6 +17,55 @@ pub struct DrawCmd {
     pub material: u32,
     /// pipeline key: alpha_mode * 2 + double_sided
     pub key: u8,
+    /// world-space bounds of this chunk
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
+/// Splits every draw into spatial chunks (grid cells in X/Y) so the camera and the shadow cascades can cull.
+/// Returns the re-ordered index buffer and the chunk list, opaque first, blended last.
+fn chunk_draws(world: &glb::World) -> (Vec<u32>, Vec<DrawCmd>) {
+    const CELL: f32 = 4096.0;
+    const MIN_SPLIT_TRIS: u32 = 6000;
+    let pos = |i: u32| world.vertices[i as usize].pos;
+    let mut out_idx: Vec<u32> = Vec::with_capacity(world.indices.len());
+    let mut cmds = Vec::new();
+    for d in &world.draws {
+        let m = &world.materials[d.material as usize];
+        let key = m.alpha_mode * 2 + m.double_sided as u8;
+        let tris = &world.indices[d.first_index as usize..(d.first_index + d.index_count) as usize];
+        let mut cells: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
+        let split = d.index_count / 3 >= MIN_SPLIT_TRIS;
+        for t in tris.chunks_exact(3) {
+            let k = if split {
+                let (a, b, c) = (pos(t[0]), pos(t[1]), pos(t[2]));
+                let cx = (a[0] + b[0] + c[0]) / 3.0;
+                let cy = (a[1] + b[1] + c[1]) / 3.0;
+                ((cx / CELL).floor() as i32, (cy / CELL).floor() as i32)
+            } else {
+                (0, 0)
+            };
+            cells.entry(k).or_default().extend_from_slice(t);
+        }
+        let mut keys: Vec<_> = cells.keys().copied().collect();
+        keys.sort();
+        for k in keys {
+            let ix = &cells[&k];
+            let (mut mn, mut mx) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for &i in ix {
+                let p = pos(i);
+                for a in 0..3 {
+                    mn[a] = mn[a].min(p[a]);
+                    mx[a] = mx[a].max(p[a]);
+                }
+            }
+            cmds.push(DrawCmd { first_index: out_idx.len() as u32, index_count: ix.len() as u32, material: d.material, key, min: mn, max: mx });
+            out_idx.extend_from_slice(ix);
+        }
+    }
+    // stable: opaque, then alpha-tested, then blended (glb order kept inside each class)
+    cmds.sort_by_key(|c| (c.key / 2, c.key, c.material));
+    (out_idx, cmds)
 }
 
 pub struct LoadedWorld {
@@ -112,7 +160,9 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     }
     let col_thread = std::thread::spawn(move || Collision::build(positions, &col_idx));
 
-    // Geometry buffers.
+    // Geometry buffers (index buffer re-ordered into spatial chunks).
+    let (chunk_idx, draws) = chunk_draws(&world);
+    world.indices = chunk_idx;
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("world vb"), contents: bytemuck::cast_slice(&world.vertices), usage: wgpu::BufferUsages::VERTEX });
     let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("world ib"), contents: bytemuck::cast_slice(&world.indices), usage: wgpu::BufferUsages::INDEX });
     let vb_mb = (world.vertices.len() * 32) as f64 / 1e6;
@@ -185,14 +235,6 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
         })
         .collect();
 
-    let draws: Vec<DrawCmd> = world
-        .draws
-        .iter()
-        .map(|d| {
-            let m = &world.materials[d.material as usize];
-            DrawCmd { first_index: d.first_index, index_count: d.index_count, material: d.material, key: m.alpha_mode * 2 + m.double_sided as u8 }
-        })
-        .collect();
 
     progress.set(0.95);
     let collision = col_thread.join().map_err(|_| "collision build panicked".to_string())?;

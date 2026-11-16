@@ -3,6 +3,7 @@
 //! server (v2) can use all of it.
 
 pub mod assets;
+pub mod bsplight;
 pub mod collision;
 pub mod glb;
 pub mod sim;

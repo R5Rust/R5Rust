@@ -2,8 +2,9 @@
 //! World pass: 4x MSAA HDR (Rgba16Float) + reverse-Z depth, sky first, then opaque / alpha-tested
 //! (alpha-to-coverage) / blended draws. Post pass: ACES tonemap, or the loading screen.
 
+use crate::csm::{self, Csm};
 use crate::loader::{upload_rgba, LoadedWorld};
-use glam::Vec3;
+use glam::{Mat4, Vec3, Vec4};
 use shared::assets::Config;
 use std::sync::Arc;
 use winit::window::Window;
@@ -25,6 +26,9 @@ pub struct FrameUniform {
     pub ground: [f32; 4],
     pub fog: [f32; 4],
     pub misc: [f32; 4],
+    pub shadow_vp: [[[f32; 4]; 4]; csm::N],
+    /// cascade half-widths
+    pub cascade_r: [f32; 4],
 }
 
 #[repr(C)]
@@ -70,6 +74,8 @@ pub struct Gfx {
     load_size: (u32, u32),
     post_bg: wgpu::BindGroup,
     frame_bg: Option<wgpu::BindGroup>,
+    pub csm: Csm,
+    pub drawn: std::cell::Cell<u32>,
     offscreen: Option<wgpu::TextureView>,
 }
 
@@ -193,7 +199,14 @@ impl Gfx {
 
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame"),
-            entries: &[layout_entry(0, uniform_ty()), layout_entry(1, tex_ty()), layout_entry(2, samp_ty()), layout_entry(3, samp_ty())],
+            entries: &[
+                layout_entry(0, uniform_ty()),
+                layout_entry(1, tex_ty()),
+                layout_entry(2, samp_ty()),
+                layout_entry(3, samp_ty()),
+                layout_entry(4, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }),
+                layout_entry(5, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison)),
+            ],
         });
         let mat_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("mat"), entries: &[layout_entry(0, uniform_ty()), layout_entry(1, tex_ty())] });
         let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -279,6 +292,8 @@ impl Gfx {
         let mat_samp = device.create_sampler(&lin(wgpu::AddressMode::Repeat, 16, wgpu::MipmapFilterMode::Linear));
         let post_samp = device.create_sampler(&lin(wgpu::AddressMode::ClampToEdge, 1, wgpu::MipmapFilterMode::Nearest));
 
+        let csm = Csm::new(&device, &mat_layout, &mat_samp);
+
         let ls = loadscreen.unwrap_or_else(|| image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 10, 12, 255])));
         let load_size = ls.dimensions();
         let load_view = upload_rgba(&device, &queue, &[ls], wgpu::TextureFormat::Rgba8UnormSrgb, "loadscreen").create_view(&Default::default());
@@ -313,6 +328,8 @@ impl Gfx {
             load_size,
             post_bg,
             frame_bg: None,
+            csm,
+            drawn: std::cell::Cell::new(0),
             offscreen: None,
         })
     }
@@ -357,8 +374,17 @@ impl Gfx {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&world.lightmap) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.lm_samp) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.mat_samp) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.csm.array_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.csm.cmp_samp) },
             ],
         }));
+        self.csm.invalidate();
+    }
+
+    /// Per-frame work before drawing: re-renders the shadow cascades the camera has moved away from.
+    pub fn prepare(&mut self, cam: &Camera, world: &LoadedWorld) -> u32 {
+        let to_sun = -Vec3::from(world.meta.sun_dir).normalize_or(Vec3::Z);
+        self.csm.update(&self.device, &self.queue, cam.pos, to_sun, world)
     }
 
     pub fn frame_uniform(&self, cam: &Camera, world: &LoadedWorld, time: f32) -> FrameUniform {
@@ -381,6 +407,8 @@ impl Gfx {
             ground: [0.147, 0.102, 0.064, 0.0],
             fog: [0.347, 0.456, 0.578, 20000.0],
             misc: [90000.0, time, 1.0, cam.debug],
+            shadow_vp: self.csm.mats.map(|m| m.to_cols_array_2d()),
+            cascade_r: csm::RADII,
         }
     }
 
@@ -413,7 +441,14 @@ impl Gfx {
             rp.set_vertex_buffer(0, w.vbuf.slice(..));
             rp.set_index_buffer(w.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             let mut cur_key = 255u8;
+            let planes = frustum_planes(&Mat4::from_cols_array_2d(&fu.view_proj));
+            let cam = Vec3::new(fu.cam_pos[0], fu.cam_pos[1], fu.cam_pos[2]);
+            let mut drawn = 0;
             for d in &w.draws {
+                if !visible(&planes, Vec3::from(d.min) - cam, Vec3::from(d.max) - cam) {
+                    continue;
+                }
+                drawn += 1;
                 if d.key != cur_key {
                     cur_key = d.key;
                     rp.set_pipeline(&self.world_pipes[d.key as usize]);
@@ -421,6 +456,7 @@ impl Gfx {
                 rp.set_bind_group(1, &w.mat_groups[d.material as usize], &[]);
                 rp.draw_indexed(d.first_index..d.first_index + d.index_count, 0, 0..1);
             }
+            self.drawn.set(drawn);
             1.0
         } else {
             0.0
@@ -534,4 +570,17 @@ impl Gfx {
     pub fn wait(&self) {
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
     }
+}
+
+/// Side + near planes of a reverse-Z infinite projection (camera-relative space).
+fn frustum_planes(vp: &Mat4) -> [Vec4; 5] {
+    let (r0, r1, r2, r3) = (vp.row(0), vp.row(1), vp.row(2), vp.row(3));
+    [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r3 - r2]
+}
+
+fn visible(planes: &[Vec4; 5], mn: Vec3, mx: Vec3) -> bool {
+    planes.iter().all(|p| {
+        let v = Vec3::new(if p.x >= 0.0 { mx.x } else { mn.x }, if p.y >= 0.0 { mx.y } else { mn.y }, if p.z >= 0.0 { mx.z } else { mn.z });
+        p.x * v.x + p.y * v.y + p.z * v.z + p.w >= 0.0
+    })
 }
