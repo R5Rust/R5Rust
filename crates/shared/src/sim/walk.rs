@@ -197,6 +197,9 @@ pub(super) fn check_jump_button(c: &mut Ctx) -> bool {
     apply_half_gravity(c, c.ft);
     check_velocity(c);
     c.p.last_jump_time = c.now;
+    // S21 jump 0x140a3b550 tail: pl+0x3670 = now, lurch strength 1, tap count 0
+    c.p.grace.mult = 1.0;
+    c.p.grace.taps = 0;
     c.p.air_from_jump = true;
     true
 }
@@ -601,6 +604,138 @@ fn air_accelerate(c: &mut Ctx, dir: Vec3, ws: f32, accel: f32, dt: f32) {
     c.p.vel = nv;
 }
 
+/// Velocity-based multi-tap decay, S21 client 0x140a48810: how much of the lurch strength multiplier one lurch
+/// at horizontal speed `vh` eats. t = fminf(vh, max_speed) / max_speed, eased, times max_decay (0 = off, default).
+fn grace_velocity_decay(cv: &crate::settings::Cvars, vh: f32) -> f32 {
+    let m = cv.jump_grace_multi_tap_decay_velocity_based_max_decay;
+    if m <= 0.0 {
+        return 0.0;
+    }
+    let ms = cv.jump_grace_multi_tap_decay_velocity_based_max_speed;
+    let t = vh.min(ms) / ms;
+    match cv.jump_grace_multi_tap_decay_velocity_based_easing_type {
+        // easeInSine: the binary evaluates sin(t*pi/2 + pi/2) with its own polynomial; = cos(t*pi/2)
+        1 => (m - (t * std::f32::consts::FRAC_PI_2 + std::f32::consts::FRAC_PI_2).sin() * m) + 0.0,
+        // easeInCirc
+        2 => 0.0 - ((1.0 - t * t).sqrt() - 1.0) * m,
+        3 => t * m + 0.0,
+        // step: returns 1.0 (not max_decay) above max_speed, as the binary does
+        4 => {
+            if ms < vh {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        // 0 and anything else: easeInCubic
+        _ => t * t * t * m + 0.0,
+    }
+}
+
+/// Jump grace: the lurch / tap-strafe. S21 client C_GameMovement::AirMove_TapStrafe 0x140a48a30 (r5apex_dx12.exe),
+/// called by AirMove 0x140a48f90 right after AirAccelerate. A move key pressed within jump_graceperiodmax of the
+/// jump bends the horizontal velocity toward the held keys (camera-relative, opposites cancel), keeping the speed
+/// unless the change exceeds jump_grace_max x sprint speed, which caps it (that cap is what costs speed on wide
+/// lurches). Differences from the 2019 server's keyboard grace (jump_keyboardgrace*, the previous port):
+/// cutoff speed, tap count / min period / multi-tap and velocity decay, the optional limit-to-90 back rule,
+/// analog input when require_tap is off, and no velocity change when the blended direction is shorter than 0.01.
+fn jump_grace(c: &mut Ctx) {
+    let cv = c.cv;
+    // R5Flowstate SDK client hook Hook_AirMove_TapStrafe (mantle_boost.cpp): a full mantle boost (state 4) skips
+    // this whole function until landing. The S21 binary has no such gate; R5Flowstate (the reference) does.
+    {
+        let mb = &mut c.p.mantle_boost;
+        if mb.state == 4 && c.p.last_land_time > mb.applied_time {
+            mb.state = 0;
+        }
+        if cv.mantle_boost_enabled && cv.mantle_boost_disables_tap_strafes && mb.state == 4 {
+            return;
+        }
+    }
+    const MOVE_KEYS: u32 = IN_FORWARD | IN_BACK | IN_MOVELEFT | IN_MOVERIGHT; // 0x618
+    // mv+0x2c: keys newly pressed this tick
+    if c.pressed & MOVE_KEYS == 0 && cv.jump_grace_require_tap {
+        return;
+    }
+    let now = c.now;
+    // (now - pl+0x46e0 last controller input >= jump_grace_controller_disable_duration: keyboard only here, and the
+    // default -1 always passes, so the gate is left out)
+    let t0 = if cv.jump_grace_jump { c.p.last_jump_time } else { c.p.last_ground_time }; // pl+0x3670 / 0x366c
+    let el = now - t0;
+    let pmax = cv.jump_graceperiodmax;
+    if !(el < pmax && cv.jump_grace_min_tap_period < now - c.p.grace.last_tap && c.p.grace.taps < cv.jump_grace_max_tap_count) {
+        return;
+    }
+    let v = c.p.vel;
+    let vh = (v.x * v.x + v.y * v.y + 0.0).sqrt();
+    let vk = 1.0 / vh.max(EPS);
+    let (ux, uy) = (v.x * vk, v.y * vk);
+    if !(vh <= cv.jump_grace_cutoff_speed) {
+        return;
+    }
+    c.p.grace.last_tap = now;
+    // the push: held keys (mv+0x24) with require_tap, else the analog move (mv+0x30 / 0x34)
+    let (kf, ks) = if cv.jump_grace_require_tap {
+        let b = c.buttons;
+        let f = (if b & IN_FORWARD != 0 { 1.0 } else { 0.0 }) - (if b & IN_BACK != 0 { 1.0 } else { 0.0 });
+        let s = (if b & IN_MOVERIGHT != 0 { 1.0 } else { 0.0 }) - (if b & IN_MOVELEFT != 0 { 1.0 } else { 0.0 });
+        (f, s)
+    } else {
+        (c.fwd, c.side)
+    };
+    let (f, r) = (c.flat_f, c.flat_r); // mv+0x60 / 0x6c
+    let kx = kf * f.x + ks * r.x;
+    let kz = kf * f.z + ks * r.z;
+    let ky = kf * f.y + ks * r.y;
+    let kl = 1.0 / (ky * ky + kx * kx + kz * kz).sqrt().max(EPS); // a null input (A+D) stays 0
+    let mut wx = kl * kx;
+    let mut wy = kl * ky;
+    if cv.jump_grace_limit_to_90 {
+        let d = wy * uy + wx * ux + kl * kz * vk * 0.0;
+        if d < 0.0 {
+            // drop the part of the push that points against the velocity, then renormalise (rsqrtss + one
+            // Newton step in the binary; 1/sqrt here)
+            let nd = -d;
+            wx += ux * nd;
+            wy += uy * nd;
+            let wz = nd * vk * 0.0 + kl * kz;
+            let l2 = wx * wx + 1.1920929e-7 + wy * wy + wz * wz;
+            let k = 1.0 / l2.sqrt();
+            wy *= k;
+            wx *= k;
+        }
+    }
+    c.p.grace.mult *= 1.0 - grace_velocity_decay(&cv, vh);
+    let mut ramp = ((el - pmax) / (cv.jump_graceperiodmin - pmax)).max(0.0);
+    if 1.0 <= ramp {
+        ramp = 1.0;
+    }
+    let s = ramp * c.p.grace.mult * cv.jump_grace_strength;
+    let nx = (wx - ux) * s + ux;
+    let ny = (wy - uy) * s + uy;
+    let nl = (ny * ny + nx * nx).sqrt();
+    if !(0.01 < nl) {
+        return;
+    }
+    c.p.grace.taps += 1;
+    if cv.jump_grace_decay_start_tap_count <= c.p.grace.taps {
+        c.p.grace.mult *= cv.jump_grace_multi_tap_decay;
+    }
+    let inv = 1.0 / nl;
+    // 0x140b09c00(pl, 0) = pl+0x3278 speed scale x sprintspeed of stance 0
+    let cap = (c.p.speed_scale * c.s.stand.sprintspeed) * cv.jump_grace_max;
+    let mut dx = vh * nx * inv - v.x;
+    let mut dy = vh * ny * inv - v.y;
+    let d2 = dy * dy + dx * dx;
+    if cap * cap < d2 {
+        let q = cap / d2.sqrt();
+        dx *= q;
+        dy *= q;
+    }
+    c.p.vel = Vec3::new(v.x + dx, v.y + dy, v.z);
+    // 0x140a58ec0 -> 0x140a58560 (jump assist toward a ledge target): not ported, as in the S3 port
+}
+
 /// AirMove 0x140b9b740 (airmove.md).
 fn air_move(c: &mut Ctx, dt: f32) {
     let now = c.now;
@@ -623,56 +758,8 @@ fn air_move(c: &mut Ctx, dt: f32) {
     let ws = (1.0 * c.p.speed_scale) * mn;
     air_accelerate(c, dir, ws, c.s.air_acceleration, dt);
 
-    // step 7: jump keyboard grace (tap-strafe). R5Regenis tapstrafe.cpp masks the move-key presses here while a
-    // full mantle boost is in the air (until landing) and above 1100 u/s horizontal (the client's
-    // jump_grace_cutoff_speed).
-    let mut pressed = c.pressed;
-    {
-        let mb = &mut c.p.mantle_boost;
-        if mb.state == 4 && c.p.last_land_time > mb.applied_time {
-            mb.state = 0;
-        }
-        let vh2 = c.p.vel.x * c.p.vel.x + c.p.vel.y * c.p.vel.y;
-        if (c.cv.mantle_boost_enabled && c.cv.mantle_boost_disables_tap_strafes && mb.state == 4) || vh2 > c.cv.lurch_cutoff_speed * c.cv.lurch_cutoff_speed {
-            pressed &= !(IN_FORWARD | IN_BACK | IN_MOVELEFT | IN_MOVERIGHT);
-        }
-    }
-    if pressed & (IN_FORWARD | IN_BACK | IN_MOVELEFT | IN_MOVERIGHT) != 0 {
-        let el = now - c.p.last_jump_time;
-        let gmax = c.cv.jump_keyboardgraceperiodmax;
-        if gmax > el {
-            let b = c.buttons;
-            let kf = (if b & IN_FORWARD != 0 { 1.0 } else { 0.0 }) - (if b & IN_BACK != 0 { 1.0 } else { 0.0 });
-            let ks = (if b & IN_MOVERIGHT != 0 { 1.0 } else { 0.0 }) - (if b & IN_MOVELEFT != 0 { 1.0 } else { 0.0 });
-            let v = c.p.vel;
-            let k = c.flat_f * kf + c.flat_r * ks;
-            let kk = 1.0 / k.length().max(EPS);
-            let vh = (v.x * v.x + v.y * v.y).sqrt();
-            let vk = 1.0 / vh.max(EPS);
-            let (ux, uy) = (v.x * vk, v.y * vk);
-            let gmin = c.cv.jump_keyboardgraceperiodmin;
-            let r = ((el - gmax) / (gmin - gmax)).max(0.0).min(1.0) * c.cv.jump_keyboardgrace_strength;
-            let mut nx = ((kk * k.x - ux) * r) + ux;
-            let mut ny = ((kk * k.y - uy) * r) + uy;
-            let nl = (ny * ny + nx * nx).sqrt();
-            if nl > 0.01 {
-                let cc = vh / nl;
-                nx *= cc;
-                ny *= cc;
-            }
-            let cap = (c.p.speed_scale * c.s.stand.sprintspeed) * c.cv.jump_keyboardgrace_max;
-            let mut dx = nx - v.x;
-            let mut dy = ny - v.y;
-            let d2 = dy * dy + dx * dx;
-            if d2 > cap * cap {
-                let q = cap / d2.sqrt();
-                dx *= q;
-                dy *= q;
-            }
-            c.p.vel = Vec3::new(v.x + dx, v.y + dy, v.z);
-            // JumpAssist 0x140baca70: not ported
-        }
-    }
+    // step 7: jump grace (lurch / tap-strafe), S21 client
+    jump_grace(c);
 
     // step 9: trace end, contact plane
     let o = c.p.pos;

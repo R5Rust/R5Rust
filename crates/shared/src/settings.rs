@@ -4,7 +4,8 @@
 //! 72-tall legend: 20 of the 28 pilot_survival legends share every movement value below). `movecheck` re-reads
 //! the file (when the assets are present) and asserts these consts still match it.
 //! Cvar defaults: read from r5apex_ds.exe's static ConVar objects (default string at ConVar+0x50) for every cvar
-//! whose ConVar pointer the specs give (every value below was read that way).
+//! whose ConVar pointer the specs give (every value below was read that way), except the jump grace (lurch) block,
+//! which comes from the S21 client r5apex_dx12.exe (see docs/movement.md "Lurch").
 
 use glam::Vec3;
 
@@ -233,10 +234,25 @@ pub struct Cvars {
     pub skip_jump_height_fraction: f32,      // exe "1.0"
     pub skip_speed_retain: f32,              // exe "-1"
     pub skip_speed_reduce: f32,              // exe "100"
-    pub jump_keyboardgraceperiodmax: f32,    // exe "0.5"
-    pub jump_keyboardgraceperiodmin: f32,    // exe "0.2"
-    pub jump_keyboardgrace_strength: f32,    // exe "0.7"
-    pub jump_keyboardgrace_max: f32,         // exe "0.7"
+    // Jump grace (lurch / tap-strafe): the S21 client's cvars (r5apex_dx12.exe, default string read from each
+    // ConVar's registration function; read by AirMove_TapStrafe 0x140a48a30 through ConVar+0x40 -> +0x60/+0x64).
+    // They replace the 2019 server's jump_keyboardgrace* (periodmax 0.5, periodmin 0.2, strength 0.7, max 0.7).
+    pub jump_graceperiodmax: f32,            // dx12 "0.5"  (reg 0x14019fd60) window after the jump
+    pub jump_graceperiodmin: f32,            // dx12 "0.2"  (reg 0x14019fb90) full strength until here
+    pub jump_grace_strength: f32,            // dx12 "0.7"  (reg 0x14019ff30) blend toward the keys
+    pub jump_grace_max: f32,                 // dx12 "0.7"  (reg 0x1401a0100) x sprint speed: max change per lurch
+    pub jump_grace_cutoff_speed: f32,        // dx12 "1100" (reg 0x1401a0f80) no lurch above this h-speed
+    pub jump_grace_require_tap: bool,        // dx12 "1"    (reg 0x1401a02d0) only a newly pressed move key fires
+    pub jump_grace_jump: bool,               // dx12 "1"    (reg 0x1401a0db0) window from the jump (0: from last ground)
+    pub jump_grace_min_tap_period: f32,      // dx12 "0.0"  (reg 0x1401a04a0) min time between lurches
+    pub jump_grace_max_tap_count: i32,       // dx12 "1000" (reg 0x1401a0a10) lurches per jump
+    pub jump_grace_decay_start_tap_count: i32, // dx12 "1000" (reg 0x1401a0670) from this lurch on, strength x decay
+    pub jump_grace_multi_tap_decay: f32,     // dx12 "1.0"  (reg 0x1401a0840)
+    pub jump_grace_multi_tap_decay_velocity_based_max_decay: f32, // dx12 "0.0" (reg 0x1401a1150)
+    pub jump_grace_multi_tap_decay_velocity_based_max_speed: f32, // dx12 "900" (reg 0x1401a1320)
+    pub jump_grace_multi_tap_decay_velocity_based_easing_type: i32, // dx12 "1" (reg 0x1401a14f0) 0 cubic 1 sine 2 circ 3 linear 4 step
+    pub jump_grace_limit_to_90: bool,        // dx12 "0"    (reg 0x1401a0be0) drop the key push's backward part
+    pub jump_grace_controller_disable_duration: f32, // dx12 "-1.0" (reg 0x1401a16c0) no controller tracking here
     pub slide_max_angle_dot: f32,            // exe "0.6"
     pub slide_while_in_air: bool,            // exe "0"
     pub slide_auto_stand: bool,              // exe "0"
@@ -256,14 +272,13 @@ pub struct Cvars {
     pub automantle_rest_frac: f32,           // exe "0.4"
     pub automantle_rest_frac_below: f32,     // exe "0.3"
     pub automantle_backoff_anim_maxfrac: f32,// exe "0.7"
-    // Mantle boost and tap-strafe gates: R5Regenis engine/s21-r5sdk mantle_boost.cpp / tapstrafe.cpp defaults
-    // (that bridge rebuilds the S21 client feature on the dedicated server; not in r5apex_ds.exe itself).
+    // Mantle boost and its tap-strafe gate: R5Flowstate SDK (s21-r5sdk) mantle_boost.cpp defaults. The client SDK
+    // hooks AirMove_TapStrafe and skips it while a full boost is in the air (not in r5apex_dx12.exe itself).
     pub mantle_boost_enabled: bool,              // "1" (playlist var mantle_boost_enabled, default true)
     pub mantle_boost_disables_tap_strafes: bool, // "1"
     pub mantle_boost_min_valid_traversal_frac: f32, // "0.5"
     pub mantle_boost_sprint_mult: f32,           // "1.3" (bridge_mantle_boost_sprint_mult)
     pub mantle_boost_jump_height: f32,           // "90" (bridge_mantle_boost_jump_height)
-    pub lurch_cutoff_speed: f32,                 // "1100" (bridge_lurch_cutoff_speed = client jump_grace_cutoff_speed)
     // Wall climb cvars (ConVar pointer -> name from the registration code, default from ConVar+0x50)
     pub wallrun_enable: bool,                    // 0x1422e9e28 exe "1"
     pub wallrun_retry_interval: f32,             // 0x14236f348 exe "0.07"
@@ -298,10 +313,22 @@ pub const CVARS: Cvars = Cvars {
     skip_jump_height_fraction: 1.0,
     skip_speed_retain: -1.0,
     skip_speed_reduce: 100.0,
-    jump_keyboardgraceperiodmax: 0.5,
-    jump_keyboardgraceperiodmin: 0.2,
-    jump_keyboardgrace_strength: 0.7,
-    jump_keyboardgrace_max: 0.7,
+    jump_graceperiodmax: 0.5,
+    jump_graceperiodmin: 0.2,
+    jump_grace_strength: 0.7,
+    jump_grace_max: 0.7,
+    jump_grace_cutoff_speed: 1100.0,
+    jump_grace_require_tap: true,
+    jump_grace_jump: true,
+    jump_grace_min_tap_period: 0.0,
+    jump_grace_max_tap_count: 1000,
+    jump_grace_decay_start_tap_count: 1000,
+    jump_grace_multi_tap_decay: 1.0,
+    jump_grace_multi_tap_decay_velocity_based_max_decay: 0.0,
+    jump_grace_multi_tap_decay_velocity_based_max_speed: 900.0,
+    jump_grace_multi_tap_decay_velocity_based_easing_type: 1,
+    jump_grace_limit_to_90: false,
+    jump_grace_controller_disable_duration: -1.0,
     slide_max_angle_dot: 0.6,
     slide_while_in_air: false,
     slide_auto_stand: false,
@@ -326,7 +353,6 @@ pub const CVARS: Cvars = Cvars {
     mantle_boost_min_valid_traversal_frac: 0.5,
     mantle_boost_sprint_mult: 1.3,
     mantle_boost_jump_height: 90.0,
-    lurch_cutoff_speed: 1100.0,
     wallrun_enable: true,
     wallrun_retry_interval: 0.07,
     wallrun_same_wall_dot: 0.9,

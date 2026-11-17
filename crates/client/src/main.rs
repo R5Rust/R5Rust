@@ -132,6 +132,8 @@ fn input_from(keys: &HashSet<String>, jump_pressed: bool, yaw: f32, pitch: f32) 
     Input {
         forward: ax("w", "s"),
         right: ax("d", "a"),
+        null_fwd: k("w") && k("s"),
+        null_side: k("d") && k("a"),
         jump: k("space"),
         jump_pressed,
         sprint: k("shift"),
@@ -391,6 +393,8 @@ fn bind_input(st: &InputState, binds: &Binds, auto_sprint: bool, yaw: f32, pitch
     Input {
         forward: ax(Action::Forward, Action::Back),
         right: ax(Action::Right, Action::Left),
+        null_fwd: d(Action::Forward) && d(Action::Back),
+        null_side: d(Action::Right) && d(Action::Left),
         jump: d(Action::Jump),
         jump_pressed: st.pressed(binds, Action::Jump),
         sprint: d(Action::Sprint) || auto_sprint,

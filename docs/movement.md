@@ -16,12 +16,12 @@ UPRIGHT is the engine's double-precision test (`sim::upright`).
 cargo run --release -p shared --example movecheck
 ```
 
-It runs 107 checks on a synthetic test world: a floor, a 22u step, a 23u step, a 60u ledge, a 100u cliff, a 300u
+It runs 130 checks on a synthetic test world: a floor, a 22u step, a 23u step, a 60u ledge, a 100u cliff, a 300u
 wall and a 150u wall.
 If the assets are present it also runs them on the real Firing Range, and it re-reads the legend's settings file
 to confirm the consts below still match it. It exits with code 1 if any check fails.
 
-Last run: 107/107 passed. A tick on the real 5.4M-triangle map costs **~50 µs** on average and ~0.3 ms at worst
+Last run: 130/130 passed. A tick on the real 5.4M-triangle map costs **~50 µs** on average and ~0.3 ms at worst
 (sprint, jump, slide and mantle mixed, at 60 Hz).
 
 | Check | Got |
@@ -41,6 +41,9 @@ Last run: 107/107 passed. A tick on the real 5.4M-triangle map costs **~50 µs**
 | 22u step / 23u step | walks up / blocked |
 | mantle onto the 60u ledge | 0.53 s; ends standing on top |
 | tap-strafe 0.1 s after a jump | turns the velocity 45° (change capped at 0.7 × 260 per press) |
+| lurch D at 0.35 s / 0.45 s after the jump | bends 27.9° / 7.5°, speed kept (strength 0.7 fading to 0 at 0.5 s) |
+| lurch S at 0.1 s | speed drops by the cap (182), direction kept |
+| null input (A held, D pressed) / wheel spam 30/s while turning | no change (still a tap) / 14 lurches, no decay at default cvars |
 
 ### Mantle exits
 
@@ -61,7 +64,7 @@ Last run: 107/107 passed. A tick on the real 5.4M-triangle map costs **~50 µs**
 | File | Functions | Spec |
 |---|---|---|
 | `sim/mod.rs` | PlayerMove 0x140ba8fc0 (the per-tick order), SetupMove's buttons and input vector, UpdateSprint 0x140bedf60, CanSprint 0x140bed930, AllowSprint 0x140bed5a0, GetMaxSpeed 0x140b890b0 | playermove.md §3, disassembly |
-| `sim/walk.rs` | FullWalkMove 0x140b9ead0, ApplyHalfGravity 0x140b8c2a0, CheckJumpButton 0x140b8d490, WalkMove 0x140b9cdb0 (ground path), Friction 0x140b9c7c0, Accelerate 0x140b9c610, GetAccelerate 0x140b8c5d0, AirMove 0x140b9b740, AirAccelerate 0x140b9b510, CheckVelocity 0x140ba3b60 | fullwalkmove.md, walkmove.md, airmove.md, R5Regenis `native/r5r_engine/src/movement.cpp` |
+| `sim/walk.rs` | FullWalkMove 0x140b9ead0, ApplyHalfGravity 0x140b8c2a0, CheckJumpButton 0x140b8d490, WalkMove 0x140b9cdb0 (ground path), Friction 0x140b9c7c0, Accelerate 0x140b9c610, GetAccelerate 0x140b8c5d0, AirMove 0x140b9b740, AirAccelerate 0x140b9b510, CheckVelocity 0x140ba3b60; the lurch is the **S21 client's** AirMove_TapStrafe 0x140a48a30 (r5apex_dx12.exe, see "Lurch") | fullwalkmove.md, walkmove.md, airmove.md, R5Regenis `native/r5r_engine/src/movement.cpp`, decompiled for this port |
 | `sim/ground.rs` | CategorizePosition 0x140ba4f30 (ledge re-probe included), SetGroundEntity 0x140ba46d0 (landing energy, landing slowdown, slide-on-land), StayOnGround / GroundSnapTrace, StepSmooth / DecayStepSmooth, CheckStuck, LandingSpeedScale 0x140bf5200 | playermove.md §4-8 |
 | `sim/duck.rs` | Duck 0x140ba7500 (4 states, integer-ms timer, smoothstep eye height), CanUnduck, FinishUnDuck, SetDuckViewOffset, StartSliding 0x140ba7ed0, StopSliding | playermove.md §7, slide.md |
 | `sim/step.rs` | StepSlide 0x140b9ad70 (all 4 variants), TryPlayerMoveStep 0x140b9a970, StepMove 0x140bb0610 | stepslide.md |
@@ -201,8 +204,7 @@ Every cvar default below was read from the exe's static ConVar objects (the defa
 | sv_gravity | 750 | sv_maxvelocity | 34000 |
 | AirAccelerate's air-control cvar (0x1423705d8; name not resolved) | 2.0 | sv_optimizedmovement | 1 |
 | jump_graceperiod | 0.2 | skip_time / _jump_height_speed / _fraction | 1.0 / 450 / 1.0 |
-| skip_speed_retain / skip_speed_reduce | -1 / 100 | jump_keyboardgraceperiodmax / min | 0.5 / 0.2 |
-| jump_keyboardgrace_strength / _max | 0.7 / 0.7 | slide_max_angle_dot | 0.6 |
+| skip_speed_retain / skip_speed_reduce | -1 / 100 | slide_max_angle_dot | 0.6 |
 | slide_whileInAir / slide_auto_stand | 0 / 0 | slide_step_velocity_reduction | 10 |
 | traversal_enable / traversal_cooldown | 1 / 0.5 | automantle_enable / _cooldown | 1 / .25 |
 | automantle_searchdist / _mindist | 5 / 18 | automantle_height_level / above / below | 10 / 30 / -10 |
@@ -217,8 +219,10 @@ Every cvar default below was read from the exe's static ConVar objects (the defa
 The wall-climb cvar names were resolved from their registration code (`lea rax, "name"; mov [obj+0x18], rax`): the
 ConVar objects only receive their name pointer at runtime, so obj+0x18 is empty in the file.
 
-The mantle boost and the tap-strafe gate come from R5Regenis's bridge (`engine/s21-r5sdk/src/game/server/
-mantle_boost.cpp`, `tapstrafe.cpp`), not from the exe:
+The lurch cvars (`jump_grace_*`) are the S21 client's; their table is in "Lurch" below.
+
+The mantle boost and its tap-strafe gate come from the R5Flowstate SDK (`s21-r5sdk/src/game/{client,server}/
+mantle_boost.cpp`), not from either exe:
 
 | Cvar | Default |
 |---|---|
@@ -227,11 +231,126 @@ mantle_boost.cpp`, `tapstrafe.cpp`), not from the exe:
 | mantle_boost_min_valid_traversal_frac | 0.5 |
 | bridge_mantle_boost_sprint_mult | 1.3 |
 | bridge_mantle_boost_jump_height | 90 |
-| bridge_lurch_cutoff_speed | 1100 |
 | mantle_boost_input_setting | 1 (jump) |
 
 All of these live in `crates/shared/src/settings.rs` (`STOCK`, `CVARS`). Each `Player` carries a copy
 (`settings`, `cvars`, `speed_scale`), so the server or a test can change them per player.
+
+## Lurch (jump grace / tap-strafe): the S21 client's
+
+The lurch is the one piece of movement taken from the S21 client `r5apex_dx12.exe` instead of the 2019-era
+`r5apex_ds.exe`, because that is what an R5Flowstate player feels (the client predicts it every frame). It was
+decompiled for this port (Ghidra headless on `reverse-engineering-projects\ghidra\R5Apex.gpr`).
+
+**Functions ported**
+
+| Address (dx12) | What | Where |
+|---|---|---|
+| 0x140a48a30 | AirMove_TapStrafe: the lurch itself | `walk.rs` `jump_grace` |
+| 0x140a48810 | velocity-based multi-tap decay (5 easings; `fminf` 0x1412a82b8) | `walk.rs` `grace_velocity_decay` |
+| 0x140a48f90 | the S21 AirMove: calls the lurch right after AirAccelerate 0x140a485e0, as the 2019 one did | (order unchanged) |
+| 0x140b09c00 | cap base = pl+0x3278 speed scale × `sprintspeed` of stance 0 (settings field `sprintspeed`, lookup 0x141af7d98) | `jump_grace` |
+| 0x140a3b550 (tail) | the jump: pl+0x3670 = now, strength multiplier 1, tap count 0 | `check_jump_button` |
+| 0x140b12970 | post-think: on the ground pl+0x366c = now, multiplier 1, tap count 0 | `player_move` post-think |
+
+How each cvar was found: their registration functions (listed in the table) write the ConVar object; the only
+other reference to each object is ConVar+0x40 (the parent pointer) read by 0x140a48a30 or 0x140a48810, which then
+reads the float at +0x60 / the int at +0x64. The defaults are the strings each registration function points at.
+
+**The algorithm** (per air tick, after AirAccelerate):
+
+1. R5Flowstate's client SDK hook skips the whole function while a full mantle boost is in the air (state 4) until
+   landing. That gate is not in the S21 binary; it is in the reference game, so it stays.
+2. With `jump_grace_require_tap` a move key must be newly pressed this tick (mv+0x2c & 0x618). Without it the
+   analog stick (mv+0x30/0x34) drives it every tick.
+3. Within `jump_graceperiodmax` of the jump (`jump_grace_jump 1`; 0 = of leaving the ground), more than
+   `jump_grace_min_tap_period` after the last attempt, and under `jump_grace_max_tap_count` lurches.
+4. Horizontal speed at or under `jump_grace_cutoff_speed` (1100), else nothing (not even the attempt time).
+5. The push = held keys (W−S, D−A) on the flat camera basis, normalised. Opposite keys cancel (a "null input":
+   the push is 0). With `jump_grace_limit_to_90` its component against the velocity is removed first.
+6. The multiplier shrinks by the velocity decay; `r = ramp × multiplier × jump_grace_strength`, where the ramp is
+   1 until `jump_graceperiodmin` and falls linearly to 0 at `jump_graceperiodmax`.
+7. `n = lerp(velocity direction, push, r)`. If `|n| <= 0.01` nothing happens. Otherwise it counts a tap
+   (from `jump_grace_decay_start_tap_count` on, the multiplier × `jump_grace_multi_tap_decay`), and the velocity
+   moves to `|v| × n / |n|`, with the change capped at `jump_grace_max × sprint speed` (182 at scale 1, 209 at
+   1.15). Vertical velocity is untouched.
+
+**What changed from the 2019 keyboard grace (the previous port, `jump_keyboardgrace*`).** At the default cvars the
+numbers are the same for every ordinary lurch: same window (0.5 / 0.2), strength 0.7, cap 0.7 × sprint speed, and
+the 1100 cutoff the R5Regenis bridge had already added. The differences:
+
+- the cutoff is native (and the attempt time is only recorded under it);
+- tap count, min tap period, multi-tap decay and velocity decay exist (all off at their defaults);
+- when the blended direction is shorter than 0.01 the S21 does nothing; the 2019 code still applied the
+  unscaled blend, which pulled the velocity toward zero (a near-exact back press at r = 0.5);
+- `jump_grace_limit_to_90` (default 0) can drop the backward part of the push;
+- `require_tap 0` would lurch every tick from the analog stick (controllers);
+- the window can run from leaving the ground (`jump_grace_jump 0`).
+
+Nothing else in the S21 AirMove changes a number for a stock pilot: AirAccelerate 0x140a485e0 is the same
+(including the air-control cvar 2.0 in its turning branch), the air drag uses airDrag/airFriction (0 for pilots;
+jetpackPostEffectDrag during a jetpack), and the extra blocks (pl+0x4960 launch fall limiter, grapple, jetpack
+pitch, slip restriction) are not stock-pilot paths.
+
+**Cvars** (`settings.rs`, defaults from r5apex_dx12.exe):
+
+| Cvar | Default | Registration |
+|---|---|---|
+| jump_graceperiodmax | 0.5 | 0x14019fd60 |
+| jump_graceperiodmin | 0.2 | 0x14019fb90 |
+| jump_grace_strength | 0.7 | 0x14019ff30 |
+| jump_grace_max | 0.7 | 0x1401a0100 |
+| jump_grace_cutoff_speed | 1100 | 0x1401a0f80 |
+| jump_grace_require_tap | 1 | 0x1401a02d0 |
+| jump_grace_jump | 1 | 0x1401a0db0 |
+| jump_grace_min_tap_period | 0.0 | 0x1401a04a0 |
+| jump_grace_max_tap_count | 1000 | 0x1401a0a10 |
+| jump_grace_decay_start_tap_count | 1000 | 0x1401a0670 |
+| jump_grace_multi_tap_decay | 1.0 | 0x1401a0840 |
+| jump_grace_multi_tap_decay_velocity_based_max_decay | 0.0 | 0x1401a1150 |
+| jump_grace_multi_tap_decay_velocity_based_max_speed | 900 | 0x1401a1320 |
+| jump_grace_multi_tap_decay_velocity_based_easing_type | 1 (0 cubic, 1 sine, 2 circ, 3 linear, 4 step) | 0x1401a14f0 |
+| jump_grace_limit_to_90 | 0 | 0x1401a0be0 |
+| jump_grace_controller_disable_duration | -1.0 | 0x1401a16c0 |
+
+Per-player state: `Player::grace` (`JumpGrace`: last attempt time pl+0x3674, multiplier pl+0x3678, tap count
+pl+0x367c). `Input::null_side` / `null_fwd` carry "both keys of an axis held", so a null input sets both buttons
+like Apex does (the client sets them from the binds).
+
+**Approximated or left out:** the controller gate (pl+0x46e0, last controller input) is dropped since there is
+no controller path and the default -1 always passes; `limit_to_90`'s rsqrtss + Newton step is a plain 1/sqrt; the
+sine easing uses `f32::sin` instead of the binary's polynomial; the jump assist after the lurch (0x140a58ec0 ->
+0x140a58560) is not ported, as before. These are live client cvars: R5Flowstate could run other values than the
+static defaults. `tools/r5f-probe/plan.py` now dumps all of them at the start of a movement run.
+
+**Against R5Flowstate (`probecmp`, horizontal speed at t 1.75, ours / real):**
+
+| Run | Before (2019 grace) | After (S21) |
+|---|---|---|
+| lurch_d_150 / lurch_a_150 | 256 / 264, 256 / 263 | 256 / 264, 256 / 263 |
+| lurch_s_150 | 48 / 299 | 299 / 299 |
+| lurch_sd_150 | 174 / 263 | 256 / 263 |
+| forward_ras_ref_0 | 86..192 / 316 | no valid real data |
+
+The S, SD and RAS "real" numbers were probe bugs, not game behaviour:
+
+- **The S21 client has no `+back` command**: it is `+backward` (the exe holds `+backward`/`-backward` and no
+  `+back`). Every `+back` in the plans pressed nothing, so lurch_s_150 is really "release W in the air" and
+  lurch_sd_150 is really a D lurch. `rp_main.gnut` now sends `+backward` and prints `[RPROBE] backward-fix`;
+  `probecmp` replays `+back` as a no-op for logs without that marker, which is where the "after" numbers come
+  from. A real S press does cut speed by the cap, in the game and here.
+- **forward_ras_ref_0 never ran**: the lurch-trainer plan's events are bare `JUMP` / `TAP` with the notch count
+  in a separate field, and the probe script died at the first one ("Index 2 is beyond array size") at 1.5 s. The
+  "316 held" was `probecmp` repeating the last sample. `plan.py` now keeps the count (`JUMP:8`), the probe takes a
+  bare `JUMP` as one press, and `probecmp` flags bare events. (The lurch trainer's own `r5test` plans use `+back`
+  too.)
+
+Still open: the real D/A lurch at 150 ms changes the velocity by ~236 u/s (|Δv| from the logged samples), against
+the formula's cap of 209 (0.7 × 260 × 1.15), so ours ends at 256 instead of 264. The direction of the change fits
+r ≈ 0.68-0.7. Either the live `jump_grace_max` is higher than the static 0.7 (≈0.79 would fit) or the speed
+scale the cap uses is not the holstered 1.15. Re-run the probe (it now dumps the live `jump_grace_*` values and has
+the fixed `+backward`, `lurch_null_150` and `tap_spam_d` runs): `python tools\r5f-probe\plan.py` (this rewrites
+`rp_plan.gnut` for movement runs), then `tools\r5f-probe\run.ps1`.
 
 ## Collision
 
@@ -272,10 +391,7 @@ and 9 edge cross products.
   the last 0.10-0.13 s of a mantle". With no animation, the window here is the last **0.115 s** of the climb at the
   current rate, with progress above 0.5. `Player::mantle_boost.sweet_spot_frac` exposes where the window opens, for
   a future hint UI.
-- **Tap-strafe (keyboard grace).** The lead's brief said the S21 dedi has no lurch code. R5Regenis's `tapstrafe.cpp`
-  says otherwise: its header reads "suppression on dedi's native inline lurch". It only masks the lurch presses
-  above 1100 u/s and while a full mantle boost is in the air. So AirMove's spec'd keyboard grace is ported as it
-  is, with those two gates added.
+- **Lurch.** Ported from the S21 client, not the ds binary; see "Lurch" below for what is approximated.
 - **The mantle boost makes the native jump-off unreachable.** With `mantle_boost_enabled` on (the default, as in
   S21), every jump press during a mantle latches the boost FSM. TraversalMove never sees that press, so the
   native jump-off, the hop-back and the native superglide cannot happen. They are ported and checked with the

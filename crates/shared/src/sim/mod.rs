@@ -67,6 +67,23 @@ pub struct Wall {
     pub ref_height: f32,
 }
 
+/// Jump grace (lurch) state, S21 client pl+0x3674..0x367c. The post-think and the jump reset `mult` and `taps`.
+#[derive(Clone, Copy, Debug)]
+pub struct JumpGrace {
+    /// pl+0x3674: last time a lurch was attempted (under the cutoff speed), for jump_grace_min_tap_period
+    pub last_tap: f32,
+    /// pl+0x3678: strength multiplier (1 on the ground / at the jump; multi-tap and velocity decay shrink it)
+    pub mult: f32,
+    /// pl+0x367c: lurches since the jump (only the ones that moved the velocity)
+    pub taps: i32,
+}
+
+impl Default for JumpGrace {
+    fn default() -> Self {
+        Self { last_tap: -100.0, mult: 1.0, taps: 0 }
+    }
+}
+
 /// One tick of player input.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Input {
@@ -81,6 +98,11 @@ pub struct Input {
     pub jump_pressed: bool,
     /// sprint held (Apex: a press requests sprint for 3 s and it latches while you keep moving forward)
     pub sprint: bool,
+    /// A and D both held (a "null input"): `right` reads 0, but Apex still sets both buttons, so pressing the
+    /// second key fires a lurch with no sideways push (and A+D+W lurches straight along W)
+    pub null_side: bool,
+    /// W and S both held, same idea for `forward`
+    pub null_fwd: bool,
     /// crouch held (crouch / slide)
     pub crouch: bool,
     /// fly mode: descend
@@ -167,6 +189,7 @@ pub struct Player {
     pub sprinting: bool,
     pub traversal: Traversal,
     pub mantle_boost: MantleBoost,
+    pub grace: JumpGrace,
     /// pl+0x662c: the surface up-normal. World up, or the wall's normal while on a wall (climbing).
     pub surface_normal: Vec3,
     pub wall: Wall,
@@ -233,6 +256,7 @@ impl Player {
             sprinting: false,
             traversal: Traversal::default(),
             mantle_boost: MantleBoost::default(),
+            grace: JumpGrace::default(),
             surface_normal: UP,
             wall: Wall { ref_height: pos.z, ..Wall::default() },
             time: 0.0,
@@ -407,6 +431,12 @@ pub fn simulate(p: &mut Player, input: &Input, dt: f32, col: &Collision) {
     if input.right < 0.0 {
         b |= IN_MOVELEFT;
     }
+    if input.null_fwd {
+        b |= IN_FORWARD | IN_BACK;
+    }
+    if input.null_side {
+        b |= IN_MOVELEFT | IN_MOVERIGHT;
+    }
     if input.jump || input.jump_pressed {
         b |= IN_JUMP;
     }
@@ -520,6 +550,9 @@ fn player_move(c: &mut Ctx) {
     if c.gnd() {
         c.p.last_ground_time = c.now;
         c.p.last_ground_normal = c.p.surface_normal;
+        // S21 post-think 0x140b12970: on the ground the lurch strength and tap count reset (pl+0x3678 = 1, 0x367c = 0)
+        c.p.grace.mult = 1.0;
+        c.p.grace.taps = 0;
     }
     // post-think 0x140bfca13: the verticalGainCutoff reference height follows the feet down, and snaps to them
     // on walkable, upright ground (pl+0x67c0 launch-pad latch: no launch pads here)

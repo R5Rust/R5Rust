@@ -291,7 +291,8 @@ fn main() {
     }
     let gain = hspeed(&p) - v0;
     c.range("air strafe (A + turning 120 deg/s): speed gain in 0.67 s", gain, 5.0, 120.0);
-    // tap-strafe: a new key press in the 0.5 s keyboard grace rotates the velocity, keeping speed
+    // tap-strafe: a new key press in the 0.5 s jump grace rotates the velocity, keeping speed (S21 jump_grace_*;
+    // the same numbers as the 2019 keyboard grace at the default cvars)
     let mut p = settle(&col, start);
     run(&mut p, &col, 240, Input { forward: 1.0, sprint: true, ..Default::default() });
     sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, &col);
@@ -308,7 +309,7 @@ fn main() {
     let before = p.vel;
     sim::simulate(&mut p, &inp(0.0, 1.0), TICK, &col);
     let ang = before.truncate().angle_to(p.vel.truncate()).to_degrees().abs();
-    c.range("no keyboard grace 0.6 s after the jump (deg, air accel only)", ang, 0.0, 3.0);
+    c.range("no jump grace 0.6 s after the jump (deg, air accel only)", ang, 0.0, 3.0);
 
     // ------------------------------------------------------------ slide
     let mut p = settle(&col, start);
@@ -389,6 +390,9 @@ fn main() {
     run(&mut p, &col, 60, inp(1.0, 0.0));
     c.truth("walks down off the 22u step (StayOnGround)", p.on_ground && p.pos.z < 0.1 && p.pos.x > 420.0, format!("({:.0}, z {:.2})", p.pos.x, p.pos.z));
 
+    // ------------------------------------------------------------ S21 lurch (jump grace) details
+    lurch_checks(&mut c, &col, start);
+
     // ------------------------------------------------------------ mantle (native TraversalMove exits)
     mantle_checks(&mut c, &col);
 
@@ -402,6 +406,129 @@ fn main() {
     if c.fails > 0 {
         std::process::exit(1);
     }
+}
+
+/// Sprint along +X (speed scale 1: 260), jump, then `ticks` airborne ticks of `held`. The next simulate is
+/// (ticks + 1) / 60 s after the jump.
+fn airborne(col: &Collision, start: Vec3, ticks: usize, held: Input) -> Player {
+    let mut p = settle(col, start);
+    run(&mut p, col, 240, Input { forward: 1.0, sprint: true, ..Default::default() });
+    sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, col);
+    run(&mut p, col, ticks, held);
+    p
+}
+
+/// One tick of `i` on `p`, and the same tick on a copy with the jump grace switched off (= the velocity the
+/// lurch starts from: AirAccelerate has already run). Returns (without lurch, with lurch).
+fn lurch_tick(p: &mut Player, col: &Collision, i: Input) -> (Vec3, Vec3) {
+    let mut q = *p;
+    q.cvars.jump_graceperiodmax = 0.0;
+    sim::simulate(&mut q, &i, TICK, col);
+    sim::simulate(p, &i, TICK, col);
+    (q.vel, p.vel)
+}
+
+fn deg(a: Vec3, b: Vec3) -> f32 {
+    a.truncate().angle_to(b.truncate()).to_degrees().abs()
+}
+
+/// S21 AirMove_TapStrafe 0x140a48a30 at its default cvars (strength 0.7, full until 0.2 s, fades to 0 at 0.5 s,
+/// change capped at 0.7 x sprint speed, cutoff 1100), plus back presses, null inputs and multi-tap decay.
+fn lurch_checks(c: &mut Checks, col: &Collision, start: Vec3) {
+    let cap = 0.7 * 260.0;
+    // strength vs time after the jump: a D press bends the velocity by atan(r / (1 - r)), r = 0.7 x ramp,
+    // while the change stays under the cap
+    for (ticks, label) in [(20usize, "0.35"), (26, "0.45")] {
+        let el = (ticks + 1) as f32 * TICK;
+        let mut p = airborne(col, start, ticks, Input::default());
+        let (v1, v2) = lurch_tick(&mut p, col, inp(0.0, 1.0));
+        // the push is +R, the velocity is v1 (not quite +X after AirAccelerate), so measure the bend from v1
+        let u = v1.truncate().normalize();
+        let w = glam::Vec2::new(0.0, -1.0);
+        let r = ((el - 0.5) / (0.2 - 0.5)).clamp(0.0, 1.0) * 0.7;
+        let want = u.angle_to(u + (w - u) * r).to_degrees().abs();
+        c.near(&format!("lurch D at {label} s: bend toward D, r = 0.7 x ramp = {r:.3} (deg)"), deg(v1, v2), want, 0.05);
+        c.near(&format!("lurch D at {label} s: speed kept (change under the cap)"), v2.truncate().length(), v1.truncate().length(), 0.05);
+    }
+    let mut p = airborne(col, start, 5, Input::default());
+    let (v1, v2) = lurch_tick(&mut p, col, inp(0.0, 1.0));
+    c.near("lurch D at 0.1 s: full strength, change = cap 0.7 x 260", (v2 - v1).truncate().length(), cap, 0.05);
+    c.near("lurch D at 0.1 s: one tap counted", p.grace.taps as f32, 1.0, 0.0);
+    let mut p = airborne(col, start, 30, Input::default());
+    let (v1, v2) = lurch_tick(&mut p, col, inp(0.0, 1.0));
+    c.near("lurch D at 0.517 s: window (0.5 s) over, no change", (v2 - v1).length(), 0.0, 1e-4);
+    // a held key never re-fires
+    let mut p = airborne(col, start, 5, Input::default());
+    sim::simulate(&mut p, &inp(0.0, 1.0), TICK, col);
+    let (v1, v2) = lurch_tick(&mut p, col, inp(0.0, 1.0));
+    c.near("held D: no second lurch on the next tick", (v2 - v1).length(), 0.0, 1e-4);
+
+    // back press (S): the push points against the velocity, so the change is the full cap straight backward:
+    // speed drops by 182, direction kept (jump_grace_limit_to_90 = 0, the S21 default)
+    let mut p = airborne(col, start, 5, Input::default());
+    let (v1, v2) = lurch_tick(&mut p, col, inp(-1.0, 0.0));
+    c.near("lurch S at 0.1 s: speed loss = the cap (182)", v1.truncate().length() - v2.truncate().length(), cap, 0.05);
+    c.near("lurch S: direction kept (deg)", deg(v1, v2), 0.0, 0.01);
+    let mut p = airborne(col, start, 5, Input::default());
+    p.cvars.jump_grace_limit_to_90 = true;
+    let (v1, v2) = lurch_tick(&mut p, col, inp(-1.0, 0.0));
+    c.near("lurch S with jump_grace_limit_to_90 1: no change", (v2 - v1).length(), 0.0, 0.01);
+    let mut a = airborne(col, start, 5, Input::default());
+    a.cvars.jump_grace_limit_to_90 = true;
+    let mut b = a;
+    let (_, va) = lurch_tick(&mut a, col, inp(-1.0, 1.0));
+    let (_, vb) = lurch_tick(&mut b, col, inp(0.0, 1.0));
+    c.near("limit_to_90 1: S+D bends like D (deg)", deg(va, vb), 0.0, 1.5);
+
+    // null inputs: holding A then pressing D (A+D cancel): no push, velocity untouched, but it is a tap;
+    // A+D held + W pressed = a W lurch
+    let mut p = airborne(col, start, 4, inp(0.0, -1.0));
+    let taps = p.grace.taps; // the A press was a lurch of its own
+    let (v1, v2) = lurch_tick(&mut p, col, Input { null_side: true, ..Default::default() });
+    c.near("null input (A held, D pressed): velocity unchanged", (v2 - v1).length(), 0.0, 1e-3);
+    c.near("null input: still counts as a tap", (p.grace.taps - taps) as f32, 1.0, 0.0);
+    let mut w = airborne(col, start, 4, Input { yaw: 90.0, null_side: true, ..Default::default() });
+    let mut f = airborne(col, start, 4, Input { yaw: 90.0, ..Default::default() });
+    let (_, vw) = lurch_tick(&mut w, col, Input { forward: 1.0, yaw: 90.0, null_side: true, ..Default::default() });
+    let (_, vf) = lurch_tick(&mut f, col, Input { forward: 1.0, yaw: 90.0, ..Default::default() });
+    c.near("null input: A+D held + W pressed = a plain W lurch", (vw - vf).length(), 0.0, 1e-3);
+    c.range("  (that W lurch, camera +Y, bends the +X velocity, deg)", deg(Vec3::X, vw), 30.0, 90.0);
+
+    // wheel spam: 30 forward presses/s (every other tick) while turning 4 deg/tick. Default cvars have no decay
+    // (multi_tap_decay 1, decay start 1000, velocity decay 0): every press in the 0.5 s window lurches at mult 1.
+    let spam = |p: &mut Player| {
+        let mut yaw = 0.0f32;
+        for k in 0..30 {
+            yaw += 4.0;
+            let i = Input { forward: if k % 2 == 0 { 1.0 } else { 0.0 }, yaw, ..Default::default() };
+            sim::simulate(p, &i, TICK, col);
+        }
+    };
+    let mut p = airborne(col, start, 0, Input::default());
+    spam(&mut p);
+    // presses on ticks 2, 4 .. 28 after the jump (tick 0's notch is W still held from the jump tick; tick 30 is
+    // at 0.5 s, past the window)
+    c.near("wheel spam 30/s for 0.5 s while turning: 14 lurches", p.grace.taps as f32, 14.0, 0.0);
+    c.near("wheel spam: default cvars never decay the strength", p.grace.mult, 1.0, 0.0);
+    c.range("wheel spam: velocity follows the camera turn (deg of 116)", deg(Vec3::X, p.vel), 60.0, 116.0);
+    let mut q = airborne(col, start, 0, Input::default());
+    q.cvars.jump_grace_multi_tap_decay = 0.5;
+    q.cvars.jump_grace_decay_start_tap_count = 2;
+    spam(&mut q);
+    c.near("multi_tap_decay 0.5 from tap 2: mult 0.5^13 after 14", q.grace.mult, 0.5f32.powi(13), 1e-7);
+    c.truth("decayed spam turns less than full-strength spam", deg(Vec3::X, q.vel) < deg(Vec3::X, p.vel) - 10.0,
+        format!("{:.1} vs {:.1} deg", deg(Vec3::X, q.vel), deg(Vec3::X, p.vel)));
+    // velocity-based decay (easing 3 = linear): one lurch at speed v eats max_decay x v / max_speed of the mult
+    let mut p = airborne(col, start, 5, Input::default());
+    p.cvars.jump_grace_multi_tap_decay_velocity_based_max_decay = 0.5;
+    p.cvars.jump_grace_multi_tap_decay_velocity_based_easing_type = 3;
+    let (v1, _) = lurch_tick(&mut p, col, inp(0.0, 1.0));
+    c.near("velocity decay (linear, 0.5 at 900): mult = 1 - 0.5 v/900", p.grace.mult, 1.0 - 0.5 * v1.truncate().length() / 900.0, 1e-4);
+    // the cutoff: no lurch above 1100 u/s horizontal
+    let mut p = airborne(col, start, 5, Input::default());
+    p.vel.x = 1150.0;
+    let (v1, v2) = lurch_tick(&mut p, col, inp(0.0, 1.0));
+    c.near("no lurch above jump_grace_cutoff_speed 1100", (v2 - v1).length(), 0.0, 1e-4);
 }
 
 fn mantle_checks(c: &mut Checks, col: &Collision) {

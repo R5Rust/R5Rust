@@ -30,6 +30,13 @@ fn main() {
     let mut real = load_log(&format!("{dir}/out/r5f_client.log"), "[RPROBE] c ");
     let src = if real.is_empty() { real = load_log(&format!("{dir}/out/r5f.log"), "[RPROBE] s "); "server" } else { "client" };
     println!("reference: R5Flowstate {src} log, {} runs", real.len());
+    // The S21 client has no "+back" command (it is "+backward"), so plans that said +back pressed nothing in the
+    // real game. Logs recorded since the probe maps +back to +backward carry this marker; older logs replay with
+    // "back" ignored, exactly as the game received them.
+    let back_live = std::fs::read_to_string(format!("{dir}/out/r5f_client.log")).map(|t| t.contains("[RPROBE] backward-fix")).unwrap_or(false);
+    if !back_live {
+        println!("note: log predates the +back -> +backward fix: replaying +back as a no-op like the game did");
+    }
     let w = glb::load_world(&Config::load().world_glb(), glb::Mode::Geometry, true).unwrap();
     let idx: Vec<u32> = w.draws.iter().filter(|d| w.materials[d.material as usize].solid()).flat_map(|d| w.indices[d.first_index as usize..(d.first_index + d.index_count) as usize].iter().copied()).collect();
     let col = Collision::build(w.positions.clone(), &idx);
@@ -72,6 +79,7 @@ fn main() {
                 let c = &evs[ei].1;
                 if let Some(x) = c.strip_prefix('+') { held.insert(x.to_string()); }
                 else if let Some(x) = c.strip_prefix('-') { held.remove(x); }
+                else if c == "JUMP" || c == "TAP" { println!("  {name}: bare {c} (no count): the probe script errors there, run is invalid"); }
                 else if let Some(n) = c.strip_prefix("JUMP:") { spam.push(("jump".into(), k, n.parse().unwrap())); }
                 else if let Some(n) = c.strip_prefix("TAP:") { spam.push(("forward".into(), k, n.parse().unwrap())); }
                 ei += 1;
@@ -83,7 +91,7 @@ fn main() {
             }
             let h = |s: &str| now.contains(s);
             let input = Input {
-                forward: (h("forward") as i32 - h("back") as i32) as f32,
+                forward: (h("forward") as i32 - (h("backward") || (back_live && h("back"))) as i32) as f32,
                 right: (h("moveright") as i32 - h("moveleft") as i32) as f32,
                 jump: h("jump"),
                 sprint: true, // Kainz's R5F profile has player_setting_autosprint 1

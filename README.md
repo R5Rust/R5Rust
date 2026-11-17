@@ -36,7 +36,7 @@ Everything saves to `r5rust_settings.toml` (gitignored). Defaults:
 Movement is Apex's own (ported from R5Regenis' disassembly specs + the game's pilot settings): walk 173.5, sprint 260,
 crouch 80, slide + boost, slide jump, bhop rules, tap strafe, step 22, mantle + superglide + **mantle boost**,
 **wall climb** + jump off the wall.
-See `docs/movement.md`; `cargo run --release -p shared --example movecheck` runs its 107 checks.
+See `docs/movement.md`; `cargo run --release -p shared --example movecheck` runs its 130 checks.
 
 The window title shows fps, position and ground/air/FLY.
 
