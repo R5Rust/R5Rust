@@ -165,7 +165,7 @@ decal-class meshes, which r5rust also keeps out of the cascades. The world's own
 much smaller set (lumps 0x7C-0x7F: 45k triangles against 248k opaque render triangles), so that part is the Source
 convention (decals and overlays never cast) rather than proven from the data.
 
-`tools/export-map` carries this into world.glb as material extras `noShadow` / `skybox` (geometry with either gets its
+`export-map` carries this into world.glb as material extras `noShadow` / `skybox` (geometry with either gets its
 own primitives: group keys `|ns`, `|sky`); `crates/client/src/csm.rs` skips `DrawCmd::shadow == false`.
 
 ### Sun shading [H] (world L304-372)

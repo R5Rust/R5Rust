@@ -1,13 +1,13 @@
 # Collision: where it comes from
 
-The player collides with **Apex's own collision data**, not with the triangles we draw. `tools/export-map`
+The player collides with **Apex's own collision data**, not with the triangles we draw. `export-map`
 decodes it from the map BSP and the static prop models into `<map>/collision.bin` next to `world.glb`
 (`D:\R5Rust\assets\maps\mp_rr_canyonlands_staging_mu1\collision.bin`). The client, the examples and `movecheck`
 load it through `shared::collmesh`. Without that file they fall back to world.glb's solid render triangles and log
 a warning.
 
 ```powershell
-cd tools\export-map
+cd ..\export-map
 cargo run --release -- --collision --out D:\R5Rust\assets\maps\mp_rr_canyonlands_staging_mu1   # ~10-20 s
 ```
 
@@ -28,7 +28,7 @@ coarse shell, 12 triangles for a crate, 170 for a 27k-triangle cliff rock. Tree 
 only one with surface-property data, and it is what traces use. Movement uses tree 0. Tree 1 is only written
 with `--prop-physics` (source 3). On rocks the shell sits as much as 115 units above the visible surface, so
 using it for movement would make you float. **Not verified against the engine binary:** if Apex's player hull
-traces turn out to use the physics tree, flip `split_trees` in `tools/export-map/src/coll.rs`.
+traces turn out to use the physics tree, flip `split_trees` in `export-map/src/coll.rs`.
 
 2,088 props (decals, wires, conduits, small pebble clusters, `tree_acacia_small_01`, tripod cones, ...) have a
 prop leaf but a model with no BVH and no `.phy`. They have nothing to collide with in the game, so you walk

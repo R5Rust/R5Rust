@@ -1,5 +1,16 @@
 # R5Rust
 
+> Part of the [R5Rust](https://github.com/R5Rust) org. Clone the repos side by side:
+> **R5Rust** (this: client, server, shared sim), **[export-map](https://github.com/R5Rust/export-map)** (builds the map data
+> from your own Apex install), **[r5f-probe](https://github.com/R5Rust/r5f-probe)** (ground truth from real R5Flowstate).
+> No game assets live in any of them: you extract them from your own install.
+
+![Firing Range](docs/img/range.jpg)
+
+| | |
+|---|---|
+| ![Town](docs/img/town.jpg) | ![Spawn hall](docs/img/spawn.jpg) |
+
 From-scratch Rust engine that loads the Apex Legends **Firing Range** (`mp_rr_canyonlands_staging_mu1`) from
 your own extracted assets, and lets you walk around it. Long-term goal: client `r5rust` + headless dedicated
 server `r5rust_ds`, like R5Flowstate's `r5apex.exe` / `r5apex_ds.exe`.
@@ -44,8 +55,8 @@ The window title shows fps, position and ground/air/FLY.
 
 Default root `D:\R5Rust\assets` (override with `R5RUST_ASSETS` or `assets_root` in `r5rust.toml`):
 
-- `maps\mp_rr_canyonlands_staging_mu1\world.glb` + `meta.json`, made by `C:\Code\apex\r5-web-client\tools\export-map`
-- `maps\mp_rr_canyonlands_staging_mu1\collision.bin`: the game's own collision, made by `tools\export-map --collision`
+- `maps\mp_rr_canyonlands_staging_mu1\world.glb` + `meta.json`, made by `[export-map](https://github.com/R5Rust/export-map)`
+- `maps\mp_rr_canyonlands_staging_mu1\collision.bin`: the game's own collision, made by `export-map --collision`
   (see `docs/collision.md`). Without it the player collides with the render triangles and the log warns.
 - `images\ui\maps_mp_rr_canyonlands_staging_mu1_loadscreen\*.png`
 
@@ -82,19 +93,19 @@ Dark rock crevice to bright road: `--pos 1800,-5200,500.8 --pitch 5 --yaw 202.5 
 
 ## Re-exporting the map
 
-`tools/export-map` (Rust, standalone) rebuilds `world.glb` + `meta.json` from the game's paks; `tools/build_materials.py`
+`export-map` (Rust, standalone) rebuilds `world.glb` + `meta.json` from the game's paks; `export-map/build_materials.py`
 maps materials to the extracted textures + constants (`materials.json`). Lighting lumps live in `<map>/bsp/`,
 cubemaps in `cubemaps.dds`, the dome's sky cubes in `skies\<material>.dds` (fallback `skycube.dds`). Compressed texture
-cache: `D:\R5Rust\_cache\tex`. Run `python tools\build_materials.py` after every full export (new skins bring new materials).
+cache: `D:\R5Rust\_cache\tex`. Run `python ..\export-map\build_materials.py` after every full export (new skins bring new materials).
 
 Full export (~2 min; the exporter's `../../../../apex` path dependencies only resolve from the main checkout, not a worktree):
-`cd tools\export-map; cargo run --release -- --out D:\R5Rust\assets\maps\mp_rr_canyonlands_staging_mu1`. It applies each static
+`cd ..\export-map; cargo run --release -- --out D:\R5Rust\assets\maps\mp_rr_canyonlands_staging_mu1`. It applies each static
 prop's skin, and tags geometry in the glb material extras: `noShadow` (prop flag 0x10, decal meshes: never in the shadow
 cascades, `docs/apex-lighting.md`) and `skybox` (prop flag 0x40: drawn only from the sky camera, `docs/skybox.md`).
 Older world.glb files without those extras still load. The previous export is kept as `world.v1.glb` / `meta.v1.json`.
 
 Collision only (about 20 s, reuses the last export's BSP + models):
-`cd tools\export-map; cargo run --release -- --collision --out D:\R5Rust\assets\maps\mp_rr_canyonlands_staging_mu1`.
+`cd ..\export-map; cargo run --release -- --collision --out D:\R5Rust\assets\maps\mp_rr_canyonlands_staging_mu1`.
 Compare it with the render triangles: `cargo run --release -p shared --example collcompare`; inspect one spot:
 `--example collprobe -- x,y [zmin zmax] [radius]`.
 

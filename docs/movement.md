@@ -321,7 +321,7 @@ like Apex does (the client sets them from the binds).
 no controller path and the default -1 always passes; `limit_to_90`'s rsqrtss + Newton step is a plain 1/sqrt; the
 sine easing uses `f32::sin` instead of the binary's polynomial; the jump assist after the lurch (0x140a58ec0 ->
 0x140a58560) is not ported, as before. These are live client cvars: R5Flowstate could run other values than the
-static defaults. `tools/r5f-probe/plan.py` now dumps all of them at the start of a movement run.
+static defaults. `r5f-probe/plan.py` now dumps all of them at the start of a movement run.
 
 **Against R5Flowstate (`probecmp`, horizontal speed at t 1.75, ours / real):**
 
@@ -349,8 +349,8 @@ Still open: the real D/A lurch at 150 ms changes the velocity by ~236 u/s (|Δv|
 the formula's cap of 209 (0.7 × 260 × 1.15), so ours ends at 256 instead of 264. The direction of the change fits
 r ≈ 0.68-0.7. Either the live `jump_grace_max` is higher than the static 0.7 (≈0.79 would fit) or the speed
 scale the cap uses is not the holstered 1.15. Re-run the probe (it now dumps the live `jump_grace_*` values and has
-the fixed `+backward`, `lurch_null_150` and `tap_spam_d` runs): `python tools\r5f-probe\plan.py` (this rewrites
-`rp_plan.gnut` for movement runs), then `tools\r5f-probe\run.ps1`.
+the fixed `+backward`, `lurch_null_150` and `tap_spam_d` runs): `python ..\r5f-probe\plan.py` (this rewrites
+`rp_plan.gnut` for movement runs), then `..\r5f-probe\run.ps1`.
 
 ## Collision
 

@@ -17,7 +17,7 @@ dome models swaps `freedm_cubemap_skulltown` (Kings Canyon desert, the walker, a
 
 Skins live in the studiohdr (rmdl v16/v17, `studio_r5_v16.h`): `numskinref` u16 @148, `numskinfamilies` u16 @150,
 `skinindex` u16 @152 (a header offset: `(o & 0xFFFE) << (4 * (o & 1))`), then `families x skinrefs` i16 texture
-indices. `tools/export-map` `skin_remap()` applies them per prop.
+indices. `export-map` `skin_remap()` applies them per prop.
 
 The cube textures (HDR BC6H, 2048^2) sit in `<map>/skies/<material leaf>.dds`; the client loads the one the sky
 material names and falls back to `skycube.dds`. Which extracted file is which was matched by eye against the real

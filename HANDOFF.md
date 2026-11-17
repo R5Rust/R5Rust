@@ -20,10 +20,10 @@ collision. 2.9 ms/frame headless at 1600x900, ~600 fps windowed at spawn. Cold l
 ## Lighting / post status (2026-11-16, session 3)
 Ported from the game's own shaders (docs/apex-lighting.md, docs/apex-post.md): RGBM lightmap + sky vector, RTL lights,
 probe SH + static lights for props, Respawn diffuse + GGX, baked BC6H cubemap reflections, sun gated by baked vis with
-cached cascades, material textures + albedo/emissive tints (materials.json via tools/build_materials.py), vertex
+cached cascades, material textures + albedo/emissive tints (materials.json via export-map/build_materials.py), vertex
 colours, the Firing Range's sky-shaded 'fake sky' dome (HDR skycube.dds), Apex auto exposure (centre-spot mean, dead
 band 0.18 calibrated against a real R5Flowstate shot), bloom before exposure, height fog from env_fog_controller.
-world.glb now comes from **tools/export-map** (our copy of r5-web-client's exporter: keeps vertex colours + skies/).
+world.glb now comes from **export-map** (our copy of r5-web-client's exporter: keeps vertex colours + skies/).
 Old exports kept next to it: world.novc.glb, world.nosky.glb.
 Still off vs the real game: 2-layer blend materials (_bm, e.g. range floor concrete), tonemap curve (unknown which
 of Apex's 6; using ACES fit), HDR colour-grading LUT (mp_rr_desertlands_hu_hdr.raw_hdr, in the game VPK), outdoor
@@ -45,7 +45,7 @@ Open: skybox fog, vista brightness, water reflections are far darker than the re
 
 Done + committed: S21 lurch (96dc48d), auto sprint + holstered 1.15 speed, real collision.bin, no-shadow/skins/3D skybox,
 cut-out opacity masks (pine branches), F8 = append spot to r5rust_marks.txt, auto exposure per-frame speed (c692f5a).
-Ground truth: `tools/r5f-probe` (README in plan.py/run.ps1 headers): `python plan.py` + `run.ps1` records movement in real
+Ground truth: `r5f-probe` (README in plan.py/run.ps1 headers): `python plan.py` + `run.ps1` records movement in real
 R5Flowstate (Octane; Lifeline can't lurch); `python plan.py --shots` + `run.ps1 -Shots` screenshots poses.json; compare with
 `cargo run --release -p shared --example probecmp` and the headless `r5rust.exe --screenshot ... --pos --yaw --pitch --fov 100 --fly`.
 Not yet staged to play\next (last staged build = cca4bb5).
