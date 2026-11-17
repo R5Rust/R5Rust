@@ -247,6 +247,11 @@ fn tint(v: &serde_json::Value) -> [f32; 4] {
     [c(0), c(1), c(2), 1.0]
 }
 
+/// a perf spec colour (F0) from materials.json, 0.04 where the material has none
+fn spec_const(v: &serde_json::Value) -> [f32; 4] {
+    if v.is_array() { tint(v) } else { [0.04, 0.04, 0.04, 1.0] }
+}
+
 fn tv(b: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry { binding: b, resource: wgpu::BindingResource::TextureView(v) }
 }
@@ -468,8 +473,10 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
                 uv2: [rx2[0], rx2[1], ry2[0], ry2[1]],
                 albedo2_tint: tint(&e["albedo2_tint"]),
                 layer2: [gloss2.is_some() as u32 as f32, spec2.is_some() as u32 as f32, f1("perf_gloss", 0.25), f1("perf_gloss2", 0.25)],
-                perf_spec: { let t = tint(&e["perf_spec"]); [t[0], t[1], t[2], (!std::ptr::eq(spec, &def_spec)) as u32 as f32] },
-                perf_spec2: tint(&e["perf_spec2"]),
+                // c_L0/L1_perfSpecColor is F0. Old-style _col/_nml/_gls/_bm materials export an empty CBufUberStatic, so
+                // a missing value means the dielectric default 0.04, not tint()'s 1.0 (F0 = 1 lit them as white mirrors)
+                perf_spec: { let t = spec_const(&e["perf_spec"]); [t[0], t[1], t[2], (!std::ptr::eq(spec, &def_spec)) as u32 as f32] },
+                perf_spec2: spec_const(&e["perf_spec2"]),
             };
             let ub = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mat"), contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM });
             device.create_bind_group(&wgpu::BindGroupDescriptor {
