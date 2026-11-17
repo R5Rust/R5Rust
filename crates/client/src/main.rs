@@ -53,6 +53,8 @@ struct Args {
     fov: Option<f32>,
     exposure: Option<f32>,
     menu: bool,
+    /// second pose "x,y,z,pitch,yaw" (feet): print the auto exposure curve stepping between --pos and it
+    expo_curve: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -82,6 +84,7 @@ fn parse_args() -> Args {
             "--fov" => a.fov = next(&mut i).parse().ok(),
             "--exposure" => a.exposure = next(&mut i).parse().ok(),
             "--menu" => a.menu = true,
+            "--expo-curve" => a.expo_curve = Some(next(&mut i)),
             other => log::warn!("unknown arg {other}"),
         }
         i += 1;
@@ -210,7 +213,67 @@ fn run_headless(cfg: Config, args: Args) -> Result<(), String> {
         start.x, start.y, start.z, args.frames, player.pos.x, player.pos.y, player.pos.z, player.on_ground, player.flying, (player.pos - start).length()
     );
     println!("screenshot -> {}  (total {:.1}s)", path.display(), t0.elapsed().as_secs_f64());
+    if let Some(b) = &args.expo_curve {
+        let v: Vec<f32> = b.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if v.len() != 5 {
+            return Err("--expo-curve wants x,y,z,pitch,yaw".into());
+        }
+        let eye = Player::new(sim::find_free(&world.collision, Vec3::new(v[0], v[1], v[2]))).eye();
+        let cam_b = Camera { pos: eye, yaw: v[4], pitch: v[3], fov: cfg.fov, debug: 0.0 };
+        expo_curve(&mut gfx, &world, &cam, &cam_b);
+    }
     Ok(())
+}
+
+/// Auto exposure step response with the real meter + adaptation passes: settle (snap) at one pose, cut to the other,
+/// print the exposure after every frame both ways, and check it against the engine formula run on the CPU.
+fn expo_curve(gfx: &mut Gfx, world: &LoadedWorld, a: &Camera, b: &Camera) {
+    gfx.instant_exposure = false;
+    gfx.forced_exposure = None;
+    let x = gfx.expo.clone();
+    fn frame(gfx: &mut Gfx, world: &LoadedWorld, cam: &Camera) -> (f32, f32) {
+        let fu = gfx.frame_uniform(cam, world, 0.0);
+        gfx.screenshot_free_draw(world, &fu);
+        gfx.read_exposure()
+    }
+    let settle = |gfx: &mut Gfx, cam: &Camera| {
+        gfx.prepare(cam, world);
+        gfx.snap_exposure();
+        let mut r = (0.0, 0.0);
+        for _ in 0..4 {
+            r = frame(gfx, world, cam);
+        }
+        r
+    };
+    let (ea, la) = settle(gfx, a);
+    let (eb, lb) = settle(gfx, b);
+    println!("expo curve: pose A settles at {ea:.3} (spot lum {la:.4}), pose B at {eb:.3} (spot lum {lb:.4})");
+    let (emin, emax) = (x.min_multiplier * x.min, (x.max_multiplier * x.max).max(x.min_multiplier * x.min));
+    for (name, from, to) in [("A -> B", a, b), ("B -> A", b, a)] {
+        let (e0, _) = settle(gfx, from);
+        gfx.prepare(to, world);
+        let mut curve = Vec::new();
+        let mut cpu = e0;
+        let mut worst = 0f32;
+        for _ in 0..600 {
+            let (e, avg) = frame(gfx, world, to);
+            // the engine's step on the same metered average
+            let k = if avg < x.target_min { x.target_min / avg } else if avg > x.target_max.max(x.target_min) { x.target_max.max(x.target_min) / avg } else { 1.0 };
+            let t = k * x.compensation.exp2();
+            cpu = (cpu + (t - cpu) * (x.rate / cpu.max(t)).clamp(0.0, 1.0)).clamp(emin, emax);
+            worst = worst.max((cpu - e).abs());
+            curve.push(e);
+        }
+        let end = *curve.last().unwrap();
+        let reach = |f: f32| curve.iter().position(|&e| (e - e0).abs() >= f * (end - e0).abs() - 1e-4).map_or(curve.len(), |i| i + 1);
+        let (f50, f90, f99) = (reach(0.5), reach(0.9), reach(0.99));
+        println!("{name}: {e0:.3} -> {end:.3}; 50% after {f50} frames, 90% after {f90}, 99% after {f99}; |GPU - CPU formula| <= {worst:.5}");
+        for fps in [60.0, 144.0, 240.0] {
+            println!("    at {fps:>3} fps: 90% in {:.2} s, 99% in {:.2} s", f90 as f32 / fps, f99 as f32 / fps);
+        }
+        let line: Vec<String> = curve.iter().take(f99.max(8) + 2).map(|e| format!("{e:.3}")).collect();
+        println!("    per frame: {}", line.join(" "));
+    }
 }
 
 // ---------------------------------------------------------------- windowed game

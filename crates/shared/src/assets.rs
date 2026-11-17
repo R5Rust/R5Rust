@@ -36,28 +36,54 @@ pub struct Config {
 }
 
 /// Apex-style auto exposure (mat_autoexposure_*): dead band on the centre-spot mean luminance.
+/// Field names follow the convars; how the engine turns them into CBufExposureAdaptation / CBufLogLuminance is
+/// `Gfx::expo_params` (DoEnginePostProcessing FUN_140961750 + FUN_1404bdf00, docs/apex-post.md section 1).
 #[derive(Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct AutoExposure {
+    /// mat_autoexposure_target_lum_min
     pub target_min: f32,
+    /// mat_autoexposure_target_lum_max (the engine uses max(target_min, target_max))
     pub target_max: f32,
-    /// EV stops
+    /// mat_autoexposure_compensation, EV stops
     pub compensation: f32,
+    /// mat_autoexposure_min
     pub min: f32,
+    /// mat_autoexposure_max
     pub max: f32,
-    /// relative change per second
+    /// mat_autoexposure_min_multiplier / max_multiplier: scale min / max
+    pub min_multiplier: f32,
+    pub max_multiplier: f32,
+    /// mat_autoexposure_uncap: min 0, max 100
+    pub uncap: bool,
+    /// mat_autoexposure_speed = c_adaptationRate as is. Per rendered frame: the engine does not scale it by frame time,
+    /// so Apex (and we) adapt faster at higher fps.
     pub rate: f32,
-    /// fraction of the screen metered (centred)
+    /// c_spotMeteringScreenRatio: fraction of the screen metered (centred). Engine constant 0.8 (0.3 while zoomed
+    /// in with a scope), clamped to [0.1, 1]
     pub spot: f32,
-    /// per-pixel luminance clamp before averaging
+    /// mat_autoexposure_max_luminance: per-pixel luminance clamp before averaging (<= 0 = no clamp)
     pub max_lum: f32,
 }
 
 impl Default for AutoExposure {
     fn default() -> Self {
-        // S21 defaults read live from R5Flowstate (tools/r5f-probe cvar dump): mat_autoexposure_target_lum_min/max 0.18/1.0,
-        // min/max 1.0/4.5, speed 0.15, max_luminance 10
-        Self { target_min: 0.18, target_max: 1.0, compensation: 0.0, min: 1.0, max: 4.5, rate: 0.15, spot: 0.6, max_lum: 10.0 }
+        // Firing Range values: its env_exposure "env_exposure_firing_range" (auto_speed 0.15, auto_min 1, auto_max 4.5,
+        // auto_compensation 0) overrides the convar defaults (speed 0.1, min 0.5, max 3) every frame; the R5Flowstate
+        // cvar dump (tools/r5f-probe) reads the same values in game. target_lum_min/max 0.18/1.0, max_luminance 10.
+        Self {
+            target_min: 0.18,
+            target_max: 1.0,
+            compensation: 0.0,
+            min: 1.0,
+            max: 4.5,
+            min_multiplier: 1.0,
+            max_multiplier: 1.0,
+            uncap: false,
+            rate: 0.15,
+            spot: 0.8,
+            max_lum: 10.0,
+        }
     }
 }
 

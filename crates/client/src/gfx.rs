@@ -102,7 +102,8 @@ pub struct Gfx {
     expo_bg: wgpu::BindGroup,
     expo_lum: wgpu::ComputePipeline,
     expo_adapt: wgpu::ComputePipeline,
-    expo_last: std::cell::Cell<std::time::Instant>,
+    /// c_snapExposure for the next frame (set on world load, like the engine's level reset FUN_140962750)
+    expo_snap: std::cell::Cell<bool>,
     /// snap exposure every frame (screenshot mode)
     pub instant_exposure: bool,
     /// auto-exposure settings (Apex mat_autoexposure_* equivalents)
@@ -397,7 +398,7 @@ impl Gfx {
 
         let (msaa_view, hdr_view, depth_view) = targets(&device, width.max(1), height.max(1));
         let expo_state = device.create_buffer(&wgpu::BufferDescriptor { label: Some("expo"), size: 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let expo_params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("expo params"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let expo_params = device.create_buffer(&wgpu::BufferDescriptor { label: Some("expo params"), size: 48, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let cs = wgpu::ShaderStages::COMPUTE;
         let expo_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("expo"),
@@ -473,7 +474,7 @@ impl Gfx {
             expo_bg,
             expo_lum,
             expo_adapt,
-            expo_last: std::cell::Cell::new(std::time::Instant::now()),
+            expo_snap: std::cell::Cell::new(true),
             instant_exposure: false,
             expo: cfg.auto_exposure.clone(),
             forced_exposure: None,
@@ -543,7 +544,37 @@ impl Gfx {
         self.expo_bg = Self::make_expo_bg(&self.device, &self.expo_layout, &self.hdr_view, &self.expo_state, &self.expo_params);
     }
 
+    /// CBufExposureAdaptation + CBufLogLuminance values for this frame, filled the way S21's DoEnginePostProcessing
+    /// (FUN_140961750) and its dispatch (FUN_1404bdf00) do it:
+    ///   min = min_multiplier * mat_autoexposure_min, max = max_multiplier * mat_autoexposure_max (each also times a
+    ///   script multiplier, 1 unless set); uncap -> min 0, max 100; max = max(min, max)
+    ///   target_lum_max = max(target_lum_min, target_lum_max); compensation = mat_autoexposure_compensation (+ script bias)
+    ///   c_adaptationRate = mat_autoexposure_speed, no dt; spot = clamp(ratio, 0.1, 1); max_luminance <= 0 -> no clamp
+    /// Consumes the pending snap.
+    fn expo_params(&self) -> [f32; 12] {
+        let x = &self.expo;
+        let (mut emin, mut emax) = if x.uncap { (0.0, 100.0) } else { (x.min_multiplier * x.min, x.max_multiplier * x.max) };
+        emax = emax.max(emin);
+        let mut rate = x.rate;
+        if let Some(f) = self.forced_exposure {
+            (emin, emax) = (f, f);
+        }
+        if self.instant_exposure || self.forced_exposure.is_some() {
+            rate = 1e6; // saturate() -> 1: the clamped target this frame
+        }
+        let snap = self.expo_snap.replace(false) && !self.instant_exposure && self.forced_exposure.is_none();
+        // the meter sums fixed point, so "no clamp" is capped where the sum still fits a u32
+        let max_lum = if x.max_lum > 0.0 { x.max_lum.min(100.0) } else { 100.0 };
+        [rate, x.target_min, x.target_max.max(x.target_min), x.compensation, emin, emax, x.spot.clamp(0.1, 1.0), max_lum, snap as u32 as f32, 0.0, 0.0, 0.0]
+    }
+
+    /// Forget the adapted exposure: the next frame takes the metered target (the engine's AutoExposureSnap()).
+    pub fn snap_exposure(&self) {
+        self.expo_snap.set(true);
+    }
+
     pub fn set_world(&mut self, world: &LoadedWorld) {
+        self.expo_snap.set(true);
         self.frame_bg = Some(self.make_frame_bg(world, &self.frame_ub, "frame"));
         self.sky_bg = Some(self.make_frame_bg(world, &self.sky_ub, "sky frame"));
         self.csm.invalidate();
@@ -688,13 +719,7 @@ impl Gfx {
             }
             self.drawn.set(drawn);
             drop(rp);
-            let now = std::time::Instant::now();
-            let dt = (now - self.expo_last.get()).as_secs_f32().min(0.5);
-            self.expo_last.set(now);
-            let x = &self.expo;
-            let rate = if self.instant_exposure || self.forced_exposure.is_some() { 1e6 } else { x.rate * dt };
-            let (emin, emax) = match self.forced_exposure { Some(f) => (f, f), None => (x.min, x.max) };
-            self.queue.write_buffer(&self.expo_params, 0, bytemuck::cast_slice(&[rate, x.target_min, x.target_max, x.compensation, emin, emax, x.spot, x.max_lum]));
+            self.queue.write_buffer(&self.expo_params, 0, bytemuck::cast_slice(&self.expo_params()));
             let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("expo"), timestamp_writes: None });
             cp.set_bind_group(0, &self.expo_bg, &[]);
             cp.set_pipeline(&self.expo_lum);

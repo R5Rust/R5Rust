@@ -64,10 +64,43 @@ if (c_snapExposure) newE = target;                                  // snap skip
 ```
 - The target is *not* "key / average". It is a band: exposure is only pushed when average luminance leaves
   `[c_targetLumMin, c_targetLumMax]`, and then just enough to put it back on the nearest edge.
-- `c_adaptationRate` has no frame-time term in the shader, so the CPU must pre-scale it by dt [M].
+- `c_adaptationRate` has no frame-time term in the shader, and the CPU does **not** scale it by dt either (below): it
+  is `mat_autoexposure_speed` as is, one step per rendered frame, so Apex adapts faster at higher fps [H].
 - Because the rate is divided by `max(prev, target)`, the step is roughly a constant *relative* change per frame.
   Adaptation up and down are symmetric [H].
 - `c_forcedExposure` (variant `_1`) writes a fixed exposure into every texel [H].
+
+**CPU side** (S21 `r5apex_dx12.exe`, decompiled with Ghidra) [H]:
+- `FUN_140961750` = `DoEnginePostProcessing` (its PIX marker), once per rendered frame. Unless
+  `mat_autoexposure_force_value` != 0 (then `_rt_ExposureForced`), it fills a struct and calls `FUN_1404bdf00`, which
+  writes `CBufLogLuminance`, runs the meter + downsamples, writes `CBufExposureAdaptation` and runs the adaptation
+  pass into a ping-pong `_rt_Exposure0/1`:
+  ```c
+  c_exposureMin  = scriptMinMul * mat_autoexposure_min_multiplier * mat_autoexposure_min;
+  c_exposureMax  = scriptMaxMul * mat_autoexposure_max_multiplier * mat_autoexposure_max;
+  if (mat_autoexposure_uncap) { c_exposureMin = 0; c_exposureMax = 100; }
+  c_exposureMax  = max(c_exposureMin, c_exposureMax);
+  c_targetLumMin = mat_autoexposure_target_lum_min;
+  c_targetLumMax = max(mat_autoexposure_target_lum_min, mat_autoexposure_target_lum_max);
+  c_exposureCompensation = scriptCompensation + scriptCompensationBias + mat_autoexposure_compensation;
+  c_adaptationRate = mat_autoexposure_speed;                  // raw, no frame time
+  c_snapExposure = snapPending; snapPending = 0;
+  c_spotMeteringScreenRatio = clamp(spotRatio, 0.1, 1.0); spotRatio = 0.8;   // reset every frame
+  c_maxExposureLuminance = mat_autoexposure_max_luminance > 0 ? it : FLT_MAX;
+  ```
+- Script hooks (`FUN_1409907a0`/`FUN_140990800`/`FUN_1409906e0`/`FUN_140990740`/`FUN_1409906a0`):
+  `AutoExposureSetMax/MinExposureMultiplier`, `AutoExposureSetExposureCompensation(Bias)`, `AutoExposureSnap`. The level
+  reset `FUN_140962750` puts the multipliers back to 1, the compensations to 0 and sets `snapPending = 1`, so a map
+  load snaps.
+- `spotRatio` is 0.8 unless `FUN_140839310` (view setup) sees the active weapon zoomed in past its threshold
+  (`FUN_140719b50`), then 0.3 for that frame.
+- Exposure controllers: `FUN_140867620` (C_ExposureController / `env_exposure`, blended with `exposure_volume`s in
+  `FUN_140867340` over the controller's fade time) **overwrites** `mat_autoexposure_compensation/force_value/min/max/
+  speed` every frame unless `mat_autoexposure_disable_controllers`. The convar defaults (speed 0.1, min 0.5, max 3) are
+  therefore not what plays: the Firing Range BSP has one `env_exposure_firing_range` with `auto_speed 0.15`,
+  `auto_min 1`, `auto_max 4.5`, `auto_compensation 0`, `auto_force_value 0`, which is what the in-game cvar dump reads.
+- Consequence: 1 -> 4.5 (bright to dark) takes ~26 frames, 4.5 -> 1 ~36 frames to 90 %. That is 0.17 / 0.25 s at
+  144 fps (0.4 / 0.6 s at 60). Our old dt-scaled guess (0.15/s) took 23-36 s.
 - Exposure is applied **once, in the composite**: `color *= ExposureTexture[0,0].x` (EP L153-154). The forward shaders
   don't apply it.
 - `c_exposureInteractionRate`, `c_overrideExposureInteractionRate` and `c_exposureCounteractionType` live in
@@ -174,8 +207,9 @@ baked constants and it matches Apex's saturated-highlight look [L]. Verify again
 
 | Field (cbuffer) | Source | Status |
 |---|---|---|
-| `c_spotMeteringScreenRatio`, `c_maxExposureLuminance` (CBufLogLuminance) | engine/convar | unknown |
-| `c_exposureMin/Max`, `c_exposureCompensation`, `c_adaptationRate`, `c_snapExposure`, `c_targetLumMin/Max`, `c_forcedExposure` | engine/convar/script | unknown |
+| `c_spotMeteringScreenRatio`, `c_maxExposureLuminance` (CBufLogLuminance) | engine constant / convar | **resolved** (section 1): 0.8 (0.3 scoped), `mat_autoexposure_max_luminance` 10 |
+| `c_exposureMin/Max`, `c_exposureCompensation`, `c_adaptationRate`, `c_snapExposure`, `c_targetLumMin/Max` | convar via `env_exposure` / script | **resolved** (section 1): 1, 4.5, 0, 0.15 per frame, snap on map load, 0.18, 1.0 |
+| `c_forcedExposure` | `mat_autoexposure_force_value` | unused by the normal path (non-zero switches to `_rt_ExposureForced`) |
 | `c_bloomCutoff`, `c_bloomClamp`, `c_bloomCutoffExposureAdapt`, `c_bloomExp`, `c_preScaleFactor`; blur `c_sideTapPacks`/`c_centerWeight`; mip count | engine | unknown |
 | `c_bloomAmount`, `c_wideBloomAmount`, `c_streakBloomAmount`, `c_streakBloomExponentPost` | engine/script | unknown |
 | `c_sharpenAmount/Width/Threshold` | user setting (likely "sharpening" option) | unknown |
@@ -190,8 +224,7 @@ baked constants and it matches Apex's saturated-highlight look [L]. Verify again
    (exposure-aware knee) → separable blurs (base + wide + streak) → composite:
    `(scene + bloom) * exposure → [HDR LUT] → tonemap → [LDR LUT] → postColorScale` → sRGB swapchain.
 2. Store exposure as a linear multiplier in a 2×2 R32F texture. Adaptation is a dead-band controller, not "key/avg".
-   Starting guesses [L]: `targetLumMin ≈ targetLumMax ≈ 0.18` (degenerates to classic key=0.18), rate ≈ 1-2/s × dt
-   relative, spot ratio ≈ 0.5-0.7.
+   Firing Range values (section 1): target band 0.18..1.0, exposure 1..4.5, rate 0.15 per frame (no dt), spot 0.8.
 3. Bloom knee: `w = min(min(L·E, clamp), 2(L·E − cutoff))/(L·E)`, applied to the *unexposed* colour.
 4. To get the HDR LUT, extract `materials/correction/mp_rr_desertlands_hu_hdr.raw_hdr` from the R5 VPK. Expect 33³
    texels in PQ space (input = PQ(c·0.01), output decoded ×100). Its byte layout (likely RGB f16/f32) is unknown.

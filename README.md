@@ -70,11 +70,15 @@ max_texture_size = 1024
 ```powershell
 .\target\release\r5rust.exe --screenshot out.png [--loadshot load.png] [--frames 120]
     [--pos x,y,z] [--yaw deg] [--pitch deg] [--hold w,shift,space] [--fly] [--debug 1|2|3]
+    [--expo-curve x,y,z,pitch,yaw]
 ```
 
 Settles for 30 ticks, holds `--hold` keys for `--frames` ticks (60/s), renders, and prints load stats,
 GPU ms/frame, where the player ended up and the jump peak. `--debug`: 1 = sun visibility (lightmap A),
 2 = baked indirect light, 3 = albedo only.
+`--expo-curve` then cuts the camera between `--pos` and that second pose (feet position) both ways and prints the
+auto exposure after every frame, the frames to 50/90/99 %, and the gap to the engine formula run on the CPU.
+Dark rock crevice to bright road: `--pos 1800,-5200,500.8 --pitch 5 --yaw 202.5 --expo-curve -3000,-200,-82.9,5,67.5`.
 
 ## Re-exporting the map
 
