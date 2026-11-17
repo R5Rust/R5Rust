@@ -5,3 +5,4 @@ target/
 tools/r5f-probe/out/
 .claude/worktrees/
 mapcache/
+r5rust_marks.txt

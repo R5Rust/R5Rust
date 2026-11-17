@@ -19,10 +19,11 @@ pub enum Action {
     FlyDown,
     Respawn,
     Fullscreen,
+    Mark,
 }
 
 impl Action {
-    pub const ALL: [Action; 11] = [
+    pub const ALL: [Action; 12] = [
         Action::Forward,
         Action::Back,
         Action::Left,
@@ -34,6 +35,7 @@ impl Action {
         Action::FlyDown,
         Action::Respawn,
         Action::Fullscreen,
+        Action::Mark,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -48,6 +50,7 @@ impl Action {
             Action::FlyDown => "Fly Down",
             Action::Respawn => "Respawn",
             Action::Fullscreen => "Fullscreen",
+            Action::Mark => "Mark spot (bug report)",
         }
     }
 }
@@ -160,6 +163,7 @@ impl Default for Binds {
                 (Action::FlyDown, [k(K::KeyX), None]),
                 (Action::Respawn, [k(K::KeyR), None]),
                 (Action::Fullscreen, [k(K::F11), None]),
+                (Action::Mark, [k(K::F8), None]),
             ],
         }
     }

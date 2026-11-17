@@ -375,6 +375,27 @@ impl App {
                         g.pitch = pitch;
                     }
                 }
+                Action::Mark => {
+                    // F8: log exactly where you are so a movement/collision bug can be reproduced headless
+                    if let Some(g) = &self.game {
+                        let p = &g.player;
+                        let line = format!(
+                            "{}  pos {:.2},{:.2},{:.2}  ang {:.2} {:.2}  vel {:.1},{:.1},{:.1} ({:.0} u/s)  state {}  ground {}  flying {}
+",
+                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                            p.pos.x, p.pos.y, p.pos.z, g.pitch, g.yaw, p.vel.x, p.vel.y, p.vel.z, p.vel.truncate().length(),
+                            p.state_name(), p.on_ground, p.flying
+                        );
+                        use std::io::Write;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("r5rust_marks.txt") {
+                            let _ = f.write_all(line.as_bytes());
+                        }
+                        log::info!("marked: {}", line.trim());
+                        if let Some(w) = &self.window {
+                            w.set_title(&format!("R5Rust  |  MARKED {:.0}, {:.0}, {:.0} -> r5rust_marks.txt", p.pos.x, p.pos.y, p.pos.z));
+                        }
+                    }
+                }
                 Action::Fullscreen => {
                     if let Some(w) = &self.window {
                         w.set_fullscreen(if w.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) });
