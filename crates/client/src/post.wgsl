@@ -104,7 +104,16 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
         let g = textureSampleLevel(grading_lut, samp, pq * (32.0 / 33.0) + 0.5 / 33.0, 0.0).rgb;
         c = pq_decode(g) * 100.0;
     }
-    // tonemap: Apex picks one of six at runtime (c_tonemapFunction); z = 0 ACES fit, 1 = function 0
+    // tonemap: Apex picks one of six at runtime (c_tonemapFunction); z = 0 ACES fit, 1 = function 0, 2 = function 4.
+    // S21 runs function 4 (mat_debug_tonemapping 4): FUN_1404aa440 sets S = 1, toe = mid1 = 0, M2 = S * 0.5
+    // (mat_debug_tonemapping_linear_segment_end): hue-preserving max-channel exponential shoulder.
+    if (pp.bloom.z > 1.5) {
+        let m2 = 0.5;
+        let m = max(max(c.r, c.g), c.b);
+        var mt = m;
+        if (m >= m2) { mt = m2 + (1.0 - m2) * (1.0 - exp(-(m - m2) / (1.0 - m2))); }
+        return out_color(clamp(c * (mt / max(m, 1e-6)), vec3<f32>(0.0), vec3<f32>(1.0)));
+    }
     if (pp.bloom.z > 0.5) {
         let t = c * (10.0 * c + 0.3) / (c * (10.0 * c + 0.5) + 1.5);
         return out_color(clamp(t, vec3<f32>(0.0), vec3<f32>(1.0)));

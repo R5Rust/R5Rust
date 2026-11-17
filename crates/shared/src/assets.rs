@@ -31,7 +31,7 @@ pub struct Config {
     pub bloom_cutoff: f32,
     /// cap on exposed luminance that blooms (c_bloomClamp)
     pub bloom_clamp: f32,
-    /// 0 = ACES fit, 1 = Apex tonemap function 0
+    /// 0 = ACES fit, 1 = Apex tonemap function 0, 2 = Apex function 4 (what S21 runs)
     pub tonemap: u32,
 }
 
@@ -55,7 +55,9 @@ pub struct AutoExposure {
 
 impl Default for AutoExposure {
     fn default() -> Self {
-        Self { target_min: 0.18, target_max: 0.18, compensation: 0.0, min: 0.1, max: 8.0, rate: 1.5, spot: 0.6, max_lum: 20.0 }
+        // S21 defaults read live from R5Flowstate (tools/r5f-probe cvar dump): mat_autoexposure_target_lum_min/max 0.18/1.0,
+        // min/max 1.0/4.5, speed 0.15, max_luminance 10
+        Self { target_min: 0.18, target_max: 1.0, compensation: 0.0, min: 1.0, max: 4.5, rate: 0.15, spot: 0.6, max_lum: 10.0 }
     }
 }
 
@@ -76,10 +78,11 @@ impl Default for Config {
             port: 37015,
             exposure: 1.0,
             auto_exposure: AutoExposure::default(),
-            bloom_amount: 0.12,
-            bloom_cutoff: 1.0,
-            bloom_clamp: 20.0,
-            tonemap: 1,
+            // mat_bloom_global_baseline 0.1, mat_bloom_cutoff 1.5, mat_bloom_clamp 10 (live S21 values)
+            bloom_amount: 0.1,
+            bloom_cutoff: 1.5,
+            bloom_clamp: 10.0,
+            tonemap: 2,
         }
     }
 }
