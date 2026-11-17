@@ -4,3 +4,4 @@ target/
 /r5rust_settings.toml
 tools/r5f-probe/out/
 .claude/worktrees/
+mapcache/
