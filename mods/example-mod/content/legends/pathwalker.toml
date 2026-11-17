@@ -1,0 +1,8 @@
+name = "Pathwalker"
+description = "Template legend showing every field."
+class = "skirmisher"
+settings = "pilot_survival_firesupport"   # moves like a stock legend
+tactical = "blink"                         # = example:blink
+ultimate = "tether"
+passives = ["light_step"]
+model = ""

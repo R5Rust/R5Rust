@@ -7,6 +7,7 @@ pub mod bsplight;
 pub mod collision;
 pub mod collmesh;
 pub mod glb;
+pub mod registry;
 pub mod settings;
 pub mod sim;
 

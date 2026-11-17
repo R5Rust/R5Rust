@@ -1,0 +1,5 @@
+name = "Tether"
+description = "Anchor a return point and snap back to it."
+slot = "ultimate"
+cooldown = 120.0
+charges = 1

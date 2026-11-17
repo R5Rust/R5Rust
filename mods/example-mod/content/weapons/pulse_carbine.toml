@@ -1,0 +1,11 @@
+name = "Pulse Carbine"
+description = "Template weapon showing every field."
+class = "assault_rifle"
+game_class = ""
+ammo = "pulse_cells"
+fire_modes = ["auto", "semi"]
+damage = 16.0
+headshot_multiplier = 1.75
+rpm = 600.0
+magazine = 28
+attachment_slots = ["barrel", "mag", "optic", "stock"]

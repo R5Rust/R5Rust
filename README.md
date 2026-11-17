@@ -10,6 +10,15 @@ Double-click **`play.bat`** (or `.\play.ps1`). It runs your own copy in `play\cu
 fight with an open game. `tools\publish.ps1` builds and stages a new version in `play\next\`; the next time
 you launch `play.bat` it swaps in automatically and prints what it updated to. `play\` is gitignored.
 
+## Content and mods
+
+Legends, abilities, passives, weapons, ammo types, attachments, consumables and maps are data, not code: one TOML file
+each in `content/<kind>/`, loaded into a registry (`crates/shared/src/registry.rs`) at startup. Mods use the same
+layout under `mods/<folder>/content/` with a `mod.toml`, get their own id namespace (`mymod:railgun`) and can override
+base entries with `replaces`. Right now only the Firing Range map is defined; `mods/example-mod/` (disabled) shows every
+kind. Check everything with `cargo run --release -p shared --example content` (`-- --all` includes disabled mods).
+Details: `content/README.md`, `mods/README.md`.
+
 ## Run (dev)
 
 ```powershell

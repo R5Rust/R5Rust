@@ -670,6 +670,16 @@ impl ApplicationHandler for App {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info,wgpu_core=warn,wgpu_hal=warn,naga=warn")).init();
     let mut cfg = Config::load();
+    // content registry (legends, weapons, maps, ... + mods): only reported for now, nothing reads it yet
+    let content = shared::registry::Content::load_default();
+    log::info!("content: {}", content.summary());
+    for e in &content.errors {
+        log::warn!("content: {e}");
+    }
+    match content.map_by_bsp(&cfg.map) {
+        Some((_, id, m)) => log::info!("map {id} ({})", m.name),
+        None => log::warn!("map {} isn't in content/maps", cfg.map),
+    }
     let args = parse_args();
     if let Some(f) = args.fov {
         cfg.fov = f;

@@ -1,0 +1,6 @@
+name = "Blink"
+description = "Short forward dash."
+slot = "tactical"
+cooldown = 12.0
+charges = 1
+dash_distance = 300.0   # not an engine field yet: kept in `extra` for the code that will read it

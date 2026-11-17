@@ -1,0 +1,5 @@
+# core:firing_range
+name = "Firing Range"
+description = "Apex Legends' Firing Range (the S21 build R5Flowstate runs)."
+bsp = "mp_rr_canyonlands_staging_mu1"
+modes = ["firing_range"]

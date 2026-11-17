@@ -1,0 +1,5 @@
+name = "Extended Pulse Mag"
+slot = "mag"
+tier = 1
+weapons = ["pulse_carbine"]
+magazine_bonus = 4

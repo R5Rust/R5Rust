@@ -1,0 +1,4 @@
+name = "Test Box"
+description = "Template map entry."
+bsp = "mp_example_test_box"
+modes = ["sandbox"]
