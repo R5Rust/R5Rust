@@ -135,9 +135,20 @@ struct MatUniform {
     perf_spec: [f32; 4],
     /// perf spec colour L1 (rgb)
     perf_spec2: [f32; 4],
+    /// c_uv1..5 RotScaleX.xy, RotScaleY.xy
+    uv_rs: [[f32; 4]; 5],
+    /// c_uv1..5 Translate.xy
+    uv_tr: [[f32; 4]; 5],
+    /// UV per texture slot (ROUTE_SLOTS order): uv index 0..5 (0 = untransformed) | 8 if world-planar (x, -y)
+    route: [[u32; 4]; 4],
+    /// x = has detail (layer 0), y = has detail2 (layer 1), z = detail2 overlaid (else 2x multiply)
+    detail: [f32; 4],
 }
 
-const TEX_SLOTS: [(&str, Kind); 12] = [
+/// texture slots with a UV route, in MatUniform::route order (world.wgsl R_* constants)
+const ROUTE_SLOTS: [&str; 13] = ["albedo", "normal", "gloss", "spec", "ao", "albedo2", "normal2", "gloss2", "spec2", "blend", "detail_normal", "detail", "detail2"];
+
+const TEX_SLOTS: [(&str, Kind); 14] = [
     ("albedo", Kind::Albedo),
     ("normal", Kind::Normal),
     ("gloss", Kind::Gloss),
@@ -150,6 +161,8 @@ const TEX_SLOTS: [(&str, Kind); 12] = [
     ("spec2", Kind::Spec),
     ("blend", Kind::Gloss),
     ("detail_normal", Kind::Normal),
+    ("detail", Kind::Detail),
+    ("detail2", Kind::Detail),
 ];
 
 /// Six faces `<leaf>_albedoTexture_000..005.png` (D3D face order) of the sky material, as one cube texture.
@@ -336,7 +349,7 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     // Baked lighting from the raw BSP lumps + one probe per static prop.
     let bsp = BspLighting::load(&cfg.bsp_dir())?;
     let sky_probe = meta.sky_probe.map(|(p, c)| (p & 0xFFFFFF) | ((c & 0xFF) << 24));
-    let probe_ix = lighting::assign_probes(&bsp, &world.vertices, &world.indices, &world.draws, |m| world.materials[m as usize].lightmapped, |m| {
+    let probe_ix = lighting::assign_probes(&bsp, &world.vertices, &world.lighting, &world.indices, &world.draws, |m| world.materials[m as usize].lightmapped, |m| {
         if world.materials[m as usize].skybox { sky_probe } else { None }
     });
     let probe_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("probe vb"), contents: bytemuck::cast_slice(&probe_ix), usage: wgpu::BufferUsages::VERTEX });
@@ -353,6 +366,7 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     let vb_mb = (world.vertices.len() * 32) as f64 / 1e6;
     let tris = world.tri_count();
     world.vertices = Vec::new();
+    world.lighting = Vec::new();
     world.indices = Vec::new();
     progress.set(0.3);
 
@@ -419,6 +433,7 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     let def_spec = solid(device, queue, [56, 56, 56, 255], F::Rgba8UnormSrgb, "spec 0.04");
     let one = solid(device, queue, [255; 4], F::Rgba8Unorm, "ao 1");
     let black = solid(device, queue, [0, 0, 0, 255], F::Rgba8UnormSrgb, "black");
+    let grey = solid(device, queue, [128, 128, 128, 255], F::Rgba8Unorm, "detail 0.5");
 
     let mat_groups: Vec<wgpu::BindGroup> = world
         .materials
@@ -440,6 +455,8 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
             let spec2 = get("spec2", Kind::Spec);
             let mask = get("blend", Kind::Gloss);
             let detail_n = get("detail_normal", Kind::Normal);
+            let detail = get("detail", Kind::Detail);
+            let detail2 = get("detail2", Kind::Detail);
             let f2 = |k: &str, d: [f32; 2]| -> [f32; 2] {
                 let a = e[k].as_array();
                 let c = |i: usize| a.and_then(|a| a.get(i)).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(d[i]);
@@ -448,11 +465,37 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
             let f1 = |k: &str, d: f32| e[k].as_f64().map(|x| x as f32).unwrap_or(d);
             let (rx, ry, t1) = (f2("uv1RotScaleX", [1.0, 0.0]), f2("uv1RotScaleY", [0.0, 1.0]), f2("uv1Translate", [0.0, 0.0]));
             let (rx2, ry2, t2) = (f2("uv2RotScaleX", [1.0, 0.0]), f2("uv2RotScaleY", [0.0, 1.0]), f2("uv2Translate", [0.0, 0.0]));
+            let mut uv_rs = [[1.0, 0.0, 0.0, 1.0]; 5];
+            let mut uv_tr = [[0.0; 4]; 5];
+            for n in 0..5 {
+                let (x, y, t) = (f2(&format!("uv{}RotScaleX", n + 1), [1.0, 0.0]), f2(&format!("uv{}RotScaleY", n + 1), [0.0, 1.0]), f2(&format!("uv{}Translate", n + 1), [0.0, 0.0]));
+                uv_rs[n] = [x[0], x[1], y[0], y[1]];
+                uv_tr[n] = [t[0], t[1], 0.0, 0.0];
+            }
             let two_layer = albedo2.is_some();
             // blended "transparent" overlays (e.g. sand over the range floor): opacity = (1 - blend) * albedo alpha
             let overlay = !two_layer && m.alpha_mode == 2 && mask.is_some();
             // a tiny layer-0 UV scale means the shader maps layer 0 from world position (terrain-style)
             let planar = (two_layer || overlay) && (rx[0].abs() + rx[1].abs()) < 0.05;
+            // UV per texture: read from the material's pixel shader by build_materials.py (uv_route). Without one (no PS
+            // in the extraction) layer 0 goes through uv1 (world-planar on terrain-scale blends), layer 1 uses the mesh
+            // UV, the overlay mask follows layer 0, and the detail maps go through uv2.
+            let l0 = 1 | ((planar as u32) << 3);
+            let mut route = [[0u32; 4]; 4];
+            for (k, slot) in ROUTE_SLOTS.iter().enumerate() {
+                let def = match *slot {
+                    "albedo" | "normal" | "gloss" | "spec" | "ao" => l0,
+                    "blend" if overlay => l0,
+                    "detail_normal" | "detail" | "detail2" => 2 | ((planar as u32) << 3),
+                    _ => 0,
+                };
+                let r = &e["uv_route"][*slot];
+                let code = match (r[0].as_u64(), r[1].as_str()) {
+                    (Some(i), Some(b)) => i as u32 | (((b == "planar") as u32) << 3),
+                    _ => def,
+                };
+                route[k / 4][k % 4] = code;
+            }
             if m.alpha_mode == 2 && std::env::var_os("R5_LOG_BLEND").is_some() {
                 log::info!("blend mat {} overlay={overlay} two_layer={two_layer} mask={} json_blend={}", m.name, mask.is_some(), e["blend"]);
             }
@@ -467,7 +510,10 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
                     let c = |i: usize, d: f32| a.and_then(|a| a.get(i)).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(d);
                     [c(0, 0.0), c(1, 1.0), c(2, 1.0), 0.0]
                 },
-                blend: [if overlay { if e["old_style"].as_bool().unwrap_or(false) { 3.0 } else { 2.0 } } else { two_layer as u32 as f32 }, f1("blend_ramp", 3.0), planar as u32 as f32, detail_n.is_some() as u32 as f32],
+                // overlay opacity: 2 = (1 - blend) * alpha, the transparent layer-blend PS (0x937D8E4BC98DD7A9), also for the old-style
+                // _col/_nml/_gls/_bm overlays with a real _bm mask (road tracks, erosion; their PS isn't extracted, but the rule
+                // matches R5Flowstate: docs/apex-lighting.md 1.2); 3 = blend * alpha for overlays whose mask slot is a guess
+                blend: [if overlay { if e["blend_inferred"].as_bool().unwrap_or(false) { 3.0 } else { 2.0 } } else { two_layer as u32 as f32 }, f1("blend_ramp", 3.0), planar as u32 as f32, detail_n.is_some() as u32 as f32],
                 uv1: [rx[0], rx[1], ry[0], ry[1]],
                 uv_t: [t1[0], t1[1], t2[0], t2[1]],
                 uv2: [rx2[0], rx2[1], ry2[0], ry2[1]],
@@ -477,6 +523,11 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
                 // a missing value means the dielectric default 0.04, not tint()'s 1.0 (F0 = 1 lit them as white mirrors)
                 perf_spec: { let t = spec_const(&e["perf_spec"]); [t[0], t[1], t[2], (!std::ptr::eq(spec, &def_spec)) as u32 as f32] },
                 perf_spec2: spec_const(&e["perf_spec2"]),
+                uv_rs,
+                uv_tr,
+                route,
+                // c_uberFeatureFlags bit 2: detail2 is overlaid like layer 0's detail (else albedo2 * detail2 * 2)
+                detail: [detail.is_some() as u32 as f32, detail2.is_some() as u32 as f32, ((e["feature_flags"].as_u64().unwrap_or(0) & 4) != 0) as u32 as f32, 0.0],
             };
             let ub = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mat"), contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM });
             device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -496,6 +547,8 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
                     tv(10, spec2.unwrap_or(&def_spec)),
                     tv(11, mask.unwrap_or(&one)),
                     tv(12, detail_n.unwrap_or(&flat_n)),
+                    tv(13, detail.unwrap_or(&grey)),
+                    tv(14, detail2.unwrap_or(&grey)),
                 ],
             })
         })

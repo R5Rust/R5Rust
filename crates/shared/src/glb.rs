@@ -80,6 +80,10 @@ pub struct World {
     pub indices: Vec<u32>,
     /// Only filled in `Full` mode.
     pub vertices: Vec<Vertex>,
+    /// Per vertex (parallel to `vertices`), from export-map's `_LIGHTING` attribute: a static prop's own light
+    /// probe (bits 0-23) + env cubemap (bits 24-31); u32::MAX where the glb has none (world geometry). Empty when
+    /// no primitive carries it (older exports).
+    pub lighting: Vec<u32>,
     pub draws: Vec<Draw>,
     pub materials: Vec<Material>,
     pub images: Vec<ImageRef>,
@@ -205,6 +209,20 @@ impl<'a> Gltf<'a> {
         out
     }
 
+    /// Reads a SCALAR u32 accessor raw (no float conversion, which would lose bits above 2^24).
+    fn read_u32(&self, idx: usize) -> Option<Vec<u32>> {
+        let acc = &self.j["accessors"][idx];
+        if acc["componentType"].as_u64() != Some(5125) {
+            return None;
+        }
+        let count = acc["count"].as_u64().unwrap_or(0) as usize;
+        let bv = &self.j["bufferViews"][acc["bufferView"].as_u64().unwrap_or(0) as usize];
+        let base = bv["byteOffset"].as_u64().unwrap_or(0) as usize + acc["byteOffset"].as_u64().unwrap_or(0) as usize;
+        let stride = bv["byteStride"].as_u64().map(|s| s as usize).unwrap_or(4);
+        self.bin.get(base..base + count.saturating_sub(1) * stride + 4)?;
+        Some((0..count).map(|i| u32::from_le_bytes(self.bin[base + i * stride..base + i * stride + 4].try_into().unwrap())).collect())
+    }
+
     fn read_indices(&self, idx: usize) -> Vec<u32> {
         let acc = &self.j["accessors"][idx];
         let count = acc["count"].as_u64().unwrap_or(0) as usize;
@@ -229,6 +247,7 @@ struct PrimOut {
     pos: Vec<[f32; 3]>,
     idx: Vec<u32>,
     verts: Vec<Vertex>,
+    lighting: Option<Vec<u32>>,
 }
 
 fn parse_materials(j: &Value) -> Vec<Material> {
@@ -308,7 +327,9 @@ pub fn load_world(path: &Path, mode: Mode, skip_blend: bool) -> Result<World, St
             let idx = g.read_indices(p["indices"].as_u64()? as usize);
             let pos: Vec<[f32; 3]> = posf.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
             let mut verts = Vec::new();
+            let mut lighting = None;
             if full {
+                lighting = a["_LIGHTING"].as_u64().and_then(|i| g.read_u32(i as usize)).filter(|l| l.len() == n);
                 let nrm = a["NORMAL"].as_u64().map(|i| g.read_f32(i as usize, 3));
                 let uv0 = a["TEXCOORD_0"].as_u64().map(|i| g.read_f32(i as usize, 2));
                 let uv1 = a["TEXCOORD_1"].as_u64().map(|i| g.read_f32(i as usize, 2));
@@ -337,7 +358,7 @@ pub fn load_world(path: &Path, mode: Mode, skip_blend: bool) -> Result<World, St
                     verts.push(v);
                 }
             }
-            Some(PrimOut { material: matid as u32, alpha, pos: if full { Vec::new() } else { pos }, idx, verts })
+            Some(PrimOut { material: matid as u32, alpha, pos: if full { Vec::new() } else { pos }, idx, verts, lighting })
         })
         .collect();
 
@@ -357,7 +378,18 @@ pub fn load_world(path: &Path, mode: Mode, skip_blend: bool) -> Result<World, St
     if full {
         vertices.reserve(acc as usize);
     }
+    let mut lighting: Vec<u32> = Vec::new();
+    let any_lighting = prims.iter().any(|p| p.lighting.is_some());
+    if any_lighting {
+        lighting.reserve(acc as usize);
+    }
     for p in prims.iter_mut() {
+        if any_lighting {
+            match p.lighting.take() {
+                Some(l) => lighting.extend_from_slice(&l),
+                None => lighting.resize(lighting.len() + p.verts.len(), u32::MAX),
+            }
+        }
         if full {
             vertices.append(&mut p.verts);
         } else {
@@ -409,6 +441,7 @@ pub fn load_world(path: &Path, mode: Mode, skip_blend: bool) -> Result<World, St
         positions,
         indices,
         vertices,
+        lighting,
         draws,
         materials,
         images,

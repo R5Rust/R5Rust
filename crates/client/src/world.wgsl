@@ -72,6 +72,10 @@ struct Mat {
     layer2: vec4<f32>,         // x has gloss2, y has spec2, z perf gloss L0, w perf gloss L1
     perf_spec: vec4<f32>,      // rgb L0 spec constant, w has spec texture
     perf_spec2: vec4<f32>,
+    uv_rs: array<vec4<f32>, 5>,  // c_uv1..5 RotScaleX.xy, RotScaleY.xy
+    uv_tr: array<vec4<f32>, 5>,  // c_uv1..5 Translate.xy
+    route: array<vec4<u32>, 4>,  // UV per texture slot (R_*): uv index 0..5 (0 = untransformed) | 8 world-planar
+    detail: vec4<f32>,           // x has detail (L0), y has detail2 (L1), z detail2 overlaid (else 2x multiply)
 };
 @group(1) @binding(0) var<uniform> mt: Mat;
 @group(1) @binding(1) var albedo_tex: texture_2d<f32>;
@@ -86,6 +90,42 @@ struct Mat {
 @group(1) @binding(10) var spec2_tex: texture_2d<f32>;
 @group(1) @binding(11) var blend_tex: texture_2d<f32>;
 @group(1) @binding(12) var detail_n_tex: texture_2d<f32>;
+@group(1) @binding(13) var detail_tex: texture_2d<f32>;
+@group(1) @binding(14) var detail2_tex: texture_2d<f32>;
+
+// texture slots, in loader.rs ROUTE_SLOTS order
+const R_ALBEDO: u32 = 0u;
+const R_NORMAL: u32 = 1u;
+const R_GLOSS: u32 = 2u;
+const R_SPEC: u32 = 3u;
+const R_AO: u32 = 4u;
+const R_ALBEDO2: u32 = 5u;
+const R_NORMAL2: u32 = 6u;
+const R_GLOSS2: u32 = 7u;
+const R_SPEC2: u32 = 8u;
+const R_BLEND: u32 = 9u;
+const R_DETAIL_N: u32 = 10u;
+const R_DETAIL: u32 = 11u;
+const R_DETAIL2: u32 = 12u;
+
+// The UV a texture slot is sampled with, as the material's own PS does it (apex-lighting.md section 1.1): the mesh UV
+// or world (x, -y), optionally through one of the c_uv1..5 transforms.
+fn route_uv(slot: u32, uv0: vec2<f32>, planar: vec2<f32>) -> vec2<f32> {
+    let code = mt.route[slot / 4u][slot % 4u];
+    let b = select(uv0, planar, (code & 8u) != 0u);
+    let n = code & 7u;
+    if (n == 0u) { return b; }
+    return xform(b, mt.uv_rs[n - 1u], mt.uv_tr[n - 1u].xy);
+}
+
+// detail albedo overlay (blend PS 0x2FBB46BF988A98AC, 0x937D8E4BC98DD7A9): Photoshop overlay in gamma-2 space,
+// detail 128/255 = neutral; the multiply branch is taken for all channels if any detail channel is < 0.5
+fn detail_overlay(a: vec3<f32>, d_in: vec3<f32>) -> vec3<f32> {
+    let d = clamp(d_in - vec3<f32>(0.001961), vec3<f32>(0.0), vec3<f32>(1.0));
+    let s = sqrt(max(a, vec3<f32>(0.0)));
+    let r = select(1.0 - 2.0 * (1.0 - d) * (1.0 - s), 2.0 * d * s, any(d < vec3<f32>(0.5)));
+    return r * r;
+}
 
 // tangent frame from screen derivatives of a UV set; N = normalize(T*x + B*y + Nvtx)
 fn tbn_normal(nv: vec3<f32>, rel: vec3<f32>, uv: vec2<f32>, n2: vec2<f32>) -> vec3<f32> {
@@ -276,44 +316,55 @@ fn sky_term(n: vec3<f32>, sky_vec: vec3<f32>) -> f32 {
 }
 
 @fragment
-fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    // ---- material (section 1). Layer 0 goes through c_uv1 (world-planar for terrain blends: (x, -y)),
-    // layer 1 and the blend mask use the mesh UV (blend PS 0x15B60B41971F5517).
+fn fs_main(i: VOut) -> @location(0) vec4<f32> {
+    // ---- material (section 1). Every texture uses the UV its PS routes it through (route_uv): terrain blends map
+    // their layers from world position, other materials from the mesh UV.
     let wp0 = i.rel + fr.cam_pos.xyz;
-    let planar_base = vec2<f32>(wp0.x, -wp0.y);
-    let base_uv = select(i.uv0, planar_base, mt.blend.z > 0.5);
-    let uv_l0 = xform(base_uv, mt.uv1, mt.uv_t.xy);
-    let uv_d = xform(base_uv, mt.uv2, mt.uv_t.zw);
-    let base = textureSample(albedo_tex, mat_samp, uv_l0);
-    var albedo = base.rgb * mt.color.rgb * mt.albedo_tint.rgb;
+    let pl = vec2<f32>(wp0.x, -wp0.y);
+    let uv_alb = route_uv(R_ALBEDO, i.uv0, pl);
+    let uv_nrm = route_uv(R_NORMAL, i.uv0, pl);
+    let uv_nrm2 = route_uv(R_NORMAL2, i.uv0, pl);
+    let base = textureSample(albedo_tex, mat_samp, uv_alb);
+    var base_rgb = base.rgb;
+    // the detail map is only applied where its formula was read from the shader: two-layer blends + layer-blend overlays
+    // (mt is uniform, so sampling inside these branches stays in uniform control flow)
+    if (mt.blend.x > 0.5 && mt.blend.x < 2.5 && mt.detail.x > 0.5) {
+        base_rgb = detail_overlay(base_rgb, textureSample(detail_tex, mat_samp, route_uv(R_DETAIL, i.uv0, pl)).rgb);
+    }
+    var albedo = base_rgb * mt.color.rgb * mt.albedo_tint.rgb;
     var vtx = vec3<f32>(1.0);
     if (mt.params.w > 0.5) {
         vtx = pow(abs(i.col.rgb), vec3<f32>(2.2));
         albedo *= vtx;
     }
-    var n2 = textureSample(normal_tex, mat_samp, uv_l0).rg * 2.867661 - 1.439453;
-    let dn = textureSample(detail_n_tex, mat_samp, uv_d).rg * 2.867661 - 1.439453;
+    var n2 = textureSample(normal_tex, mat_samp, uv_nrm).rg * 2.867661 - 1.439453;
+    let dn = textureSample(detail_n_tex, mat_samp, route_uv(R_DETAIL_N, i.uv0, pl)).rg * 2.867661 - 1.439453;
     if (mt.blend.w > 0.5) { n2 += dn; }
-    var gloss = textureSample(gloss_tex, mat_samp, uv_l0).r;
-    var f0 = textureSample(spec_tex, mat_samp, uv_l0).rgb;
+    var gloss = textureSample(gloss_tex, mat_samp, route_uv(R_GLOSS, i.uv0, pl)).r;
+    var f0 = textureSample(spec_tex, mat_samp, route_uv(R_SPEC, i.uv0, pl)).rgb;
     if (mt.blend.x > 0.5 && mt.perf_spec.w < 0.5) { f0 = mt.perf_spec.rgb; }
-    let ao_s = textureSample(ao_tex, mat_samp, uv_l0).r;
+    let ao_s = textureSample(ao_tex, mat_samp, route_uv(R_AO, i.uv0, pl)).r;
     let emis_t = textureSample(emis_tex, mat_samp, i.uv0).rgb;
-    let alb2 = textureSample(albedo2_tex, mat_samp, i.uv0).rgb;
-    let n2b = textureSample(normal2_tex, mat_samp, i.uv0).rg * 2.867661 - 1.439453;
-    let gloss2 = textureSample(gloss2_tex, mat_samp, i.uv0).r;
-    let spec2 = textureSample(spec2_tex, mat_samp, i.uv0).rgb;
-    let mask = textureSample(blend_tex, mat_samp, i.uv0).r;
-    let mask_l0 = textureSample(blend_tex, mat_samp, uv_l0).r;
+    var alb2 = textureSample(albedo2_tex, mat_samp, route_uv(R_ALBEDO2, i.uv0, pl)).rgb;
+    if (mt.detail.y > 0.5) {
+        let det2 = textureSample(detail2_tex, mat_samp, route_uv(R_DETAIL2, i.uv0, pl)).rgb;
+        alb2 = select(alb2 * clamp(det2 - vec3<f32>(0.001961), vec3<f32>(0.0), vec3<f32>(1.0)) * 2.0, detail_overlay(alb2, det2), mt.detail.z > 0.5);
+    }
+    let n2b = textureSample(normal2_tex, mat_samp, uv_nrm2).rg * 2.867661 - 1.439453;
+    let gloss2 = textureSample(gloss2_tex, mat_samp, route_uv(R_GLOSS2, i.uv0, pl)).r;
+    let spec2 = textureSample(spec2_tex, mat_samp, route_uv(R_SPEC2, i.uv0, pl)).rgb;
+    let mask = textureSample(blend_tex, mat_samp, route_uv(R_BLEND, i.uv0, pl)).r;
     let lm0 = textureSample(lm0_tex, lm_samp, i.uv1);
     let lm1 = textureSample(lm1_tex, lm_samp, i.uv1);
     let vis_a = textureSample(rtl_vis, lm_samp, vec2<f32>(i.uv1.x, i.uv1.y * 0.5)).rg;
     let vis_b = textureSample(rtl_vis, lm_samp, vec2<f32>(i.uv1.x, i.uv1.y * 0.5 + 0.5)).rg;
 
-    var nv = normalize(i.nrm + vec3<f32>(0.0, 0.0, 1e-6));
-    if (!front) { nv = -nv; }
-    var n = tbn_normal(nv, i.rel, uv_l0, n2);
-    let n_l1 = tbn_normal(nv, i.rel, i.uv0, n2b);
+    // No back-face flip: neither the world (wldc) nor the prop (rgdp) PS reads SV_IsFrontFace, so a double-sided
+    // surface is lit with its vertex normal on both sides. Foliage relies on it (grass normals point up; flipped,
+    // the back of every blade faced the ground and went black under its dim per-prop probe).
+    let nv = normalize(i.nrm + vec3<f32>(0.0, 0.0, 1e-6));
+    var n = tbn_normal(nv, i.rel, uv_nrm, n2);
+    let n_l1 = tbn_normal(nv, i.rel, uv_nrm2, n2b);
     if (mt.blend.x > 0.5 && mt.blend.x < 1.5) {
         // blend = saturate(ramp * (mask - 1) + vertexAlpha * (ramp + 1)); every layer property lerps
         let ramp = mt.blend.y;
@@ -325,6 +376,10 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
         f0 = mix(f0, select(mt.perf_spec2.rgb, spec2, mt.layer2.y > 0.5), bl);
     }
 
+    if (mt.blend.x > 1.5 && mt.blend.x < 2.5) {
+        // transparent overlay (PS 0x937D8E4BC98DD7A9): roughness = lerp(1 - gloss, 1, blend), rough where it fades out
+        gloss *= 1.0 - clamp(mt.blend.y * (mask - 1.0) + i.col.a * (mt.blend.y + 1.0), 0.0, 1.0);
+    }
     let r = max(1.0 - gloss, 0.04);
     var s: Surf;
     s.n = n;
@@ -423,13 +478,14 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
     var a = base.a * mt.color.a;
     if (mt.blend.x > 1.5) {
         let ramp = mt.blend.y;
-        let bl = clamp(ramp * (mask_l0 - 1.0) + i.col.a * (ramp + 1.0), 0.0, 1.0);
+        let bl = clamp(ramp * (mask - 1.0) + i.col.a * (ramp + 1.0), 0.0, 1.0);
         if (mt.blend.x < 2.5) {
-            // transparent overlay (PS 0x937D8E4BC98DD7A9 / 0x954097DFD1711C57): opacity = (1 - blend) * albedo.a
+            // transparent layer-blend overlay (PS 0x937D8E4BC98DD7A9 / 0x954097DFD1711C57): opacity = (1 - blend) * albedo.a.
+            // Also the old-style _col/_nml/_gls/_det/_bm road tracks + erosion sand (same slot layout, PS not extracted).
             a *= 1.0 - bl;
         } else {
-            // old-style _col/_nml/_gls/_bm translucent blend (its PS isn't in the extraction): vertex alpha is painted
-            // where the layer shows, so opacity = blend. Inferred from the vertex paint + the R5Flowstate reference.
+            // old-style overlays whose mask slot is a guess (sand_blend_firing_range, decals): opacity = blend, the
+            // closer of the two rules on the map00 reference. Unverified against a shader.
             a *= bl;
         }
     }
@@ -439,7 +495,7 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
     } else if (mt.params.z < 0.5) {
         a = 1.0;
     }
-    if (fr.misc.w > 7.5 && fr.misc.w < 8.5) { return vec4<f32>(vec3<f32>(a, i.col.a, mask_l0), 1.0); }
+    if (fr.misc.w > 7.5 && fr.misc.w < 8.5) { return vec4<f32>(vec3<f32>(a, i.col.a, mask), 1.0); }
     if (fr.misc.w > 8.5 && fr.misc.w < 9.5) { return vec4<f32>(i.col.r, i.col.a, mt.blend.x * 0.5, 1.0); }
     return vec4<f32>(c, a);
 }

@@ -259,13 +259,18 @@ impl GpuLighting {
     }
 }
 
-/// One probe per static-prop instance, like the game: instances aren't kept in world.glb, so each connected
-/// component of a non-lightmapped draw stands in for one, and takes the probe nearest its centre.
+/// One probe per static-prop instance, like the game. `exported` (world.glb's `_LIGHTING`, parallel to `vertices`,
+/// may be empty) carries each prop's own probe from LUMP 0x66 + its cubemap, which is what the game binds
+/// (docs/apex-lighting.md section 6). Vertices without it (older exports) fall back to the old guess: each connected
+/// component of a non-lightmapped draw stands in for an instance and takes the probe-tree probe nearest its centre.
 /// Returns per vertex: probe index in bits 0-23 (0xFFFFFF = none / lightmapped), cubemap index in bits 24-31.
 /// `fixed(material)`: a packed probe that overrides the lookup for every vertex of that material
 /// (the skybox vista's own probe).
-pub fn assign_probes(bsp: &BspLighting, vertices: &[shared::glb::Vertex], indices: &[u32], draws: &[shared::glb::Draw], lightmapped: impl Fn(u32) -> bool, fixed: impl Fn(u32) -> Option<u32>) -> Vec<u32> {
+#[allow(clippy::too_many_arguments)]
+pub fn assign_probes(bsp: &BspLighting, vertices: &[shared::glb::Vertex], exported: &[u32], indices: &[u32], draws: &[shared::glb::Draw], lightmapped: impl Fn(u32) -> bool, fixed: impl Fn(u32) -> Option<u32>) -> Vec<u32> {
     let n = vertices.len();
+    let probe_count = bsp.probes.len() as u32;
+    let own = |v: usize| exported.get(v).copied().filter(|&l| l != u32::MAX && (l & 0xFF_FFFF) < probe_count);
     let mut parent: Vec<u32> = (0..n as u32).collect();
     fn find(p: &mut [u32], mut x: u32) -> u32 {
         while p[x as usize] != x {
@@ -280,6 +285,9 @@ pub fn assign_probes(bsp: &BspLighting, vertices: &[shared::glb::Vertex], indice
             continue;
         }
         for t in indices[d.first_index as usize..(d.first_index + d.index_count) as usize].chunks_exact(3) {
+            if own(t[0] as usize).is_some() {
+                continue;
+            }
             for &v in t {
                 prop_vertex[v as usize] = true;
             }
@@ -322,6 +330,7 @@ pub fn assign_probes(bsp: &BspLighting, vertices: &[shared::glb::Vertex], indice
     let mut out: Vec<u32> = (0..n)
         .into_par_iter()
         .map(|v| match roots[v] {
+            _ if own(v).is_some() => own(v).unwrap(),
             u32::MAX => 0xFFFFFF | (bsp.nearest_cubemap(vertices[v].pos) << 24),
             r => probe_of.get(&r).copied().unwrap_or(0xFFFFFF | (bsp.nearest_cubemap(vertices[v].pos) << 24)),
         })

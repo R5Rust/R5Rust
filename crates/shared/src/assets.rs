@@ -16,6 +16,8 @@ pub struct Config {
     pub height: u32,
     pub fullscreen: bool,
     pub vsync: bool,
+    /// Cap on a material texture's longest side. The extracted textures top out at the mips the install ships
+    /// (most 128-512, a few 1024-4096: the optional .opt.starpak mips are not in R5Flowstate), so 4096 = never cap.
     pub max_texture_size: u32,
     pub sensitivity: f32,
     pub fov: f32,
@@ -96,7 +98,7 @@ impl Default for Config {
             height: 900,
             fullscreen: false,
             vsync: false,
-            max_texture_size: 1024,
+            max_texture_size: 4096,
             sensitivity: 1.6,
             fov: 100.0,
             fly_speed: 1200.0,

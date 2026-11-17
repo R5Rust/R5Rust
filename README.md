@@ -73,7 +73,7 @@ sensitivity = 1.6     # Apex/Source scale (m_yaw 0.022)
 fov = 100             # horizontal at 4:3, like Apex
 fly_speed = 1200
 backend = "vulkan"    # vulkan | dx12 | gl (falls back through the others)
-max_texture_size = 1024
+max_texture_size = 4096  # never caps: the extracted textures stop at 4096 (most are 128-512)
 ```
 
 ## Screenshot / test mode (no window)
@@ -102,7 +102,16 @@ Full export (~2 min; the exporter's `../../../../apex` path dependencies only re
 `cd ..\export-map; cargo run --release -- --out D:\R5Rust\assets\maps\mp_rr_canyonlands_staging_mu1`. It applies each static
 prop's skin, and tags geometry in the glb material extras: `noShadow` (prop flag 0x10, decal meshes: never in the shadow
 cascades, `docs/apex-lighting.md`) and `skybox` (prop flag 0x40: drawn only from the sky camera, `docs/skybox.md`).
-Older world.glb files without those extras still load. The previous export is kept as `world.v1.glb` / `meta.v1.json`.
+It also writes each static prop's own light probe (lump 0x66) + cubemap on its vertices (`_LIGHTING`), which is how
+the game lights props (`docs/apex-lighting.md` section 6). Older world.glb files without those extras still load.
+Each export first renames the previous `world.glb` / `meta.json` / `collision.bin` to `world.prev.glb` / `meta.prev.json` /
+`collision.prev.bin` (one generation back). The export before per-prop probes + LOD0 is kept as `*.pre-probes.*`.
+
+Detail is uniform by default: every static prop at LOD0 (14.9 M prop triangles, 15.1 M total; `--prop-tris <n>`, default
+16 M, drops the costliest models a LOD at a time, every copy alike, if a map goes over; `--far-lods` brings back the old
+lower LODs outside the play area), and one texture cap for world and props (`--tex`, default 4096; `--prop-tex` only to
+override). The cap rarely matters: R5Flowstate ships no `.opt.starpak`, so every texture stops at its permanent +
+mandatory-stream mips (most 128-512 px, a handful 1024-4096), the same mips the real game shows on this install.
 
 Collision only (about 20 s, reuses the last export's BSP + models):
 `cd ..\export-map; cargo run --release -- --collision --out D:\R5Rust\assets\maps\mp_rr_canyonlands_staging_mu1`.

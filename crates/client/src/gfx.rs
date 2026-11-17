@@ -274,6 +274,9 @@ impl Gfx {
                 layout_entry(10, tex_ty()),
                 layout_entry(11, tex_ty()),
                 layout_entry(12, tex_ty()),
+                // detail albedo (layer 0, layer 1)
+                layout_entry(13, tex_ty()),
+                layout_entry(14, tex_ty()),
             ],
         });
         let post_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

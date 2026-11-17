@@ -16,6 +16,8 @@ pub enum Kind {
     Spec,
     Ao,
     Emissive,
+    /// detail albedo: RGB around 0.5 = neutral, read linearly (the shader overlays it in gamma-2 space)
+    Detail,
 }
 
 impl Kind {
@@ -26,6 +28,7 @@ impl Kind {
             Kind::Normal => F::Bc5RgUnorm,
             Kind::Gloss | Kind::Ao => F::Bc4RUnorm,
             Kind::Spec | Kind::Emissive => F::Bc1RgbaUnormSrgb,
+            Kind::Detail => F::Bc1RgbaUnorm,
         }
     }
     fn block_bytes(self) -> usize {
@@ -111,7 +114,7 @@ fn encode_level(img: &RgbaImage, kind: Kind) -> Vec<u8> {
     let raw = p.as_raw();
     match kind {
         Kind::Albedo => intel_tex_2::bc7::compress_blocks(&intel_tex_2::bc7::alpha_ultra_fast_settings(), &intel_tex_2::RgbaSurface { data: raw, width: w, height: h, stride: w * 4 }),
-        Kind::Spec | Kind::Emissive => intel_tex_2::bc1::compress_blocks(&intel_tex_2::RgbaSurface { data: raw, width: w, height: h, stride: w * 4 }),
+        Kind::Spec | Kind::Emissive | Kind::Detail => intel_tex_2::bc1::compress_blocks(&intel_tex_2::RgbaSurface { data: raw, width: w, height: h, stride: w * 4 }),
         Kind::Normal => {
             let rg: Vec<u8> = raw.chunks_exact(4).flat_map(|c| [c[0], c[1]]).collect();
             intel_tex_2::bc5::compress_blocks(&intel_tex_2::RgSurface { data: &rg, width: w, height: h, stride: w * 2 })

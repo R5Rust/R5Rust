@@ -57,6 +57,50 @@ N   = normalize(n2.x * T + n2.y * B + Nvtx);    // T,B,Nvtx unnormalised interpo
   ```
 - The base world variant `0xE156…` (dev_gray etc.) is the same code without the AO texture or the vertex-colour tint [H].
 
+### 1.1 Which UV each texture uses [H]
+Every texture is sampled with either the raw mesh UV (`v0.xy` = TEXCOORD0 / 16384 from the VS, no transform) or a
+`c_uvN` transform (N = 1..5, `CBufUberStatic`: `c_uvNRotScaleX/Y` + `c_uvNTranslate`, `uv = dot(p + T, RS)`) of
+either the mesh UV or world position `p = (x, -y)`. **The routing differs per PS**, so `export-map/build_materials.py`
+reads it from each material's own DXBC (`uv_route` in materials.json: slot -> `[N, "planar"|"mesh"]`, N = 0 untransformed):
+
+| PS | layer 0 (alb/nml/gls) | layer 1 | layerBlend mask | detail / detailNormal | detail2 / detailNormal2 |
+|---|---|---|---|---|---|
+| `0x6DDE96D0617FFC89` sand_desert_01_sand_desert_02 (range floor) | uv1 planar | uv1 planar | uv1 planar | uv2 planar | - |
+| `0x2FBB46BF988A98AC` sand_desert_02_dirt_desert_05 (road floor) | uv2 planar | uv2 planar | uv1 planar | uv3 planar | uv4 planar |
+| `0xF96FF9520440F420` sand_desert_02_to_s2s_metal_trims | uv1 planar | mesh | mesh | uv2 planar | - |
+| `0x937D8E4BC98DD7A9` sand_desert_02_bm_transparent (overlay) | uv1 planar | - | uv1 planar | uv2 planar | - |
+| plain world / props (`0x393C…`, `0x355A…`, …) | mesh | - | - | - | - |
+
+r5rust used to sample layer 1 and the mask on the mesh UV and layer 0 through uv1 for every blend, which stretched the
+road floor's gravel dirt (`dirt_desert_05`) into smooth brown bands. 345 of 434 materials get a route; the rest
+(PS not in the extraction) keep that old default.
+Some foliage/scrolling PSes read `c_uvN` in **rotation form** (`sincos(c_uvNRotScaleX.x)`): RotScaleX = (angle,
+scaleU), RotScaleY = (centre as two packed f16, scaleV), Translate = scroll speed. build_materials.py rewrites those as
+the equivalent matrix (scroll dropped); read as a matrix, `tree_fir_large_leaves_01`'s identity became `(v, v)` and
+the pine branches rendered as streaked solid cards.
+
+**Detail albedo** (blend PSes above) [H]: Photoshop overlay in gamma-2 space, `d = saturate(det - 0.5/255)`,
+`s = sqrt(albedo)`, `r = any(d < 0.5) ? 2*d*s : 1 - 2*(1-d)*(1-s)`, `albedo = r*r * tint`; 128/255 is neutral, the
+texture is UNORM. detail2 is overlaid the same way when `c_uberFeatureFlags & 4`, else `albedo2 * detail2 * 2`.
+
+### 1.2 Translucent overlays (`alphaMode` BLEND with a mask)
+`0x937D8E4BC98DD7A9` (transparent layer blend, e.g. `sand_desert_02_bm_transparent`) [H]:
+```hlsl
+blend   = saturate(ramp * (mask - 1) + vtxAlpha * (ramp + 1));
+opacity = (1 - blend) * albedo.a * c_opacity * instanceAlpha;     // colour is premultiplied by it before output
+rough   = max(lerp(1 - gloss, 1, blend), 0.04);
+F0      = c_L0_perfSpecColor;                                     // no spec texture
+```
+Old-style `_col/_nml/_gls/_det/_nml/_bm` overlays (`road_tracks_dry_03_blend_2_trans`, PS `0x19865A3619FC6126`;
+`sand_desert_erosion_01_bm_transparent`, PS `0xBED6B8166A731D51`) are not in the extraction, and their
+CBufUberStatic exports empty [M]. They have the same slot layout as `0x937D…`, and the same opacity rule matches
+R5Flowstate: at the `patch1` probe pose (dirt road under the catwalk) the road's column-luma profile correlates 0.88
+with the real shot using `1 - blend` and -0.27 using `blend`; mean road colour ours (196,174,142) vs real (197,175,142).
+At `patch2` (erosion sand) the region medians match only with `1 - blend` (147/175/179 vs real 147/173/178).
+With no constants, F0 is the dielectric 0.04 (a missing perf spec used to default to 1.0: white mirrors) and ramp 3.
+Overlays whose mask slot is only a guess (an unnamed 4th texture: `sand_blend_firing_range`, the decals) keep
+`opacity = blend`, the closer rule on `map00`; that one is unverified [L].
+
 ## 2. Lightmaps (world only)
 
 ### UV [H]
@@ -326,8 +370,27 @@ SH basis constant in the shader [H].
 | `static_light_weights[4]` u8 | → `packedLightData.x` bytes (weight/255 = baked visibility of that light at the probe) | H (shader) |
 | `static_light_indexes[4]` i16 | index into the same 0x8-flag list as 0x7A (max 403, -1 = none) → global index `+32` (the world RTL path adds 32 in-shader; the prop path does not, so the CPU must) | M |
 
-Probe selection is the k-d tree walk in 0x67/0x68 (see `rbsp` docs). The shader receives one probe per instance and no
-interpolation [H].
+The shader receives one probe per instance and no interpolation [H].
+
+### Which probe a static prop gets (2026-11-17) [H data]
+**Lump 0x66 `STATIC_PROP_LIGHTPROBE_INDEX`: one u32 per static prop record, an index into 0x65.** On staging_mu1 it has
+11198 entries (= props), values 0..10786, and lump 0x65 splits in two: probes **0..10786 are per-prop probes** baked
+for the props themselves, the remaining 41670 are what the k-d tree (0x67 nodes, 0x68 refs) points at (only 2 indices
+overlap). Per-prop probes are less directional (median |L1|/L0 0.62 vs 1.25 for tree probes; foliage probes often have
+L1 = 0) and their sun visibility agrees with the tree probe at the prop's origin 82% of the time. The env cubemap is the
+record's halfword 3 (`StaticProp::unknown_3`, values 0..15 = the 16 cubemaps of 0x2A; it is the nearest cubemap only
+34% of the time, so it is assigned, not computed). Flag 0x02 (USE_LIGHTING_ORIGIN) only moves where the bake sampled
+that probe; at runtime the index is all that matters.
+
+The k-d tree is for everything that isn't a static prop (dynamic props, characters, weapons). r5rust first walked the
+tree at each merged prop component's centre: on the firing-range tower and town kit (`firing_range_kit_mat_*`,
+`live_fire_*`) that landed on probes inside/behind the walls and they rendered black (indirect ~0, no sun).
+`export-map` now writes each prop's `0x66` probe | cubemap << 24 on every vertex (glb attribute `_LIGHTING`, u32);
+`lighting::assign_probes` uses it and keeps the tree walk only as a fallback for older exports.
+
+Neither the world (wldc) nor the prop (rgdp) PS reads `SV_IsFrontFace`: a double-sided surface is lit with its vertex
+normal on both sides [H]. Foliage needs this (grass normals point straight up); flipping the normal on back faces
+turned the back of every grass blade black under its dim per-prop probe.
 
 Difference to world: no AO texture or vertex colour in this PS; everything else (BRDF, sun/CSM, env, fog, outputs) is
 byte-identical code [H]. `sknp` (characters/weapons) was not analysed.
@@ -383,7 +446,7 @@ T = b2*sin(angle) + b1*cos(angle);     B = cross(N, T) * (bit31 ? -1 : 1);     /
 4. RTL page: upload IDs as `R32_UINT`, visibility as `BC5` of size w×2h. Build `s_globalLights[32+i]` from the flag-0x8
    worldlights in lump order, using the §4.4 mapping. Inverse-square (lump 0x20) lights have intensities around 1e4, so
    getting the flag wrong is obvious on screen.
-5. Props: one probe per instance; decode with ×1/8192 (calibrate L0 against the lightmap under the same light, the only
+5. Props: one probe per instance, the one lump 0x66 names (not a tree lookup); decode with ×1/8192 (calibrate L0 against the lightmap under the same light, the only
    unconfirmed scale). Pack the static-light indices +32.
 6. The cubemap reflection is multiplied by `CUBEMAPS_AMBIENT_RCP`. If the lump is zero, compute the reciprocal from the
    cubemap, or every reflection disappears.
