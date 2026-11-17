@@ -362,19 +362,32 @@ and 9 edge cross products.
 - It returns `fraction`, `endpos`, the hit `normal`, `startsolid` and `allsolid`.
 - Like Source's `DIST_EPSILON` (1/32), the box stops 1/32 short of the surface along the hit normal. A box resting
   on a floor sits 1/32 above it, and sliding along that floor does not count as a hit.
-- When a triangle ties on fraction, the trace keeps the one whose normal points most upward. This is the case on
-  floors built from many triangles and at ledge edges.
+- When triangles tie on fraction, the trace keeps the one the move goes into hardest (most negative `d·n`), then
+  the one whose normal points most upward (floors built from many triangles, ledge edges). Reporting the most
+  upward one first was wrong in a crease: a steep slope against a wall a fraction of a degree off-axis hit together
+  at fraction 0, the trace always named the slope, and TryPlayerMove never learned about the wall.
+- **Shell slack.** A box that starts inside the 1/32 shell of a triangle (where every hit and slide leaves it, give
+  or take float rounding) may move closer, down to 1/64 (`SHELL_SLACK`), without the move counting as a hit. The gap
+  stays positive, so it still never touches the triangle. Without it, a move clipped exactly parallel to a plane still
+  approached it by up to ~0.002 units, because `end = start + v*dt` is rounded to f32 at |x| ~ 10000 (ulp 1/1024),
+  and every such move was blocked at fraction 0. That was the "floating in mid-air against walls / on the grate ramp"
+  bug: velocity collapsed to (0, 0, -6.25) every tick next to steep (unwalkable) slopes.
 - **Triangles, not brushes.** The map is a triangle soup, so a box already overlapping a triangle at the start
   does not block (Quake's "startsolid, but you can get out" rule). The one exception is a move that goes deeper
   into that triangle's plane: it is blocked at fraction 0 and flagged `allsolid`, so an embedded box can walk out
-  but cannot fall through a floor.
+  but cannot fall through a floor. A move within about 3 degrees of the plane (`EMBED_GRAZE`, |d·n| < 0.05 |d|)
+  only grazes it and is not blocked, so a box embedded a hair into a near-vertical wall (that leans back by 0.2
+  degrees, say) can still fall down along it.
 - The capsule functions (`move_capsule`, `sweep_down`, `contacts`) are still in the file. Nothing in the sim uses
   them now.
 
 ## Approximated or skipped, and why
 
 - **TryPlayerMoveCore 0x140baeba0 and StepDownSlide 0x140baf900** have no spec yet; the docs only describe them as
-  calls. They are rebuilt as Source 2013's TryPlayerMove: 4 bumps, 5 clip planes, overbounce 1. StepDownSlide is
+  calls. They are rebuilt as Source 2013's TryPlayerMove: 4 bumps, 5 clip planes, overbounce 1, plus Quake 3's
+  PM_SlideMove nudge: when a bump hits a plane already in the list, the velocity is pushed out to at least 1 unit/s
+  away from every plane touched this move and the bump retraces (Q3 nudges along the re-hit plane only, which in a
+  crease just re-hits the other plane until the 4 bumps run out). StepDownSlide is
   a slide of up to 8 iterations that stops on the first upward face. StepMove's `Q` ground-plane argument is
   ignored.
 - **CheckAutoMantle 0x140b95a40** is only summarised from the decompile. Its gates are ported: the enable cvars,

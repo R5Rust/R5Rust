@@ -292,6 +292,22 @@ pub(super) fn try_player_move_core(col: &Collision, mn: Vec3, mx: Vec3, pos: &mu
             *vel = Vec3::ZERO;
             break;
         }
+        // Quake 3 PM_SlideMove: hitting a plane already in the list again means the clipped velocity runs parallel
+        // to it and only float rounding of the end point (f32 at |x| ~ 10000 has a 1/1024 ulp) brought the hull
+        // within the DIST_EPSILON shell. Nudge the velocity out by 1 unit/s and retrace. Q3 nudges along the re-hit
+        // plane only; in a crease that just re-hits the other plane on the next bump and the 4 bumps run out, so
+        // here the velocity leaves every plane touched this move at 1 unit/s or more. Without it a hull resting
+        // on a steep (unwalkable) slope, or in the crease of one and a wall, got fraction 0 on every bump and hung
+        // in the air.
+        if planes[..numplanes].iter().any(|p| p.dot(t.normal) > 0.99) {
+            for p in &planes[..numplanes] {
+                let vn = vel.dot(*p);
+                if vn < 1.0 {
+                    *vel += *p * (1.0 - vn);
+                }
+            }
+            continue;
+        }
         planes[numplanes] = t.normal;
         numplanes += 1;
         let mut i = 0;

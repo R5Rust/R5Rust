@@ -51,11 +51,9 @@ R5Flowstate (Octane; Lifeline can't lurch); `python plan.py --shots` + `run.ps1 
 Not yet staged to play\next (last staged build = cca4bb5).
 
 **Interrupted mid-work (uncommitted in the tree, unverified - review the diff before committing):**
-- `crates/shared/src/sim/step.rs` + examples `stuckdbg/hangscan/liftdbg/bumpdbg.rs`: fix for the player hanging mid-air
-  against walls / the ramp grate. Repro spots (feet): (-11019,811,1624) hangs forever at 5/8 yaws, (-9426,-74,961) never
-  lands, (-7825,-2282,578) hangs ~1.6 s. `cargo run --release -p shared --example stuckdbg -- x,y,z` (TRACE=1 per tick).
-  Cause seen: velocity collapses to (0,0,-6.25) every tick while "air" - hull pinned against a (likely leaning) face, every
-  downward move counted as "deeper into the plane". movecheck must stay 130/130.
+- DONE (mid-air hang fix, see docs/movement.md "Collision" and docs/collision.md "Mid-air hangs"): f32 rounding made
+  moves parallel to a steep slope hit it at fraction 0; fixed with trace shell slack, the crease tie-break and a Q3
+  nudge in TryPlayerMove. hangscan 300 -> 1 of 1944 runs, movecheck 130/130.
 - `crates/client/src/loader.rs`: fix for the near-white hard-edged terrain patches. They are blended overlay meshes
   (`road_tracks_dry_03_blend_2_trans`, `sand_desert_02_bm_transparent`, ...; vanish with R5_NOBLEND=1). Albedo, lightmap,
   env spec are fine; the overlay ends up lit far brighter than the floor under it. The opacity rules in world.wgsl
@@ -68,6 +66,15 @@ olive-green kit walls (`firing_range_kit_*` / `live_fire_*` materials) and build
 sky above the dome reads dark navy. Check those materials in materials.json (missing texture files? wrong role mapping
 for `albedoTexture`-style keys vs `col`?) with `--debug 3` at that pose.
 Also open: water much darker than the real game (map03/map11), skybox fog, D-lurch 256 vs real 263 (jump_grace_max?).
+
+## GitHub (2026-11-16)
+Private org **github.com/R5Rust**, split like R5Flowstate: `R5Rust` (game), `export-map` (export-map +
+build_materials.py at its root; r5ed via pinned git dep on R5Flowstate/r5ed), `r5f-probe` (r5f-probe at its
+root), `.github-private` (member-only org profile with screenshots). CafeFPS has read access to the three code repos.
+**Never push this local repo as-is:** its history contains extracted Apex models (`mapcache/*.glb`, now removed and
+gitignored but still in old commits). The published repos were built from filtered clones (git filter-branch removing
+mapcache + the split-out tools); to publish new work, re-run that split or copy the changes into clones of the org
+repos. Unfinished agent work lives on branch `wip/paused-agents` (unverified).
 
 ## Next (v2)
 1. `r5rust_ds`: UDP server running `shared::sim` at 60 Hz; client spawns it locally unless `--connect`.

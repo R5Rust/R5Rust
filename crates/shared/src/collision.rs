@@ -13,6 +13,15 @@ pub const AXIS_LEN: f32 = 40.0;
 pub const WALKABLE_Z: f32 = 0.7;
 /// Source/Apex DIST_EPSILON: hull traces stop this far short of a surface (along its normal).
 pub const DIST_EPSILON: f32 = 1.0 / 32.0;
+/// A hull that starts inside the DIST_EPSILON shell of a triangle (a hit or a slide left it there, give or take
+/// float rounding) may move closer, down to this gap, without the move counting as a hit. A move clipped parallel
+/// to a plane still approaches it by up to ~0.002 units at |x| ~ 10000 (f32 rounding of `end`), and without this
+/// slack every such move is blocked at fraction 0: the hull hangs in the air against steep slopes and in creases.
+/// The gap stays positive, so the hull still never touches the triangle.
+pub const SHELL_SLACK: f32 = DIST_EPSILON * 0.5;
+/// sin of the angle (about 3 degrees) under which a move counts as sliding along an embedded triangle's plane
+/// rather than going deeper into it (see `trace_hull`).
+pub const EMBED_GRAZE: f32 = 0.05;
 
 /// Result of [`Collision::trace_hull`] (the fields of Source's trace_t that movement reads).
 #[derive(Clone, Copy, Debug)]
@@ -447,8 +456,14 @@ impl Collision {
                         }
                     }
                     Sweep::Hit(f, n) => {
-                        // ties (common on flat floors made of many triangles) prefer the most upward normal
-                        if !hit || f < best - 1e-6 || (f <= best + 1e-6 && n.z > best_n.z) {
+                        // Ties: prefer the plane the move goes into hardest (the one actually blocking it), then the
+                        // most upward normal (flat floors made of many triangles). In a crease (a steep slope against
+                        // a wall a fraction of a degree off-axis) both planes hit at fraction 0; reporting only the
+                        // slope left TryPlayerMove clipping against it forever and never learning the wall.
+                        let tie = f <= best + 1e-6 && f >= best - 1e-6;
+                        let (into, best_into) = (d.dot(n), d.dot(best_n));
+                        let better = into < best_into - 1e-6 || (into <= best_into + 1e-6 && n.z > best_n.z);
+                        if !hit || f < best - 1e-6 || (tie && better) {
                             best = if f < best { f } else { best };
                             best_n = n;
                             hit = true;
@@ -461,6 +476,27 @@ impl Collision {
             out.fraction = best;
             out.normal = best_n;
             out.endpos = start + d * best;
+        }
+        out
+    }
+
+    /// Debug: what each nearby triangle does to a hull trace: (triangle, kind, fraction, normal), kind 0 = overlaps
+    /// at the start without blocking, 1 = overlaps and blocks (allsolid), 2 = swept hit.
+    pub fn trace_hull_detail(&self, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3) -> Vec<([Vec3; 3], u8, f32, Vec3)> {
+        let half = (maxs - mins) * 0.5;
+        let c0 = start + (mins + maxs) * 0.5;
+        let d = end - start;
+        let pad = Vec3::splat(DIST_EPSILON + 0.01);
+        let mut cand = Vec::new();
+        self.query_aabb(c0.min(c0 + d) - half - pad, c0.max(c0 + d) + half + pad, &mut cand);
+        let mut out = Vec::new();
+        for [a, b, c] in cand {
+            match sweep_box_tri(a - c0, b - c0, c - c0, half, d) {
+                Sweep::Miss => {}
+                Sweep::Start { blocks: None } => out.push(([a, b, c], 0, 0.0, Vec3::ZERO)),
+                Sweep::Start { blocks: Some(n) } => out.push(([a, b, c], 1, 0.0, n)),
+                Sweep::Hit(f, n) => out.push(([a, b, c], 2, f, n)),
+            }
         }
         out
     }
@@ -671,6 +707,10 @@ fn sweep_box_tri(p0: Vec3, p1: Vec3, p2: Vec3, h: Vec3, d: Vec3) -> Sweep {
             if da <= 0.0 {
                 return Sweep::Miss;
             }
+            // already inside the DIST_EPSILON shell and never getting closer than half of it: no contact
+            if lo < DIST_EPSILON && lo - da >= SHELL_SLACK {
+                return Sweep::Miss;
+            }
             let te = (lo - DIST_EPSILON) / da;
             if te > t_enter {
                 t_enter = te;
@@ -680,6 +720,9 @@ fn sweep_box_tri(p0: Vec3, p1: Vec3, p2: Vec3, h: Vec3, d: Vec3) -> Sweep {
         } else if hi <= 0.0 {
             solid_now = false;
             if da >= 0.0 {
+                return Sweep::Miss;
+            }
+            if -hi < DIST_EPSILON && -hi + da >= SHELL_SLACK {
                 return Sweep::Miss;
             }
             let te = (hi + DIST_EPSILON) / da;
@@ -696,13 +739,15 @@ fn sweep_box_tri(p0: Vec3, p1: Vec3, p2: Vec3, h: Vec3, d: Vec3) -> Sweep {
     }
     if solid_now {
         // embedded: block only a move that goes deeper into the triangle's plane (towards it from the side the
-        // box centre is on), so an embedded box can still walk out but can't fall through a floor
+        // box centre is on), so an embedded box can still walk out but can't fall through a floor. A move within
+        // EMBED_GRAZE of the plane only grazes along it: falling down a wall that leans back by a fraction of a
+        // degree is not "deeper", and blocking it pinned the hull in mid-air
         let l2 = tn.length_squared();
         if l2 > 1e-12 {
             let n = tn / l2.sqrt();
             let side = if p0.dot(n) > 0.0 { -1.0 } else { 1.0 }; // centre is at the origin
             let n = n * side;
-            if d.dot(n) < -1e-4 {
+            if d.dot(n) < -(1e-4f32).max(EMBED_GRAZE * d.length()) {
                 return Sweep::Start { blocks: Some(n) };
             }
         }

@@ -74,3 +74,18 @@ materials.
   picked.
 - (-14647,-6266,-1035) is `wraith_tt_water_opaque`, a water plane out of bounds. The game has no floor there
   (only the map box at z -37000), so you fall into it, as in Apex.
+
+## Mid-air hangs: how to check for them
+
+`cargo run --release -p shared --example stuckdbg -- x,y,z` drops the player at a spot, jumps, and holds forward and
+sprint at 8 yaws for 2 s, printing height and state every 12 ticks. A flat run of "air" heights is a hang.
+`TRACE=1` (`TRACE_YAW`, `TRACE_T`, `TICKS`) prints every tick, and on ticks with no movement every triangle touching
+the trace along the velocity, with its fraction and normal. A start inside geometry is moved to the nearest free spot
+first and says so, because reported spots are rounded to whole units and can land a hull inside a wall.
+
+`cargo run --release -p shared --example hangscan [-- x,y,z ...]` drops the player on a 9x9 grid, 24 units apart, around
+each spot (default: the three reported ones) and counts hangs: 30+ ticks with no z change while not on the ground.
+`VERBOSE=1` lists them. On 2026-11-17: 300 of 1944 runs hung before the shell slack / crease / Q3 nudge fixes
+(docs/movement.md "Collision"), 1 after. That one is a real wedge (a 54 degree slope running into the underside edge
+of a ledge, narrower than the hull) that frees itself after 30 ticks.
+
