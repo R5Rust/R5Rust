@@ -19,8 +19,10 @@ pub struct DrawCmd {
     pub first_index: u32,
     pub index_count: u32,
     pub material: u32,
-    /// pipeline key: alpha_mode * 2 + double_sided
+    /// pipeline key: alpha_mode * 2 + double_sided, 6 = sky material
     pub key: u8,
+    /// index into Gfx::world_pipes: `key`, or `key + DECAL_PIPES` for the decal depth-bias copy of it
+    pub pipe: u8,
     /// world-space bounds of this chunk
     pub min: [f32; 3],
     pub max: [f32; 3],
@@ -30,9 +32,21 @@ pub struct DrawCmd {
     pub skybox: bool,
 }
 
+/// world_pipes offset of the pipelines with Apex's decal depth bias (gfx.rs)
+pub const DECAL_PIPES: u8 = 7;
+
+/// Apex picks a material's depth bias from its rasterizerFlags & 0x70 (r5apex_dx12 FUN_1405177d0, the rasterizer
+/// state builder): 0x10 = the decal bias (mat_depthbias_decal). Every decal, puddle and blended overlay mesh has it;
+/// docs/apex-lighting.md section 9.
+/// R5_NODECALBIAS=1 turns it off (A/B against tools/zscan.py).
+fn decal_bias(e: &serde_json::Value) -> bool {
+    e["raster_flags"].as_u64().is_some_and(|f| f & 0x70 == 0x10) && std::env::var_os("R5_NODECALBIAS").is_none()
+}
+
 /// Splits every draw into spatial chunks (grid cells in X/Y) so the camera and the shadow cascades can cull.
-/// Returns the re-ordered index buffer and the chunk list, opaque first, blended last.
-fn chunk_draws(world: &glb::World) -> (Vec<u32>, Vec<DrawCmd>) {
+/// Returns the re-ordered index buffer and the chunk list: opaque, alpha-tested, blended; inside each class the
+/// depth-biased decal materials after the rest (they are drawn over what is already there).
+fn chunk_draws(world: &glb::World, mats_json: &serde_json::Value) -> (Vec<u32>, Vec<DrawCmd>) {
     const CELL: f32 = 4096.0;
     const MIN_SPLIT_TRIS: u32 = 6000;
     let pos = |i: u32| world.vertices[i as usize].pos;
@@ -41,6 +55,7 @@ fn chunk_draws(world: &glb::World) -> (Vec<u32>, Vec<DrawCmd>) {
     for d in &world.draws {
         let m = &world.materials[d.material as usize];
         let key = if m.sky { 6 } else { m.alpha_mode * 2 + m.double_sided as u8 };
+        let pipe = if key != 6 && decal_bias(&mats_json[&m.name]) { key + DECAL_PIPES } else { key };
         let (shadow, skybox) = (!m.no_shadow && !m.skybox, m.skybox);
         let tris = &world.indices[d.first_index as usize..(d.first_index + d.index_count) as usize];
         let mut cells: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
@@ -68,12 +83,12 @@ fn chunk_draws(world: &glb::World) -> (Vec<u32>, Vec<DrawCmd>) {
                     mx[a] = mx[a].max(p[a]);
                 }
             }
-            cmds.push(DrawCmd { first_index: out_idx.len() as u32, index_count: ix.len() as u32, material: d.material, key, min: mn, max: mx, shadow, skybox });
+            cmds.push(DrawCmd { first_index: out_idx.len() as u32, index_count: ix.len() as u32, material: d.material, key, pipe, min: mn, max: mx, shadow, skybox });
             out_idx.extend_from_slice(ix);
         }
     }
-    // stable: opaque, then alpha-tested, then blended (glb order kept inside each class)
-    cmds.sort_by_key(|c| (c.key / 2, c.key, c.material));
+    // stable: opaque, then alpha-tested, then blended (glb order kept inside each class), decals last in each
+    cmds.sort_by_key(|c| (c.key / 2, c.pipe >= DECAL_PIPES, c.key, c.material));
     (out_idx, cmds)
 }
 
@@ -358,8 +373,20 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     drop(bsp);
     let t_light = t0.elapsed().as_secs_f64();
 
+    // The game's own material textures + render state (materials.json from tools/build_materials.py).
+    let mats_json: serde_json::Value = std::fs::read_to_string(cfg.map_dir().join("materials.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| {
+            log::warn!("no materials.json (run tools/build_materials.py): using world.glb base colours only");
+            serde_json::Value::Null
+        });
+    if world.materials.iter().any(|m| mats_json[&m.name].is_object()) && !world.materials.iter().any(|m| mats_json[&m.name]["raster_flags"].is_u64()) {
+        log::warn!("materials.json has no raster_flags (re-run tools/build_materials.py): decals drawn without depth bias");
+    }
+
     // Geometry buffers (index buffer re-ordered into spatial chunks).
-    let (chunk_idx, draws) = chunk_draws(&world);
+    let (chunk_idx, draws) = chunk_draws(&world, &mats_json);
     world.indices = chunk_idx;
     let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("world vb"), contents: bytemuck::cast_slice(&world.vertices), usage: wgpu::BufferUsages::VERTEX });
     let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("world ib"), contents: bytemuck::cast_slice(&world.indices), usage: wgpu::BufferUsages::INDEX });
@@ -370,14 +397,7 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     world.indices = Vec::new();
     progress.set(0.3);
 
-    // The game's own material textures (materials.json from tools/build_materials.py), block-compressed + cached.
-    let mats_json: serde_json::Value = std::fs::read_to_string(cfg.map_dir().join("materials.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| {
-            log::warn!("no materials.json (run tools/build_materials.py): using world.glb base colours only");
-            serde_json::Value::Null
-        });
+    // Material textures, block-compressed + cached.
     let root = cfg.assets_root();
     let cache = root.parent().unwrap_or(&root).join("_cache").join("tex");
     let cap = cfg.max_texture_size.max(16);
@@ -438,7 +458,8 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     let mat_groups: Vec<wgpu::BindGroup> = world
         .materials
         .iter()
-        .map(|m| {
+        .enumerate()
+        .map(|(mi, m)| {
             let e = &mats_json[&m.name];
             let get = |k: &str, kind: Kind| e[k].as_str().and_then(|r| mat_tex.get(&(r.to_string(), kind as u8)));
             let albedo = if m.alpha_mode == 0 || (m.alpha_mode == 2 && e["blend"].is_string()) { get("albedo", Kind::Albedo) } else { None }.or_else(|| m.base_tex.and_then(|t| views.get(&t))).unwrap_or(&white);
@@ -527,7 +548,7 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
                 uv_tr,
                 route,
                 // c_uberFeatureFlags bit 2: detail2 is overlaid like layer 0's detail (else albedo2 * detail2 * 2)
-                detail: [detail.is_some() as u32 as f32, detail2.is_some() as u32 as f32, ((e["feature_flags"].as_u64().unwrap_or(0) & 4) != 0) as u32 as f32, 0.0],
+                detail: [detail.is_some() as u32 as f32, detail2.is_some() as u32 as f32, ((e["feature_flags"].as_u64().unwrap_or(0) & 4) != 0) as u32 as f32, mi as f32],
             };
             let ub = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mat"), contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM });
             device.create_bind_group(&wgpu::BindGroupDescriptor {

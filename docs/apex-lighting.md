@@ -435,6 +435,52 @@ T = b2*sin(angle) + b1*cos(angle);     B = cross(N, T) * (bit31 ? -1 : 1);     /
 // prop POSITION (uint2): x = (lo & 0x1FFFFF), y = (lo>>21) | ((hi & 0x3FF)<<11), z = hi>>10;  pos = xyz/1024 - (1024,1024,2048)
 ```
 
+## 9. Decals and overlays: depth bias, not draw order alone (2026-11-17) [H]
+
+Decals, puddles, stencils, bullet holes, the road-track / sand `_transparent` overlays and prop decal sheets
+(`cargo_container_decals_01`) are separate meshes lying exactly on the surface under them. Drawn with the plain
+`GreaterEqual` test and no bias they z-fight with it: whether a decal pixel passes depends on the rounding of two
+interpolated depths, so it breaks into flickering holes as the camera moves (Kainz's spots k1 to k5 in
+`tools/zscan.py`).
+
+**What the material says.** Every RSX material json carries `rasterizerFlags` and `depthStencilFlags`. On this map:
+
+| rasterizerFlags | depthStencilFlags | materials |
+|---|---|---|
+| `0x6` / `0x2` | `0x17` | opaque world + props (`0x2` = no culling: tarps) |
+| `0x16` | `0x7` | all 38 decal-class materials: `world/decal/*`, `*_decal*`, `s2s_bolt_decals`, `road_tracks_dry_03_blend_2_trans`, `sand_desert_02_bm_transparent`, `sand_desert_02_wld_transparent_scroll`, `stain_02` ... |
+| `0x6` | `0x7` | glass, energy, other blended non-decals |
+
+**How the engine reads them** (`r5apex_dx12.exe`, S21):
+- `FUN_1405177d0(rasterizerFlags, desc)` builds the rasterizer state: `desc[0] = !(f & 1)`, cull = `f & 4 ? (f & 2 ? 2 : 1) : 0`,
+  `desc[2] = (f >> 3) & 1`, and the **depth bias class `f & 0x70`**: `0x00` normal, `0x10` decal, `0x20` shadow map,
+  `0x40` tight shadow map, `0x50` UI, anything else z-fill. For every class but the two shadow ones it writes
+  `DepthBias = -mat_depthbias_X`, `SlopeScaledDepthBias = -mat_slopescaledepthbias_X`, `DepthBiasClamp = -mat_depthbiasclamp_X`
+  (the `* -1.0` at `DAT_1417f8e04`): the convars are written for a normal depth buffer and the main view is reverse-Z.
+- Convar defaults (static ConVar inits at `0x1400be2a6..`): decal `-16 / -4 / -0.001`, UI `-50 / -1.7 / -0.001`,
+  normal `0 / 0 / 0`, z-fill `16 / 2 / 0`, shadow map `0 / 2 / 0`, tight shadow `10000`.
+- `FUN_140517990(depthStencilFlags, desc)`: depth enable = `f & 1 | write`, write = `(f >> 4) & 1`, compare =
+  `lut[(f >> 1) & 7]` (`ALWAYS` if depth is off), stencil = `(f >> 7) & 1`. Decals (`0x7`) use the same compare as
+  opaque (`0x17`), only without depth write.
+
+So a decal is drawn with the world's own compare, no depth write and **DepthBias 16, SlopeScaledDepthBias 4,
+DepthBiasClamp 0.001** towards the camera. On a `D32_FLOAT` target that is 16 units in the last place of the
+primitive's largest depth plus 4 x its depth slope, clamped to 0.001 in depth.
+
+**Ours.** `export-map/build_materials.py` copies both flags into `materials.json` (`raster_flags`, `depth_flags`). The loader
+gives every draw whose material has `raster_flags & 0x70 == 0x10` a copy of its pipeline with
+`DepthBiasState { constant: 16, slope_scale: 4.0, clamp: 0.001 }` (Vulkan applies it the same way on `Depth32Float`),
+and sorts those draws after the rest of their opaque / alpha-tested / blended class. `R5_NODECALBIAS=1` turns it off.
+
+**Evidence.** `python tools/zscan.py OUT --spots` renders each pose twice, the second with the camera 0.1 unit off, in two
+debug views (`--debug 11` flat colour per material, `--debug 12` view distance) and counts pixels where the material
+flips while the distance does not (dense patches only, so silhouettes and creases do not count). Over the 27 poses of
+`r5f-probe/poses.json` plus k1..k5 at 8 yaws: **25139 pixels before, 938 after**, and every pair left is an edge
+of a trim seen from a few units away, not a decal. Before, 100 % of the hits were a decal-class material against
+the surface under it (`water_puddle_ground_decal_01` / rubber floor 7500, `cement_stripes_decals_vert` / wall trim 4280,
+`grunge_decal_drips`, `firingrange_town_decal_sheet_01a`, `bullet_hole_metal_01`, `cargo_container_decals_01`, ...).
+The map00 / map08 / map18 renders change by a mean 0.85 / 0.20 / 0.03 levels (decals that were missing pixels).
+
 ## Implementation notes
 
 1. Work in **linear HDR**, keep the π-folded units, and never divide by π. Apply exposure and tonemap in a separate post

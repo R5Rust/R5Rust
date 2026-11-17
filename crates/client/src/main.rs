@@ -4,6 +4,7 @@
 //! Screenshot mode (no window, renders offscreen and exits):
 //!   r5rust --screenshot out.png [--frames 120] [--loadshot load.png] [--pos x,y,z] [--yaw d] [--pitch d]
 //!          [--hold w,shift,space] [--fly]
+//!   r5rust --screenshot DIR --poses list.txt [--debug 11|12]   (one PNG per "name x y z_eye pitch yaw" line)
 
 mod binds;
 mod bloom;
@@ -55,6 +56,8 @@ struct Args {
     menu: bool,
     /// second pose "x,y,z,pitch,yaw" (feet): print the auto exposure curve stepping between --pos and it
     expo_curve: Option<String>,
+    /// batch screenshots: a text file of "name x y z_eye pitch yaw" lines, one PNG each into the --screenshot directory
+    poses: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -85,6 +88,7 @@ fn parse_args() -> Args {
             "--exposure" => a.exposure = next(&mut i).parse().ok(),
             "--menu" => a.menu = true,
             "--expo-curve" => a.expo_curve = Some(next(&mut i)),
+            "--poses" => a.poses = Some(next(&mut i).into()),
             other => log::warn!("unknown arg {other}"),
         }
         i += 1;
@@ -164,6 +168,10 @@ fn run_headless(cfg: Config, args: Args) -> Result<(), String> {
     gfx.instant_exposure = true;
     gfx.forced_exposure = args.exposure;
     gfx.set_world(&world);
+    gfx.raw_post = args.debug > 10.5 && args.debug < 12.5;
+    if let Some(list) = &args.poses {
+        return shoot_poses(&mut gfx, &world, &args, &cfg, list, t0);
+    }
     let (mut player, yaw, pitch) = spawn(&world, &args);
     player.fly_speed = cfg.fly_speed;
     let keys: HashSet<String> = args.hold.iter().cloned().collect();
@@ -222,6 +230,29 @@ fn run_headless(cfg: Config, args: Args) -> Result<(), String> {
         let cam_b = Camera { pos: eye, yaw: v[4], pitch: v[3], fov: cfg.fov, debug: 0.0 };
         expo_curve(&mut gfx, &world, &cam, &cam_b);
     }
+    Ok(())
+}
+
+/// `--poses`: one screenshot per "name x y z_eye pitch yaw" line, at exactly that eye position (no collision nudge),
+/// with one map load. Used by the z-fighting scan (tools/zscan.py).
+fn shoot_poses(gfx: &mut Gfx, world: &LoadedWorld, args: &Args, cfg: &Config, list: &std::path::Path, t0: Instant) -> Result<(), String> {
+    let dir = args.screenshot.clone().unwrap_or_else(|| PathBuf::from("."));
+    let text = std::fs::read_to_string(list).map_err(|e| format!("{}: {e}", list.display()))?;
+    let mut n = 0;
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let v: Vec<f32> = f.iter().skip(1).filter_map(|x| x.parse().ok()).collect();
+        if f.len() != 6 || v.len() != 5 {
+            return Err(format!("bad pose line {line:?} (want: name x y z_eye pitch yaw)"));
+        }
+        let cam = Camera { pos: Vec3::new(v[0], v[1], v[2]), yaw: v[4], pitch: v[3], fov: args.fov.unwrap_or(cfg.fov), debug: args.debug };
+        gfx.prepare(&cam, world);
+        let fu = gfx.frame_uniform(&cam, world, 0.0);
+        gfx.screenshot_free_draw(world, &fu);
+        gfx.screenshot(&dir.join(format!("{}.png", f[0])), Some((world, &fu)), 1.0)?;
+        n += 1;
+    }
+    println!("{n} poses -> {}  (total {:.1}s)", dir.display(), t0.elapsed().as_secs_f64());
     Ok(())
 }
 

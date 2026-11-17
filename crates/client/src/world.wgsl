@@ -75,7 +75,7 @@ struct Mat {
     uv_rs: array<vec4<f32>, 5>,  // c_uv1..5 RotScaleX.xy, RotScaleY.xy
     uv_tr: array<vec4<f32>, 5>,  // c_uv1..5 Translate.xy
     route: array<vec4<u32>, 4>,  // UV per texture slot (R_*): uv index 0..5 (0 = untransformed) | 8 world-planar
-    detail: vec4<f32>,           // x has detail (L0), y has detail2 (L1), z detail2 overlaid (else 2x multiply)
+    detail: vec4<f32>,           // x has detail (L0), y has detail2 (L1), z detail2 overlaid (else 2x multiply), w material index
 };
 @group(1) @binding(0) var<uniform> mt: Mat;
 @group(1) @binding(1) var albedo_tex: texture_2d<f32>;
@@ -497,7 +497,25 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
     }
     if (fr.misc.w > 7.5 && fr.misc.w < 8.5) { return vec4<f32>(vec3<f32>(a, i.col.a, mask), 1.0); }
     if (fr.misc.w > 8.5 && fr.misc.w < 9.5) { return vec4<f32>(i.col.r, i.col.a, mt.blend.x * 0.5, 1.0); }
+    if (fr.misc.w > 10.5 && fr.misc.w < 12.5) {
+        // z-fighting scan (tools/zscan.py), written so the 8-bit sRGB screenshot holds these exact bytes:
+        // 11 = a flat colour per material, 12 = view distance in 1/64 units as a 24-bit number.
+        // Blended surfaces count where they are > half opaque.
+        if (mt.params.z > 1.5 && a < 0.5) { discard; }
+        var h = hash_u32(u32(mt.detail.w) + 1u);
+        if (fr.misc.w > 11.5) { h = u32(clamp(length(i.rel) * 64.0, 0.0, 16777215.0)); }
+        let b = vec3<f32>(f32(h & 255u), f32((h >> 8u) & 255u), f32((h >> 16u) & 255u)) / 255.0;
+        let lin = select(pow((b + 0.055) / 1.055, vec3<f32>(2.4)), b / 12.92, b <= vec3<f32>(0.04045));
+        return vec4<f32>(lin, select(1.0, a, mt.params.z > 0.5 && mt.params.z < 1.5));
+    }
     return vec4<f32>(c, a);
+}
+
+fn hash_u32(x0: u32) -> u32 {
+    var x = x0;
+    x = ((x >> 16u) ^ x) * 0x45d9f3bu;
+    x = ((x >> 16u) ^ x) * 0x45d9f3bu;
+    return (x >> 16u) ^ x;
 }
 
 // Sky-shaded surfaces (sky shader set 0xE273F3D2055B839F, PS 0x926A177354932726): unlit

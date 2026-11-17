@@ -94,6 +94,8 @@ pub struct Gfx {
     grading_on: bool,
     /// grading off until it matches the real game (R5_GRADE=1 turns it on)
     pub no_grading: bool,
+    /// --debug 11 / 12 (surface ids / distance): show the HDR target as-is, no exposure / bloom / tonemap / grading
+    pub raw_post: bool,
     /// 0 = ACES fit, 1 = Apex tonemap function 0 (env R5_TONEMAP)
     pub tonemap: u32,
     expo_state: wgpu::Buffer,
@@ -296,12 +298,12 @@ impl Gfx {
         let pattrs = wgpu::vertex_attr_array![5 => Uint32];
         let player = wgpu::VertexBufferLayout { array_stride: 4, step_mode: wgpu::VertexStepMode::Vertex, attributes: &pattrs };
 
-        // key = alpha_mode * 2 + double_sided
+        // key = alpha_mode * 2 + double_sided (0..5), 6 = sky material, 7..12 = 0..5 with the decal depth bias
         let mut world_pipes = Vec::new();
-        for key in 0..6u8 {
+        let world_pipe = |key: u8, bias: wgpu::DepthBiasState| {
             let alpha = key / 2;
             let double = key % 2 == 1;
-            world_pipes.push(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("world"),
                 layout: Some(&world_pl),
                 vertex: wgpu::VertexState { module: &world_sh, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[Some(vlayout.clone()), Some(player.clone())] },
@@ -311,7 +313,7 @@ impl Gfx {
                     depth_write_enabled: Some(alpha != 2),
                     depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                     stencil: Default::default(),
-                    bias: Default::default(),
+                    bias,
                 }),
                 multisample: wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: alpha == 1 },
                 fragment: Some(wgpu::FragmentState {
@@ -322,7 +324,10 @@ impl Gfx {
                 }),
                 multiview_mask: None,
                 cache: None,
-            }));
+            })
+        };
+        for key in 0..6u8 {
+            world_pipes.push(world_pipe(key, Default::default()));
         }
         // key 6: sky-shaded surfaces (unlit cube lookup + edge-faded emissive), opaque, no culling
         world_pipes.push(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -336,6 +341,12 @@ impl Gfx {
             multiview_mask: None,
             cache: None,
         }));
+        // Decal-class materials (rasterizerFlags & 0x70 == 0x10): the engine's decal depth bias, negated for its reverse-Z
+        // view like ours (r5apex_dx12 FUN_1405177d0: DepthBias = -mat_depthbias_decal = 16, SlopeScaledDepthBias =
+        // -mat_slopescaledepthbias_decal = 4, DepthBiasClamp = -mat_depthbiasclamp_decal = 0.001). docs/apex-lighting.md 9.
+        for key in 0..6u8 {
+            world_pipes.push(world_pipe(key, wgpu::DepthBiasState { constant: 16, slope_scale: 4.0, clamp: 0.001 }));
+        }
         let sky_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("sky"),
             layout: Some(&sky_pl),
@@ -470,6 +481,7 @@ impl Gfx {
             grading_on: false,
             // game grading LUT + Apex tonemap function 0 measured closest to R5Flowstate (R5_NOGRADE=1 to compare)
             no_grading: std::env::var_os("R5_NOGRADE").is_some(),
+            raw_post: false,
             tonemap: std::env::var("R5_TONEMAP").ok().and_then(|v| v.parse().ok()).unwrap_or(cfg.tonemap),
             expo_state,
             expo_params,
@@ -689,9 +701,9 @@ impl Gfx {
                             continue;
                         }
                         drawn += 1;
-                        if d.key != cur_key {
-                            cur_key = d.key;
-                            rp.set_pipeline(&self.world_pipes[d.key as usize]);
+                        if d.pipe != cur_key {
+                            cur_key = d.pipe;
+                            rp.set_pipeline(&self.world_pipes[d.pipe as usize]);
                         }
                         rp.set_bind_group(1, &w.mat_groups[d.material as usize], &[]);
                         rp.draw_indexed(d.first_index..d.first_index + d.index_count, 0, 0..1);
@@ -713,9 +725,9 @@ impl Gfx {
                     continue;
                 }
                 drawn += 1;
-                if d.key != cur_key {
-                    cur_key = d.key;
-                    rp.set_pipeline(&self.world_pipes[d.key as usize]);
+                if d.pipe != cur_key {
+                    cur_key = d.pipe;
+                    rp.set_pipeline(&self.world_pipes[d.pipe as usize]);
                 }
                 rp.set_bind_group(1, &w.mat_groups[d.material as usize], &[]);
                 rp.draw_indexed(d.first_index..d.first_index + d.index_count, 0, 0..1);
@@ -738,7 +750,7 @@ impl Gfx {
         let pu = PostUniform {
             params: [mode, progress, self.exposure, if self.out_srgb { 1.0 } else { 0.0 }],
             screen: [self.width as f32, self.height as f32, self.load_size.0 as f32, self.load_size.1 as f32],
-            bloom: [self.bloom_amount, if self.grading_on && !self.no_grading { 1.0 } else { 0.0 }, self.tonemap as f32, 0.0],
+            bloom: [self.bloom_amount, if self.grading_on && !self.no_grading { 1.0 } else { 0.0 }, self.tonemap as f32, self.raw_post as u32 as f32],
         };
         self.queue.write_buffer(&self.post_ub, 0, bytemuck::bytes_of(&pu));
         {

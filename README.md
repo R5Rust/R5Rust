@@ -1,16 +1,5 @@
 # R5Rust
 
-> Part of the [R5Rust](https://github.com/R5Rust) org. Clone the repos side by side:
-> **R5Rust** (this: client, server, shared sim), **[export-map](https://github.com/R5Rust/export-map)** (builds the map data
-> from your own Apex install), **[r5f-probe](https://github.com/R5Rust/r5f-probe)** (ground truth from real R5Flowstate).
-> No game assets live in any of them: you extract them from your own install.
-
-![Firing Range](docs/img/range.jpg)
-
-| | |
-|---|---|
-| ![Town](docs/img/town.jpg) | ![Spawn hall](docs/img/spawn.jpg) |
-
 From-scratch Rust engine that loads the Apex Legends **Firing Range** (`mp_rr_canyonlands_staging_mu1`) from
 your own extracted assets, and lets you walk around it. Long-term goal: client `r5rust` + headless dedicated
 server `r5rust_ds`, like R5Flowstate's `r5apex.exe` / `r5apex_ds.exe`.
@@ -55,7 +44,7 @@ The window title shows fps, position and ground/air/FLY.
 
 Default root `D:\R5Rust\assets` (override with `R5RUST_ASSETS` or `assets_root` in `r5rust.toml`):
 
-- `maps\mp_rr_canyonlands_staging_mu1\world.glb` + `meta.json`, made by `[export-map](https://github.com/R5Rust/export-map)`
+- `maps\mp_rr_canyonlands_staging_mu1\world.glb` + `meta.json`, made by `C:\Code\apex\r5-web-client\export-map`
 - `maps\mp_rr_canyonlands_staging_mu1\collision.bin`: the game's own collision, made by `export-map --collision`
   (see `docs/collision.md`). Without it the player collides with the render triangles and the log warns.
 - `images\ui\maps_mp_rr_canyonlands_staging_mu1_loadscreen\*.png`
@@ -86,7 +75,9 @@ max_texture_size = 4096  # never caps: the extracted textures stop at 4096 (most
 
 Settles for 30 ticks, holds `--hold` keys for `--frames` ticks (60/s), renders, and prints load stats,
 GPU ms/frame, where the player ended up and the jump peak. `--debug`: 1 = sun visibility (lightmap A),
-2 = baked indirect light, 3 = albedo only.
+2 = baked indirect light, 3 = albedo only, 11 = flat colour per material, 12 = view distance (both raw, for scripts).
+`--poses list.txt` renders one PNG per `name x y z_eye pitch yaw` line into the `--screenshot` directory with one map
+load. `python tools\zscan.py OUT --spots` uses it to count z-fighting pixels (docs/apex-lighting.md section 9).
 `--expo-curve` then cuts the camera between `--pos` and that second pose (feet position) both ways and prints the
 auto exposure after every frame, the frames to 50/90/99 %, and the gap to the engine formula run on the CPU.
 Dark rock crevice to bright road: `--pos 1800,-5200,500.8 --pitch 5 --yaw 202.5 --expo-curve -3000,-200,-82.9,5,67.5`.
@@ -96,7 +87,7 @@ Dark rock crevice to bright road: `--pos 1800,-5200,500.8 --pitch 5 --yaw 202.5 
 `export-map` (Rust, standalone) rebuilds `world.glb` + `meta.json` from the game's paks; `export-map/build_materials.py`
 maps materials to the extracted textures + constants (`materials.json`). Lighting lumps live in `<map>/bsp/`,
 cubemaps in `cubemaps.dds`, the dome's sky cubes in `skies\<material>.dds` (fallback `skycube.dds`). Compressed texture
-cache: `D:\R5Rust\_cache\tex`. Run `python ..\export-map\build_materials.py` after every full export (new skins bring new materials).
+cache: `D:\R5Rust\_cache\tex`. Run `python tools\build_materials.py` after every full export (new skins bring new materials).
 
 Full export (~2 min; the exporter's `../../../../apex` path dependencies only resolve from the main checkout, not a worktree):
 `cd ..\export-map; cargo run --release -- --out D:\R5Rust\assets\maps\mp_rr_canyonlands_staging_mu1`. It applies each static

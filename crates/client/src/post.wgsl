@@ -94,6 +94,7 @@ fn fs_main(i: VOut) -> @location(0) vec4<f32> {
         return out_color(c);
     }
     // Apex composite: (scene + bloom) * exposure -> tonemap   (bloom added before exposure)
+    if (pp.bloom.w > 0.5) { return vec4<f32>(textureSampleLevel(hdr_tex, samp, i.uv, 0.0).rgb, 1.0); }  // --debug 11 surface ids
     let h = textureSampleLevel(hdr_tex, samp, i.uv, 0.0).rgb + textureSampleLevel(bloom_tex, samp, i.uv, 0.0).rgb * pp.bloom.x;
     var c = h * pp.params.z * max(expo.exposure, 1e-3);
     if (pp.bloom.y > 0.5) {
