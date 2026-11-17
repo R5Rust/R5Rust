@@ -24,6 +24,10 @@ pub struct DrawCmd {
     /// world-space bounds of this chunk
     pub min: [f32; 3],
     pub max: [f32; 3],
+    /// casts sun (CSM) shadows
+    pub shadow: bool,
+    /// 3D skybox geometry: only the skybox pass draws it
+    pub skybox: bool,
 }
 
 /// Splits every draw into spatial chunks (grid cells in X/Y) so the camera and the shadow cascades can cull.
@@ -37,6 +41,7 @@ fn chunk_draws(world: &glb::World) -> (Vec<u32>, Vec<DrawCmd>) {
     for d in &world.draws {
         let m = &world.materials[d.material as usize];
         let key = if m.sky { 6 } else { m.alpha_mode * 2 + m.double_sided as u8 };
+        let (shadow, skybox) = (!m.no_shadow && !m.skybox, m.skybox);
         let tris = &world.indices[d.first_index as usize..(d.first_index + d.index_count) as usize];
         let mut cells: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
         let split = d.index_count / 3 >= MIN_SPLIT_TRIS;
@@ -63,7 +68,7 @@ fn chunk_draws(world: &glb::World) -> (Vec<u32>, Vec<DrawCmd>) {
                     mx[a] = mx[a].max(p[a]);
                 }
             }
-            cmds.push(DrawCmd { first_index: out_idx.len() as u32, index_count: ix.len() as u32, material: d.material, key, min: mn, max: mx });
+            cmds.push(DrawCmd { first_index: out_idx.len() as u32, index_count: ix.len() as u32, material: d.material, key, min: mn, max: mx, shadow, skybox });
             out_idx.extend_from_slice(ix);
         }
     }
@@ -150,11 +155,17 @@ const TEX_SLOTS: [(&str, Kind); 12] = [
 /// Six faces `<leaf>_albedoTexture_000..005.png` (D3D face order) of the sky material, as one cube texture.
 fn load_sky_cube(device: &wgpu::Device, queue: &wgpu::Queue, root: &std::path::Path, map_dir: &std::path::Path, sky_mat: Option<&str>) -> wgpu::TextureView {
     // The game's HDR original (BC6H cube from the map pak). The extracted PNG faces are clipped to 8 bits.
-    if let Ok(d) = crate::dds::load(&map_dir.join("skycube.dds")) {
-        if d.layers == 6 {
-            let t = crate::dds::upload(device, queue, &d, "sky cube (hdr)");
-            log::info!("sky cube: HDR {}x{} BC6H", d.width, d.height);
-            return t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::Cube), ..Default::default() });
+    // `skies/<material leaf>.dds` first: the Firing Range dome's props draw skin 1, which swaps
+    // freedm_cubemap_skulltown for freedm_cubemap_firingrange (docs/skybox.md). skycube.dds is the old fallback.
+    let leaf = sky_mat.and_then(|n| n.rsplit('/').next());
+    let named = leaf.map(|l| map_dir.join("skies").join(format!("{l}.dds")));
+    for path in named.into_iter().chain(std::iter::once(map_dir.join("skycube.dds"))) {
+        if let Ok(d) = crate::dds::load(&path) {
+            if d.layers == 6 {
+                let t = crate::dds::upload(device, queue, &d, "sky cube (hdr)");
+                log::info!("sky cube: HDR {}x{} BC6H from {}", d.width, d.height, path.display());
+                return t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::Cube), ..Default::default() });
+            }
         }
     }
     let faces: Option<Vec<image::RgbaImage>> = sky_mat.and_then(|name| {
@@ -319,7 +330,10 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
 
     // Baked lighting from the raw BSP lumps + one probe per static prop.
     let bsp = BspLighting::load(&cfg.bsp_dir())?;
-    let probe_ix = lighting::assign_probes(&bsp, &world.vertices, &world.indices, &world.draws, |m| world.materials[m as usize].lightmapped);
+    let sky_probe = meta.sky_probe.map(|(p, c)| (p & 0xFFFFFF) | ((c & 0xFF) << 24));
+    let probe_ix = lighting::assign_probes(&bsp, &world.vertices, &world.indices, &world.draws, |m| world.materials[m as usize].lightmapped, |m| {
+        if world.materials[m as usize].skybox { sky_probe } else { None }
+    });
     let probe_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("probe vb"), contents: bytemuck::cast_slice(&probe_ix), usage: wgpu::BufferUsages::VERTEX });
     drop(probe_ix);
     let light = GpuLighting::new(device, queue, &bsp, &cfg.map_dir().join("cubemaps.dds"));

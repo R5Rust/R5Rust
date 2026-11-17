@@ -80,7 +80,14 @@ GPU ms/frame, where the player ended up and the jump peak. `--debug`: 1 = sun vi
 
 `tools/export-map` (Rust, standalone) rebuilds `world.glb` + `meta.json` from the game's paks; `tools/build_materials.py`
 maps materials to the extracted textures + constants (`materials.json`). Lighting lumps live in `<map>/bsp/`,
-cubemaps in `cubemaps.dds`, the sky in `skycube.dds`. Compressed texture cache: `D:\R5Rust\_cache\tex`.
+cubemaps in `cubemaps.dds`, the dome's sky cubes in `skies\<material>.dds` (fallback `skycube.dds`). Compressed texture
+cache: `D:\R5Rust\_cache\tex`. Run `python tools\build_materials.py` after every full export (new skins bring new materials).
+
+Full export (~2 min; the exporter's `../../../../apex` path dependencies only resolve from the main checkout, not a worktree):
+`cd tools\export-map; cargo run --release -- --out D:\R5Rust\assets\maps\mp_rr_canyonlands_staging_mu1`. It applies each static
+prop's skin, and tags geometry in the glb material extras: `noShadow` (prop flag 0x10, decal meshes: never in the shadow
+cascades, `docs/apex-lighting.md`) and `skybox` (prop flag 0x40: drawn only from the sky camera, `docs/skybox.md`).
+Older world.glb files without those extras still load. The previous export is kept as `world.v1.glb` / `meta.v1.json`.
 
 Collision only (about 20 s, reuses the last export's BSP + models):
 `cd tools\export-map; cargo run --release -- --collision --out D:\R5Rust\assets\maps\mp_rr_canyonlands_staging_mu1`.
@@ -102,4 +109,9 @@ real movement (walk/sprint/crouch/slide/jump/air strafe/tap-strafe/step/mantle/m
 `docs/movement.md`). See `HANDOFF.md` for what's next.
 
 Not done: dedicated server + netcode + prediction (v2), shadows on unlightmapped props (big rocks, some props),
-interior lights (the bake has none, so interiors use a flat fill), dynamic props, HUD, weapons, audio.
+interior lights (the bake has none, so interiors use a flat fill), dynamic props, HUD, weapons, audio, the 3D skybox's
+own fog (and its vista brightness is unverified; `docs/skybox.md`).
+
+2026-11-16: no-shadow props/decals stay out of the cascades (the range road under the giant gaskets is sunlit again),
+static prop skins are applied (the dome shows the Firing Range sea and mountains instead of Skull Town), and the 3D
+skybox draws from the sky camera like the S21 client (`docs/skybox.md`).

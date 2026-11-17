@@ -262,7 +262,9 @@ impl GpuLighting {
 /// One probe per static-prop instance, like the game: instances aren't kept in world.glb, so each connected
 /// component of a non-lightmapped draw stands in for one, and takes the probe nearest its centre.
 /// Returns per vertex: probe index in bits 0-23 (0xFFFFFF = none / lightmapped), cubemap index in bits 24-31.
-pub fn assign_probes(bsp: &BspLighting, vertices: &[shared::glb::Vertex], indices: &[u32], draws: &[shared::glb::Draw], lightmapped: impl Fn(u32) -> bool) -> Vec<u32> {
+/// `fixed(material)`: a packed probe that overrides the lookup for every vertex of that material
+/// (the skybox vista's own probe).
+pub fn assign_probes(bsp: &BspLighting, vertices: &[shared::glb::Vertex], indices: &[u32], draws: &[shared::glb::Draw], lightmapped: impl Fn(u32) -> bool, fixed: impl Fn(u32) -> Option<u32>) -> Vec<u32> {
     let n = vertices.len();
     let mut parent: Vec<u32> = (0..n as u32).collect();
     fn find(p: &mut [u32], mut x: u32) -> u32 {
@@ -317,11 +319,19 @@ pub fn assign_probes(bsp: &BspLighting, vertices: &[shared::glb::Vertex], indice
         .collect();
     let roots: Vec<u32> = (0..n).map(|v| if prop_vertex[v] { find(&mut parent, v as u32) } else { u32::MAX }).collect();
     use rayon::prelude::*;
-    (0..n)
+    let mut out: Vec<u32> = (0..n)
         .into_par_iter()
         .map(|v| match roots[v] {
             u32::MAX => 0xFFFFFF | (bsp.nearest_cubemap(vertices[v].pos) << 24),
             r => probe_of.get(&r).copied().unwrap_or(0xFFFFFF | (bsp.nearest_cubemap(vertices[v].pos) << 24)),
         })
-        .collect()
+        .collect();
+    for d in draws {
+        if let Some(p) = fixed(d.material) {
+            for &v in &indices[d.first_index as usize..(d.first_index + d.index_count) as usize] {
+                out[v as usize] = p;
+            }
+        }
+    }
+    out
 }

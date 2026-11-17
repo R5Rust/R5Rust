@@ -142,6 +142,32 @@ if (sun > 0) {                      // whole sun term skipped when baked visibil
 So inside CSM range the cascade **replaces** the baked sun visibility (it does not multiply it). The baked value is used
 as a gate (0 = no sun at all) and as the far fallback [H].
 
+### Who casts into the cascades (2026-11-16) [H data]
+
+Because the cascade replaces the bake, one wrong caster blacks out a sunlit area. The static prop record's flag byte
+(`StaticProp::unknown_1` in r5ed's `sprp.rs`, Source `dstaticprop_t::flags`) decides it. Measured on staging_mu1
+against the map's own CSM caster tree (lumps 0x63 nodes / 0x64 obj refs; a ref `>= first_static_prop_index` (0x7B) is a
+static prop):
+
+| bit | Source name | on this map | in the CSM caster tree | r5rust |
+|---|---|---|---|---|
+| 0x01 | FLAG_FADES | 392 props | 170 | casts |
+| 0x02 | USE_LIGHTING_ORIGIN | 630 | 269 | casts |
+| 0x04 | (Source: NO_DRAW; here on 11198/11198 props, so not that) | all | 6097 | casts |
+| **0x10** | **NO_SHADOW** | 1308: decal models, the giant `grave_wall_gasket*` / `live_fire_col20_pan*` / `fs_girder_beam` set dressing at z 14-16k | **0** | **never casts** |
+| 0x20 | SCREEN_SPACE_FADE | 1115: grass, pebble clusters, small rocks | 881 | casts |
+| 0x40 | (Respawn) 3D skybox only | 1: the vista `mdl/vistas/eden_se.rmdl` (flags 0x54) | 0 | skybox pass, never casts (docs/skybox.md) |
+
+The bake agrees: the range floor under the gaskets is sunlit in lm1.a. Not every prop without 0x10 is in the tree
+(61% are; the rest are presumably culled by size or extent), so r5rust casts all of them rather than guess.
+World meshes: bit 0x10 of `Mesh.flags` (0x00100210 decals, 0x00100a10 blended decals, 0x00103210 water) marks
+decal-class meshes, which r5rust also keeps out of the cascades. The world's own shadow geometry is a separate,
+much smaller set (lumps 0x7C-0x7F: 45k triangles against 248k opaque render triangles), so that part is the Source
+convention (decals and overlays never cast) rather than proven from the data.
+
+`tools/export-map` carries this into world.glb as material extras `noShadow` / `skybox` (geometry with either gets its
+own primitives: group keys `|ns`, `|sky`); `crates/client/src/csm.rs` skips `DrawCmd::shadow == false`.
+
 ### Sun shading [H] (world L304-372)
 ```hlsl
 float3 sunCol = c_sunColor * cloudMaskTexture.Sample(bilinear,

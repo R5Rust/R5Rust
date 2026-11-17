@@ -66,8 +66,15 @@ pub struct Gfx {
     post_layout: wgpu::BindGroupLayout,
     world_pipes: Vec<wgpu::RenderPipeline>,
     sky_pipe: wgpu::RenderPipeline,
+    /// fullscreen triangle that resets depth to the far plane (between the 3D skybox and the world)
+    depth_reset_pipe: wgpu::RenderPipeline,
     post_pipe: wgpu::RenderPipeline,
     frame_ub: wgpu::Buffer,
+    /// the 3D skybox pass's frame uniform (sky camera), and its bind group
+    sky_ub: wgpu::Buffer,
+    sky_bg: Option<wgpu::BindGroup>,
+    /// set by `frame_uniform` when the map has a 3D skybox
+    sky_fu: std::cell::Cell<Option<FrameUniform>>,
     post_ub: wgpu::Buffer,
     lm_samp: wgpu::Sampler,
     mat_samp: wgpu::Sampler,
@@ -336,6 +343,22 @@ impl Gfx {
             multiview_mask: None,
             cache: None,
         });
+        let depth_reset_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("depth reset"),
+            layout: Some(&sky_pl),
+            vertex: wgpu::VertexState { module: &world_sh, entry_point: Some("vs_sky"), compilation_options: Default::default(), buffers: &[] },
+            primitive: Default::default(),
+            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
+            multisample: wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false },
+            fragment: Some(wgpu::FragmentState {
+                module: &world_sh,
+                entry_point: Some("fs_sky"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: HDR, blend: None, write_mask: wgpu::ColorWrites::empty() })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         let post_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("post"),
             layout: Some(&post_pl),
@@ -349,6 +372,7 @@ impl Gfx {
         });
 
         let frame_ub = device.create_buffer(&wgpu::BufferDescriptor { label: Some("frame"), size: std::mem::size_of::<FrameUniform>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let sky_ub = device.create_buffer(&wgpu::BufferDescriptor { label: Some("sky frame"), size: std::mem::size_of::<FrameUniform>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let post_ub = device.create_buffer(&wgpu::BufferDescriptor { label: Some("post"), size: std::mem::size_of::<PostUniform>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
         let lin = |addr, aniso: u16, mip| wgpu::SamplerDescriptor {
@@ -418,8 +442,12 @@ impl Gfx {
             post_layout,
             world_pipes,
             sky_pipe,
+            depth_reset_pipe,
             post_pipe,
             frame_ub,
+            sky_ub,
+            sky_bg: None,
+            sky_fu: std::cell::Cell::new(None),
             post_ub,
             lm_samp,
             mat_samp,
@@ -516,11 +544,22 @@ impl Gfx {
     }
 
     pub fn set_world(&mut self, world: &LoadedWorld) {
-        self.frame_bg = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("frame"),
+        self.frame_bg = Some(self.make_frame_bg(world, &self.frame_ub, "frame"));
+        self.sky_bg = Some(self.make_frame_bg(world, &self.sky_ub, "sky frame"));
+        self.csm.invalidate();
+        if let Some(g) = &world.grading {
+            self.grading = g.clone();
+            self.grading_on = true;
+            self.post_bg = Self::make_post_bg(&self.device, &self.post_layout, &self.post_ub, &self.hdr_view, &self.load_view, &self.post_samp, &self.expo_state, &self.bloom.output, &self.grading);
+        }
+    }
+
+    fn make_frame_bg(&self, world: &LoadedWorld, ub: &wgpu::Buffer, label: &str) -> wgpu::BindGroup {
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
             layout: &self.frame_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.frame_ub.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&world.light.lm0) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&world.light.lm1) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&world.light.rtl_ids) },
@@ -536,13 +575,7 @@ impl Gfx {
                 wgpu::BindGroupEntry { binding: 13, resource: world.light.cube_ambient.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(&world.sky_cube) },
             ],
-        }));
-        self.csm.invalidate();
-        if let Some(g) = &world.grading {
-            self.grading = g.clone();
-            self.grading_on = true;
-            self.post_bg = Self::make_post_bg(&self.device, &self.post_layout, &self.post_ub, &self.hdr_view, &self.load_view, &self.post_samp, &self.expo_state, &self.bloom.output, &self.grading);
-        }
+        })
     }
 
     /// Per-frame work before drawing: re-renders the shadow cascades the camera has moved away from.
@@ -560,7 +593,7 @@ impl Gfx {
         let vp = proj * view;
         let l = &world.light;
         let to_sun = Vec3::from(l.sun_dir).normalize_or(Vec3::Z);
-        FrameUniform {
+        let fu = FrameUniform {
             view_proj: vp.to_cols_array_2d(),
             inv_view_proj: vp.inverse().to_cols_array_2d(),
             cam_pos: [cam.pos.x, cam.pos.y, cam.pos.z, 0.0],
@@ -573,7 +606,9 @@ impl Gfx {
             shadow_vp: self.csm.mats.map(|m| m.to_cols_array_2d()),
             cascade_r: csm::RADII,
             fog_k: world.fog.k,
-        }
+        };
+        self.sky_fu.set(sky_uniform(&fu, cam, world, vfov, aspect));
+        fu
     }
 
     /// Draws one frame into `target` (the swapchain image or a screenshot texture).
@@ -605,11 +640,41 @@ impl Gfx {
             rp.set_vertex_buffer(0, w.vbuf.slice(..));
             rp.set_vertex_buffer(1, w.probe_vbuf.slice(..));
             rp.set_index_buffer(w.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            let mut drawn = 0;
+            // The 3D skybox (docs/skybox.md): its own camera and frame uniform, then depth back to the far
+            // plane so the world draws over it, as Source's CSkyboxView does.
+            if let (Some(sfu), Some(sbg)) = (self.sky_fu.get(), &self.sky_bg) {
+                if std::env::var_os("R5_NOSKYBOX").is_none() {
+                    self.queue.write_buffer(&self.sky_ub, 0, bytemuck::bytes_of(&sfu));
+                    rp.set_bind_group(0, sbg, &[]);
+                    let planes = frustum_planes(&Mat4::from_cols_array_2d(&sfu.view_proj));
+                    let cam = Vec3::new(sfu.cam_pos[0], sfu.cam_pos[1], sfu.cam_pos[2]);
+                    let mut cur_key = 255u8;
+                    for d in w.draws.iter().filter(|d| d.skybox) {
+                        if !visible(&planes, Vec3::from(d.min) - cam, Vec3::from(d.max) - cam) {
+                            continue;
+                        }
+                        drawn += 1;
+                        if d.key != cur_key {
+                            cur_key = d.key;
+                            rp.set_pipeline(&self.world_pipes[d.key as usize]);
+                        }
+                        rp.set_bind_group(1, &w.mat_groups[d.material as usize], &[]);
+                        rp.draw_indexed(d.first_index..d.first_index + d.index_count, 0, 0..1);
+                    }
+                    rp.set_pipeline(&self.depth_reset_pipe);
+                    rp.draw(0..3, 0..1);
+                    rp.set_bind_group(0, fbg, &[]);
+                }
+            }
+            let only_sky = std::env::var_os("R5_SKYBOX_ONLY").is_some();
             let mut cur_key = 255u8;
             let planes = frustum_planes(&Mat4::from_cols_array_2d(&fu.view_proj));
             let cam = Vec3::new(fu.cam_pos[0], fu.cam_pos[1], fu.cam_pos[2]);
-            let mut drawn = 0;
             for d in &w.draws {
+                if d.skybox || only_sky {
+                    continue;
+                }
                 if !visible(&planes, Vec3::from(d.min) - cam, Vec3::from(d.max) - cam) || (d.key == 6 && std::env::var_os("R5_NOSKYMAT").is_some()) || (d.key / 2 == 2 && std::env::var_os("R5_NOBLEND").is_some()) {
                     continue;
                 }
@@ -787,4 +852,33 @@ fn visible(planes: &[Vec4; 5], mn: Vec3, mx: Vec3) -> bool {
         let v = Vec3::new(if p.x >= 0.0 { mx.x } else { mn.x }, if p.y >= 0.0 { mx.y } else { mn.y }, if p.z >= 0.0 { mx.z } else { mn.z });
         p.x * v.x + p.y * v.y + p.z * v.z + p.w >= 0.0
     })
+}
+
+/// The 3D skybox's frame: the S21 client (FUN_14099df90, docs/skybox.md) builds
+/// `sky = origin + R^T * world / scale` from the sky camera's origin, angles (R = AngleMatrix) and
+/// m_skybox3d.scale, so the eye moves 1/scale as far through the vista and turns by R^T.
+/// None when the map has no 3D skybox.
+fn sky_uniform(world_fu: &FrameUniform, cam: &Camera, world: &LoadedWorld, vfov: f32, aspect: f32) -> Option<FrameUniform> {
+    let m = &world.meta;
+    if m.sky_scale <= 0.0 || !world.draws.iter().any(|d| d.skybox) {
+        return None;
+    }
+    let a = m.sky_angles;
+    let r = glam::Mat3::from_euler(glam::EulerRot::ZYX, a[1].to_radians(), a[0].to_radians(), a[2].to_radians());
+    let rt = if std::env::var_os("R5_SKY_ROT_R").is_some() { r } else { r.transpose() };
+    let eye = Vec3::from(m.sky_camera) + rt * cam.pos / m.sky_scale;
+    let fwd = rt * shared::sim::forward_vec(cam.yaw, cam.pitch);
+    let view = glam::camera::rh::view::look_to_mat4(Vec3::ZERO, fwd, rt * Vec3::Z);
+    let proj = glam::camera::rh::proj::directx::perspective_infinite_reverse(vfov, aspect, 4.0 / m.sky_scale);
+    let vp = proj * view;
+    let mut fu = *world_fu;
+    fu.view_proj = vp.to_cols_array_2d();
+    fu.inv_view_proj = vp.inverse().to_cols_array_2d();
+    fu.cam_pos = [eye.x, eye.y, eye.z, 0.0];
+    // no cascades out here: every shadow lookup lands outside them and falls back to the baked term
+    let out = Mat4::from_cols(Vec4::ZERO, Vec4::ZERO, Vec4::ZERO, Vec4::new(10.0, 10.0, 0.0, 1.0));
+    fu.shadow_vp = [out.to_cols_array_2d(); csm::N];
+    // the world's height fog is in world units; the skybox has its own (not ported yet)
+    fu.fog_k[0][3] = 0.0;
+    Some(fu)
 }

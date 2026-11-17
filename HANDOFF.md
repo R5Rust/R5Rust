@@ -35,6 +35,12 @@ disassembled from r5apex_ds.exe), on a new AABB hull sweep (`Collision::trace_hu
 bridge. `cargo run --release -p shared --example movecheck` = 87 checks (all pass), ~50 us/tick on the real map.
 Details, approximations and Lab disagreements: `docs/movement.md`.
 
+## Rendering fixes (2026-11-16, session 5)
+Prop flag 0x10 = no shadow (evidence: the map's CSM caster tree holds none of them), decal meshes too; prop skins
+(record halfword 2) applied in export-map; the dome's cube is `freedm_cubemap_firingrange` via skin 1; 3D skybox pass
+from `sky_camera + R^T * eye / skyscale` (decompiled, FUN_14099df90). See docs/skybox.md, apex-lighting.md section 3.
+Open: skybox fog, vista brightness, water reflections are far darker than the real game (map03/map11 shots).
+
 ## Next (v2)
 1. `r5rust_ds`: UDP server running `shared::sim` at 60 Hz; client spawns it locally unless `--connect`.
 2. Client prediction + reconciliation (sim is already deterministic and shared).

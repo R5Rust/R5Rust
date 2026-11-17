@@ -30,13 +30,17 @@ pub struct Material {
     pub lightmapped: bool,
     /// sky-shaded surface (unlit, samples the sky cubemap by view direction)
     pub sky: bool,
+    /// never casts sun shadows (static prop flag 0x10, decal-class world meshes); extras `noShadow`
+    pub no_shadow: bool,
+    /// 3D skybox geometry (static prop flag 0x40): drawn only from the sky camera; extras `skybox`
+    pub skybox: bool,
 }
 
 impl Material {
     /// Does this surface block the player? Grass, leaves, bushes, wires, cables and decals don't
     /// (tree trunks, stumps and logs do). Blended (glass/fx) surfaces never do.
     pub fn solid(&self) -> bool {
-        if self.alpha_mode == 2 || self.sky {
+        if self.alpha_mode == 2 || self.sky || self.skybox {
             return false;
         }
         let n = self.name.to_ascii_lowercase();
@@ -105,6 +109,12 @@ pub struct Meta {
     pub sun_ambient: [f32; 3],
     pub bounds: [f32; 6],
     pub sky_camera: [f32; 3],
+    /// sky camera pitch/yaw/roll (degrees), after the level script's override
+    pub sky_angles: [f32; 3],
+    /// world units per skybox unit (m_skybox3d.scale, the sky_camera's "skyscale"); 0 = no 3D skybox
+    pub sky_scale: f32,
+    /// the first skybox vista's own light probe (LUMP 0x66) and env cubemap index
+    pub sky_probe: Option<(u32, u32)>,
 }
 
 fn f(v: &Value) -> f32 {
@@ -130,6 +140,7 @@ pub fn load_meta(path: &Path) -> Result<Meta, String> {
     let am = arr(sun.get("ambient").unwrap_or(&Value::Null), 3);
     let b = arr(v.get("bounds").unwrap_or(&Value::Null), 6);
     let sc = arr(v.get("skyCamera").unwrap_or(&Value::Null), 3);
+    let sa = arr(v.get("skyCameraAngles").unwrap_or(&Value::Null), 3);
     Ok(Meta {
         player_spawns: spawns,
         sun_dir: if d.iter().all(|x| *x == 0.0) { [-0.53, 0.34, -0.78] } else { [d[0], d[1], d[2]] },
@@ -137,6 +148,9 @@ pub fn load_meta(path: &Path) -> Result<Meta, String> {
         sun_ambient: if am.iter().all(|x| *x == 0.0) { [0.42, 0.61, 0.8] } else { [am[0], am[1], am[2]] },
         bounds: [b[0], b[1], b[2], b[3], b[4], b[5]],
         sky_camera: [sc[0], sc[1], sc[2]],
+        sky_angles: [sa[0], sa[1], sa[2]],
+        sky_scale: v.get("skyScale").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32,
+        sky_probe: v.get("skyboxProps").and_then(|a| a.get(0)).and_then(|p| Some((p.get("probe")?.as_u64()? as u32, p.get("cubemap")?.as_u64()? as u32))),
     })
 }
 
@@ -241,6 +255,8 @@ fn parse_materials(j: &Value) -> Vec<Material> {
             double_sided: m["doubleSided"].as_bool().unwrap_or(false),
             lightmapped: m["extras"]["lightmapped"].as_bool().unwrap_or(false),
             sky: m["extras"]["sky"].as_bool().unwrap_or(false),
+            no_shadow: m["extras"]["noShadow"].as_bool().unwrap_or(false),
+            skybox: m["extras"]["skybox"].as_bool().unwrap_or(false),
         });
     }
     out
