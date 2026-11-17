@@ -412,6 +412,7 @@ fn fs_main(i: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32
 
     let dbg = fr.misc.w;
     if (dbg > 0.5 && dbg < 1.5) { c = vec3<f32>(sun); }
+    if (dbg > 9.5 && dbg < 10.5) { c = vec3<f32>(sun_baked); }
     if (dbg > 1.5 && dbg < 2.5) { c = indirect; }
     if (dbg > 2.5 && dbg < 3.5) { c = albedo; }
     if (dbg > 3.5 && dbg < 4.5) { c = n * 0.5 + 0.5; }
