@@ -118,6 +118,9 @@ fn spawn(world: &LoadedWorld, args: &Args) -> (Player, f32, f32) {
     let pos = args.pos.unwrap_or(Vec3::new(s[0], s[1], s[2]));
     let pos = sim::find_free(&world.collision, pos);
     let mut p = Player::new(pos);
+    // no weapon in hand = Apex's holstered move speed (pl+0x6134 ~1.15): R5Flowstate measures sprint 299 = 260 * 1.15,
+    // crouch 92 = 80 * 1.15 (tools/r5f-probe)
+    p.speed_scale = 1.15;
     p.flying = args.fly;
     (p, args.yaw.unwrap_or(s[3]), args.pitch.unwrap_or(0.0))
 }
@@ -284,9 +287,9 @@ impl App {
         }
 
         let gfx = self.gfx.as_mut().unwrap();
-        let (binds, fov, menu_open, mantle_boost) = match &self.menu {
-            Some(m) => (m.settings.binds.clone(), m.settings.fov, m.open, m.settings.mantle_boost),
-            None => (Binds::default(), self.cfg.fov, false, true),
+        let (binds, fov, menu_open, mantle_boost, auto_sprint) = match &self.menu {
+            Some(m) => (m.settings.binds.clone(), m.settings.fov, m.open, m.settings.mantle_boost, m.settings.auto_sprint),
+            None => (Binds::default(), self.cfg.fov, false, true, true),
         };
         let frame = gfx.begin_frame();
         if let Some(g) = &mut self.game {
@@ -295,7 +298,7 @@ impl App {
             while g.accum >= TICK {
                 self.input.begin_tick();
                 // the menu freezes input (the sim keeps running, like Apex's Esc menu)
-                let input = if menu_open { Input { yaw: g.yaw, pitch: g.pitch, ..Default::default() } } else { bind_input(&self.input, &binds, g.yaw, g.pitch) };
+                let input = if menu_open { Input { yaw: g.yaw, pitch: g.pitch, ..Default::default() } } else { bind_input(&self.input, &binds, auto_sprint, g.yaw, g.pitch) };
                 self.input.end_tick();
                 g.prev_eye = g.player.eye();
                 sim::simulate(&mut g.player, &input, TICK, &g.world.collision);
@@ -382,7 +385,7 @@ impl App {
 }
 
 /// Movement input for one sim tick from the rebindable actions.
-fn bind_input(st: &InputState, binds: &Binds, yaw: f32, pitch: f32) -> Input {
+fn bind_input(st: &InputState, binds: &Binds, auto_sprint: bool, yaw: f32, pitch: f32) -> Input {
     let d = |a| st.down(binds, a);
     let ax = |p, n| (d(p) as i32 - d(n) as i32) as f32;
     Input {
@@ -390,7 +393,7 @@ fn bind_input(st: &InputState, binds: &Binds, yaw: f32, pitch: f32) -> Input {
         right: ax(Action::Right, Action::Left),
         jump: d(Action::Jump),
         jump_pressed: st.pressed(binds, Action::Jump),
-        sprint: d(Action::Sprint),
+        sprint: d(Action::Sprint) || auto_sprint,
         crouch: d(Action::Crouch),
         // fly mode: crouch or the Fly Down bind descends
         down: d(Action::FlyDown) || d(Action::Crouch),

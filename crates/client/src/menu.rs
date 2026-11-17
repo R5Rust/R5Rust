@@ -179,6 +179,11 @@ impl Menu {
     }
 
     fn gameplay_tab(&mut self, ui: &mut egui::Ui) {
+        if ui.checkbox(&mut self.settings.auto_sprint, "Auto Sprint").changed() {
+            self.dirty = true;
+        }
+        ui.label("Like Apex's Auto Sprint option: pushing forward sprints without holding the sprint key.");
+        ui.add_space(8.0);
         if ui.checkbox(&mut self.settings.mantle_boost, "Mantle Boost").changed() {
             self.dirty = true;
         }

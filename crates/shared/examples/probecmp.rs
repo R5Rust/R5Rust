@@ -44,6 +44,7 @@ fn main() {
         if !name.contains(&filter) { continue }
         // settle like the probe's Settle(): drop onto the floor and stand still
         let mut p = Player::new(sim::find_free(&col, start));
+        p.speed_scale = 1.15; // holstered, as the client
         for _ in 0..120 {
             sim::simulate(&mut p, &Input { yaw, ..Default::default() }, TICK, &col);
         }
@@ -85,12 +86,15 @@ fn main() {
                 forward: (h("forward") as i32 - h("back") as i32) as f32,
                 right: (h("moveright") as i32 - h("moveleft") as i32) as f32,
                 jump: h("jump"),
-                sprint: h("speed"),
+                sprint: true, // Kainz's R5F profile has player_setting_autosprint 1
                 crouch: h("duck"),
                 yaw,
                 ..Default::default()
             };
             ours.push(S { t, p: p.pos - p0, v: p.vel, g: p.on_ground });
+            if std::env::var_os("PROBE_TRACE").is_some() && k % 6 == 0 {
+                println!("  t{t:5.2} pos {:?} vel {:?} {} held {:?}", p.pos, p.vel, p.state_name(), held);
+            }
             sim::simulate(&mut p, &input, TICK, &col);
         }
         // compare

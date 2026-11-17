@@ -295,11 +295,13 @@ pub struct UserSettings {
     pub invert_y: bool,
     /// Apex's mantle boost (playlist var mantle_boost_enabled, on by default)
     pub mantle_boost: bool,
+    /// Apex's player_setting_autosprint: moving forward sprints without the sprint key (on in Kainz's R5F profile)
+    pub auto_sprint: bool,
 }
 
 impl Default for UserSettings {
     fn default() -> Self {
-        UserSettings { binds: Binds::default(), sensitivity: 1.6, fov: 100.0, invert_y: false, mantle_boost: true }
+        UserSettings { binds: Binds::default(), sensitivity: 1.6, fov: 100.0, invert_y: false, mantle_boost: true, auto_sprint: true }
     }
 }
 
