@@ -8,6 +8,7 @@ mods/my-mod/
   content/
     legends/    abilities/  passives/    weapons/
     ammo/       attachments/ consumables/ maps/
+    legend_skins/ weapon_skins/ heirlooms/ charms/ cosmetics/
 ```
 
 ```toml

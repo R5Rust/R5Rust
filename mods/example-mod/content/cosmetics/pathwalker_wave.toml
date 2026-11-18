@@ -1,0 +1,6 @@
+type = "emote"
+name = "Wave"
+description = "Template legend emote."
+rarity = "epic"
+legend = "pathwalker"
+asset = ""

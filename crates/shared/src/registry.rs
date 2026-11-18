@@ -1,4 +1,5 @@
-//! Content registry: every legend, ability, passive, weapon, ammo type, attachment, consumable and map the game
+//! Content registry: every legend, ability, passive, weapon, ammo type, attachment, consumable, map and cosmetic (legend
+//! and weapon skins, heirlooms, charms, emotes, banners, ...) the game
 //! knows about, loaded from data files so base content and mods are added the same way.
 //!
 //! Layout (one TOML file per entry; the file name is the entry's name):
@@ -99,10 +100,29 @@ pub enum Kind {
     Attachment,
     Consumable,
     Map,
+    LegendSkin,
+    WeaponSkin,
+    Heirloom,
+    Charm,
+    Cosmetic,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 8] = [Kind::Legend, Kind::Ability, Kind::Passive, Kind::Weapon, Kind::AmmoType, Kind::Attachment, Kind::Consumable, Kind::Map];
+    pub const ALL: [Kind; 13] = [
+        Kind::Legend,
+        Kind::Ability,
+        Kind::Passive,
+        Kind::Weapon,
+        Kind::AmmoType,
+        Kind::Attachment,
+        Kind::Consumable,
+        Kind::Map,
+        Kind::LegendSkin,
+        Kind::WeaponSkin,
+        Kind::Heirloom,
+        Kind::Charm,
+        Kind::Cosmetic,
+    ];
 
     /// Folder name under `content/`.
     pub fn dir(self) -> &'static str {
@@ -115,6 +135,11 @@ impl Kind {
             Kind::Attachment => "attachments",
             Kind::Consumable => "consumables",
             Kind::Map => "maps",
+            Kind::LegendSkin => "legend_skins",
+            Kind::WeaponSkin => "weapon_skins",
+            Kind::Heirloom => "heirlooms",
+            Kind::Charm => "charms",
+            Kind::Cosmetic => "cosmetics",
         }
     }
 }
@@ -259,6 +284,98 @@ pub struct MapDef {
     pub extra: toml::Table,
 }
 
+// ---------------------------------------------------------------- cosmetics
+//
+// Shared fields: `rarity` is common, rare, epic, legendary, mythic or heirloom. Asset paths are the game's own
+// (`mdl/...rmdl`, `settings/...`, material / texture guids), resolved against the player's install at run time.
+
+/// A skin for one legend.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LegendSkinDef {
+    pub name: String,
+    pub description: String,
+    pub legend: Option<Id>,
+    pub rarity: String,
+    /// body model (empty = the legend's default model with a different skin index)
+    pub model: String,
+    /// skin index on the model
+    pub skin: u32,
+    /// first-person arms model
+    pub arms_model: String,
+    pub replaces: Option<Id>,
+    #[serde(flatten)]
+    pub extra: toml::Table,
+}
+
+/// A skin for one weapon.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WeaponSkinDef {
+    pub name: String,
+    pub description: String,
+    pub weapon: Option<Id>,
+    pub rarity: String,
+    /// world / view models (empty = the weapon's default with a different skin index)
+    pub model: String,
+    pub view_model: String,
+    pub skin: u32,
+    /// reactive skins: number of kill stages
+    pub reactive_stages: u32,
+    pub replaces: Option<Id>,
+    #[serde(flatten)]
+    pub extra: toml::Table,
+}
+
+/// A legend's heirloom: the melee item that replaces fists, with its own inspect.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeirloomDef {
+    pub name: String,
+    pub description: String,
+    pub legend: Option<Id>,
+    /// the melee weapon entry it equips (damage etc. live there); empty = stock fists' numbers
+    pub weapon: Option<Id>,
+    pub view_model: String,
+    pub world_model: String,
+    /// inspect / draw / holster animation sets, by the game's names
+    pub animations: Vec<String>,
+    pub replaces: Option<Id>,
+    #[serde(flatten)]
+    pub extra: toml::Table,
+}
+
+/// A weapon charm.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CharmDef {
+    pub name: String,
+    pub rarity: String,
+    pub model: String,
+    pub replaces: Option<Id>,
+    #[serde(flatten)]
+    pub extra: toml::Table,
+}
+
+/// Any other cosmetic, told apart by `type`: emote, finisher, banner_frame, banner_pose, badge, tracker, intro_quip,
+/// kill_quip, holo_spray, skydive_emote, skydive_trail, music_pack, loading_screen, ... New types need no code change.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CosmeticDef {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+    pub description: String,
+    pub rarity: String,
+    /// the legend it belongs to (finishers, banner poses, quips, emotes); empty = any legend
+    pub legend: Option<Id>,
+    /// model / texture / sound / animation asset, whatever the type needs
+    pub asset: String,
+    pub replaces: Option<Id>,
+    #[serde(flatten)]
+    pub extra: toml::Table,
+}
+
 /// Lets the loader handle every def type the same way.
 pub trait Def: for<'de> Deserialize<'de> + Clone {
     const KIND: Kind;
@@ -313,6 +430,16 @@ def_impl!(AmmoTypeDef, Kind::AmmoType);
 def_impl!(AttachmentDef, Kind::Attachment, |s| s.weapons.iter().map(|i| (Kind::Weapon, i)).collect());
 def_impl!(ConsumableDef, Kind::Consumable);
 def_impl!(MapDef, Kind::Map);
+def_impl!(LegendSkinDef, Kind::LegendSkin, |s| s.legend.iter().map(|i| (Kind::Legend, i)).collect());
+def_impl!(WeaponSkinDef, Kind::WeaponSkin, |s| s.weapon.iter().map(|i| (Kind::Weapon, i)).collect());
+def_impl!(HeirloomDef, Kind::Heirloom, |s| {
+    let mut r: Vec<(Kind, &Id)> = Vec::new();
+    r.extend(s.legend.iter().map(|i| (Kind::Legend, i)));
+    r.extend(s.weapon.iter().map(|i| (Kind::Weapon, i)));
+    r
+});
+def_impl!(CharmDef, Kind::Charm);
+def_impl!(CosmeticDef, Kind::Cosmetic, |s| s.legend.iter().map(|i| (Kind::Legend, i)).collect());
 
 // ---------------------------------------------------------------- one registry
 
@@ -432,6 +559,11 @@ pub struct Content {
     pub attachments: Registry<AttachmentDef>,
     pub consumables: Registry<ConsumableDef>,
     pub maps: Registry<MapDef>,
+    pub legend_skins: Registry<LegendSkinDef>,
+    pub weapon_skins: Registry<WeaponSkinDef>,
+    pub heirlooms: Registry<HeirloomDef>,
+    pub charms: Registry<CharmDef>,
+    pub cosmetics: Registry<CosmeticDef>,
     /// the sources that were loaded, in load order
     pub sources: Vec<Source>,
     /// parse errors, duplicate ids, broken references (content still loads; bad entries are skipped)
@@ -465,6 +597,11 @@ impl Content {
         c.attachments.finish();
         c.consumables.finish();
         c.maps.finish();
+        c.legend_skins.finish();
+        c.weapon_skins.finish();
+        c.heirlooms.finish();
+        c.charms.finish();
+        c.cosmetics.finish();
         c.check_refs();
         c
     }
@@ -479,6 +616,11 @@ impl Content {
         load_kind(s, &mut self.attachments, errors);
         load_kind(s, &mut self.consumables, errors);
         load_kind(s, &mut self.maps, errors);
+        load_kind(s, &mut self.legend_skins, errors);
+        load_kind(s, &mut self.weapon_skins, errors);
+        load_kind(s, &mut self.heirlooms, errors);
+        load_kind(s, &mut self.charms, errors);
+        load_kind(s, &mut self.cosmetics, errors);
     }
 
     fn has(&self, kind: Kind, id: &Id) -> bool {
@@ -491,6 +633,11 @@ impl Content {
             Kind::Attachment => self.attachments.handle(id).is_some(),
             Kind::Consumable => self.consumables.handle(id).is_some(),
             Kind::Map => self.maps.handle(id).is_some(),
+            Kind::LegendSkin => self.legend_skins.handle(id).is_some(),
+            Kind::WeaponSkin => self.weapon_skins.handle(id).is_some(),
+            Kind::Heirloom => self.heirlooms.handle(id).is_some(),
+            Kind::Charm => self.charms.handle(id).is_some(),
+            Kind::Cosmetic => self.cosmetics.handle(id).is_some(),
         }
     }
 
@@ -515,6 +662,16 @@ impl Content {
         check!(self.attachments);
         check!(self.consumables);
         check!(self.maps);
+        check!(self.legend_skins);
+        check!(self.weapon_skins);
+        check!(self.heirlooms);
+        check!(self.charms);
+        check!(self.cosmetics);
+        for (_, id, c) in self.cosmetics.iter() {
+            if c.kind.is_empty() {
+                errs.push(format!("{id}: cosmetic without a `type` (emote, finisher, banner_frame, ...)"));
+            }
+        }
         // attachments must name a slot some weapon has
         for (_, id, a) in self.attachments.iter() {
             if !a.slot.is_empty() && !self.weapons.is_empty() && !self.weapons.iter().any(|(_, _, w)| w.attachment_slots.iter().any(|s| s == &a.slot)) {
@@ -540,6 +697,11 @@ impl Content {
             ("attachments", self.attachments.len()),
             ("consumables", self.consumables.len()),
             ("maps", self.maps.len()),
+            ("legend skins", self.legend_skins.len()),
+            ("weapon skins", self.weapon_skins.len()),
+            ("heirlooms", self.heirlooms.len()),
+            ("charms", self.charms.len()),
+            ("cosmetics", self.cosmetics.len()),
         ]
         .iter()
         .map(|(k, n)| format!("{n} {k}"))
@@ -580,7 +742,7 @@ fn load_kind<T: Def>(s: &Source, reg: &mut Registry<T>, errors: &mut Vec<String>
 }
 
 /// Fields that hold ids; a bare `"name"` in them becomes `"<namespace>:name"`.
-const ID_FIELDS: [&str; 7] = ["tactical", "ultimate", "passives", "ammo", "weapons", "replaces", "legends"];
+const ID_FIELDS: [&str; 9] = ["tactical", "ultimate", "passives", "ammo", "weapons", "replaces", "legends", "legend", "weapon"];
 
 fn qualify_ids(text: &str, ns: &str) -> String {
     let Ok(mut table) = toml::from_str::<toml::Table>(text) else { return text.to_string() };

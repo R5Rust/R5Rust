@@ -1,0 +1,5 @@
+name = "Pathwalker Blade"
+description = "Melee weapon behind the example heirloom."
+class = "melee"
+damage = 50.0
+move_speed_scale = 1.15

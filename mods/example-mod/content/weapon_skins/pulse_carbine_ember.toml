@@ -1,0 +1,6 @@
+name = "Ember Coil"
+description = "Template weapon skin (reactive)."
+weapon = "pulse_carbine"
+rarity = "legendary"
+skin = 2
+reactive_stages = 3

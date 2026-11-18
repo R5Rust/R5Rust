@@ -44,6 +44,11 @@ fn main() {
     list("attachments", &c.attachments);
     list("consumables", &c.consumables);
     list("maps", &c.maps);
+    list("legend skins", &c.legend_skins);
+    list("weapon skins", &c.weapon_skins);
+    list("heirlooms", &c.heirlooms);
+    list("charms", &c.charms);
+    list("cosmetics", &c.cosmetics);
     println!("\n{}", c.summary());
     for e in &c.errors {
         println!("ERROR {e}");

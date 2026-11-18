@@ -1,0 +1,7 @@
+name = "Pathwalker Heirloom"
+description = "Template heirloom."
+legend = "pathwalker"
+weapon = "pathwalker_blade"
+view_model = ""
+world_model = ""
+animations = ["inspect", "draw", "holster"]
