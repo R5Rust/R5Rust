@@ -9,6 +9,15 @@
 //!
 //! The on-wall motion itself is WalkMove's wall branch (walk.rs, walkmove.md 7W). While on a wall the wall is
 //! the ground entity and `surface_normal` (pl+0x662c) is its normal.
+//!
+//! Checked against the S21 client r5apex_dx12.exe (ds -> dx12): SurfaceTransition 0x140a4f120, classifier
+//! 0x140a4e220, WallProbe 0x140a4ee20, MantleIntent 0x140a40710, FacingWall 0x140b04bb0, CanWallClimb
+//! 0x140b04c00, WallTop 0x140a4d470, UpWallBoostScale 0x140a4fed0, WallHangSlipScale 0x140a4ffa0, WallSpeedFrac
+//! 0x140a34560, WallRunUpdate 0x140a4d4e0, EndWallRun 0x140b04df0, WallSurfaceChange 0x140a4fb00, WallJump
+//! 0x140a50050, RememberWall 0x140a58f60, LedgeAssist 0x140a58ec0 (S21 player offsets: surface normal
+//! pl+0x2ab0, attach origin 0x2ac8, start time 0x3624, ref height 0x2078). The same math for a stock pilot except
+//! two S21 rules: crouch held never attaches (classify), and the wall probes run on command_number % 4
+//! (wall_run_update; the ds build has that too, the first port assumed phase 0 every tick).
 
 use super::{duck, ground, upright, Ctx, IN_DUCK};
 use crate::collision::Trace;
@@ -227,7 +236,11 @@ fn classify(c: &Ctx, pos: Vec3, nrm: Vec3, tr: Option<&Trace>, vel: Vec3) -> i32
             return 0;
         }
     }
-    // crouched and can't stand up here (slide state 3 never happens)
+    // S21 0x140a4e650 (new since ds): crouch held (mv+0x24 & 0x4000004, duck / toggle duck) never attaches
+    if c.buttons & IN_DUCK != 0 {
+        return 0;
+    }
+    // crouched and can't stand up here (pl+0x1dfc, the S21 slide flag that replaced ds slide state 3, never set)
     if c.p.duck_state != 0 && !duck::can_unduck(c) {
         return 0;
     }
@@ -486,11 +499,37 @@ pub(super) fn wall_run_update(c: &mut Ctx) {
         fall = true;
         timeout = true;
     }
-    // the wall must still be within wallrunAllowedWallDistance of a probe 16 up (pl+0x6578 flags assumed 0)
+    // The wall probes run on a 4-command cycle: `**(int**)(pl+0x34b8) % 4` is the current usercmd's
+    // command_number (S21 0x140a4dc3a; ds 0x140ba04xx has the same code at pl+0x6578).
     let o = c.p.pos;
-    let r = wall_probe(c, Vec3::new(o.x, o.y, o.z + 16.0), 16.0, n, c.half_width(), c.s.wallrun_allowed_wall_distance, None, 0);
-    if r == 3 && !fall {
-        return;
+    let dist = c.s.wallrun_allowed_wall_distance;
+    match (c.p.cmd_number as i32) % 4 {
+        // the wall must still be within wallrunAllowedWallDistance of a probe 16 up, or you fall off
+        0 => {
+            let r = wall_probe(c, Vec3::new(o.x, o.y, o.z + 16.0), 16.0, n, c.half_width(), dist, None, 0);
+            if r == 3 && !fall {
+                return;
+            }
+        }
+        // rising: a probe 32 up that misses the wall (its top is passing the chest) slows the climb by
+        // 3 * ft * wallrun_avoid_wall_top_decel (3000), floored at 0
+        2 => {
+            if 0.0 < c.p.vel.z {
+                let r = wall_probe(c, Vec3::new(o.x, o.y, o.z + 32.0), 16.0, n, c.half_width(), dist, None, 0);
+                if r != 3 {
+                    let vz = c.p.vel.z - (c.ft * 3.0) * c.cv.wallrun_avoid_wall_top_decel;
+                    c.p.vel.z = if vz <= 0.0 { 0.0 } else { vz };
+                }
+            }
+            if !fall {
+                return;
+            }
+        }
+        _ => {
+            if !fall {
+                return;
+            }
+        }
     }
     // fall off. LedgeAssist 0x140baca70 (jump assist) is not ported, so there is never an assist target and the
     // player is always pushed off the wall by wallrun_fallAwaySpeed.

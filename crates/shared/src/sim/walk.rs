@@ -8,20 +8,28 @@ use glam::Vec3;
 /// The engine's MAX(len, eps) epsilon (runtime value; any tiny positive number behaves the same).
 const EPS: f32 = 1e-8;
 
-/// FullWalkMove 0x140b9ead0 (fullwalkmove.md section 2).
+/// FullWalkMove, S21 0x140a4c810 (ds 0x140b9ead0, fullwalkmove.md section 2). The S21 order is the ds one; the
+/// extra S21 steps are all gated on things a stock pilot never has (listed below where they run).
 pub(super) fn full_walk_move(c: &mut Ctx) {
-    let dt = c.ft; // TimeScale = 1 (no air slow-mo)
-    // step 1: start gravity
+    let dt = c.ft; // TimeScale 0x140b0f6d0 = 1 (no air slow-mo)
+    // S21 entry: the dodge flags pl+0x36aa / 0x363c expire (dodge only)
+    // step 1: start gravity (S21 0x140a36130)
     apply_half_gravity(c, dt);
-    // step 2
+    // step 2: CheckVelocity 0x140a50da0. Then, before the jump, S21 runs: trigger touches / launch pads
+    // 0x140a37390, the pull-to-target 0x140a379c0 (pl+0x2be2), the path mover 0x140a37560 (pl+0x4838), the
+    // scripted launch 0x140a3b310 (pl+0x2cb8) and the trigger steer 0x140a4c4e0 (pl+0x30f4): none for a pilot
     check_velocity(c);
+    // CheckJumpButton 0x140a3b550
     check_jump_button(c);
-    // step 3: WallRunUpdate (when a wall climb ends). Constraints / tethers / gravity-grenade fields: not in scope
+    // step 3: WallRunUpdate (when a wall climb ends). Constraints 0x140a3e4f0 / tethers 0x140a3f050 / the
+    // gravity-grenade pull fields (the FUN_140aca1a0 loop): not in scope
     wall::wall_run_update(c);
     // step 5
     check_velocity(c);
     if c.gnd() {
-        // step 6G: no slip triggers, minPush 0 (on a wall the wall is the ground: WalkMove's wall branch)
+        // step 6G: no slip triggers (pl+0x3078 count 0), so the slip direction is zero and minPush is 0; S21
+        // computes minPush as the velocity along it (capped by slipSpeed via 0x140a36a90 / 0x140a36c20) and
+        // re-applies it after WalkMove 0x140a4a7c0. (On a wall the wall is the ground: WalkMove's wall branch.)
         walk_move(c, dt);
     } else {
         // step 7A
@@ -30,10 +38,10 @@ pub(super) fn full_walk_move(c: &mut Ctx) {
         }
         air_move(c, dt);
     }
-    // step 8 (ImpactCheck: sounds/events only)
+    // step 8 (ImpactCheck 0x140a4d040: sounds/events only), CategorizePosition 0x140a51bc0, end gravity
     ground::categorize_position(c);
     apply_half_gravity(c, dt);
-    // step 9: strip velocity along n when grounded
+    // step 9: strip velocity along n (S21 pl+0x2ab0, the surface normal) when grounded
     if c.gnd() {
         let n = c.p.surface_normal;
         let v = c.p.vel;
@@ -44,7 +52,9 @@ pub(super) fn full_walk_move(c: &mut Ctx) {
     check_velocity(c);
 }
 
-/// ApplyHalfGravity / AddGravity 0x140b8c2a0 (fullwalkmove.md 3, slide.md 2E): half of gravity*dt per call,
+/// ApplyHalfGravity / AddGravity, S21 0x140a36130 (ds 0x140b8c2a0; same math: the double-precision
+/// `(gs*sv_gravity)*0.5*dt*W`, gravity dir (0,0,-1) at 0x1427c9988; S21 skips it entirely on a launch-pad latch
+/// pl+0x2bba or the launch fall limiter pl+0x4960/0x4964) (fullwalkmove.md 3, slide.md 2E): half of gravity*dt per call,
 /// plus the slope-parallel part of gravity while sliding on the ground. On a wall it is scaled by
 /// WallSpeedFrac (0 while climbing into the wall).
 pub(super) fn apply_half_gravity(c: &mut Ctx, dt: f32) {
@@ -63,10 +73,13 @@ pub(super) fn apply_half_gravity(c: &mut Ctx, dt: f32) {
     }
 }
 
-/// CheckVelocity 0x140ba3b60: NaN guard and sv_maxvelocity clamp (scales the whole vector, keeping direction).
+/// CheckVelocity, S21 0x140a50da0 (ds 0x140ba3b60): NaN guard and sv_maxvelocity clamp (scales the whole vector,
+/// keeping direction). Skipped while the velocity is within 0.001 (squared, compared as a double) of the last
+/// checked one.
 pub(super) fn check_velocity(c: &mut Ctx) {
     let v = &mut c.p.vel;
-    if (c.p.cv_cache - *v).length_squared() < 0.001 {
+    let d = c.p.cv_cache - *v;
+    if !(0.001f64 <= (((d.y * d.y) + (d.x * d.x)) + (d.z * d.z)) as f64) {
         return;
     }
     for i in 0..3 {
@@ -91,8 +104,12 @@ pub(super) fn check_velocity(c: &mut Ctx) {
     c.p.cv_cache = *v;
 }
 
-/// CheckJumpButton 0x140b8d490 (fullwalkmove.md 4, movemodes.md C). Ground jump and the jump off a wall
-/// (WallJump): this legend has no double jump, dodge or boost.
+/// CheckJumpButton, S21 0x140a3b550 (ds 0x140b8d490; fullwalkmove.md 4, movemodes.md C). Ground jump and the
+/// jump off a wall (WallJump 0x140a50050): this legend has no double jump, dodge or boost. The S21 one is the ds
+/// one for a stock pilot (same constants 0.4 / 0.85 / 30 / -0.999 and cvar defaults 0.2 / 1.0 / 450 / 1.0 / -1 /
+/// 100). Its extra refusals (path mover pl+0x4838, pl+0x19b0 == 13) and the slide super jump
+/// (`player_slideSuperJumpEnabled` + `slide_super_jump_enabled`, a mod) are not stock paths. Not modelled: the
+/// surface jump factor (surface data +0x48 at pl+0x4058, 1 on default surfaces) and LedgeAssist 0x140a58ec0.
 pub(super) fn check_jump_button(c: &mut Ctx) -> bool {
     // J2: a jump press this tick (holding never re-jumps: there is no auto-hop)
     if c.pressed & IN_JUMP == 0 {
@@ -140,7 +157,7 @@ pub(super) fn check_jump_button(c: &mut Ctx) -> bool {
             }
             // 85..100 % of slideMaxJumpSpeed snaps up to it
             let b = c.s.slide_max_jump_speed;
-            if h2 > (b * 0.85) * (b * 0.85) && b * b > h2 {
+            if h2 > ((b * 0.85) * b) * 0.85 && b * b > h2 {
                 *v *= b / sc;
             }
             c.p.slide_long_jump = false;
@@ -204,14 +221,23 @@ pub(super) fn check_jump_button(c: &mut Ctx) -> bool {
     true
 }
 
-/// GetAccelerate 0x140b8c5d0 (slide branch from slide.md 2F; the rest disassembled for this port):
-/// sprintAcceleration above walk speed, lowAcceleration below lowSpeed, else acceleration.
+/// Stance block GetAccelerate / Friction read (S21 ctx+0x20 / ctx+0x28): the one latched at PlayerMove entry,
+/// before Duck. On the tick the stance changes it is the old one, while GetMaxSpeed already uses the new one
+/// (real: a slide that ends at 167 u/s reaches 299 in one tick on the crouch stance's acceleration 2500; ducking at
+/// walk speed decelerates at the standing 1250, not the crouch 0.6 x 2500).
+fn move_stance(c: &Ctx) -> crate::settings::Stance {
+    if c.move_ducked { c.s.crouch } else { c.s.stand }
+}
+
+/// GetAccelerate, S21 0x140a36450 (ds 0x140b8c5d0; slide branch from slide.md 2F): slideAccel while sliding,
+/// sprintAcceleration above walk speed - 1, lowAcceleration below lowSpeed, else acceleration; all x pl+0x1e00 (1)
+/// x speed scale. Stance numbers from `move_stance`.
 pub(super) fn get_accelerate(c: &Ctx) -> f32 {
     let sc = c.p.speed_scale;
     if c.p.sliding {
         return c.s.slide_accel * sc;
     }
-    let st = c.stance();
+    let st = move_stance(c);
     let v = c.p.vel;
     let h2 = v.x * v.x + v.y * v.y;
     if st.sprint_acceleration >= 0.0 {
@@ -227,7 +253,7 @@ pub(super) fn get_accelerate(c: &Ctx) -> f32 {
     st.acceleration * sc
 }
 
-/// Friction 0x140b9c7c0. Velocity along the wish direction (up to the wish speed) is not slowed at all; the
+/// Friction, S21 0x140a4a280 with its deceleration getter 0x140a36580 (ds 0x140b9c7c0). Velocity along the wish direction (up to the wish speed) is not slowed at all; the
 /// rest decelerates linearly at the stance's deceleration (sprintDeceleration above walk speed, the slide
 /// decels while sliding, which also decay by slideVelocityDecay^dt).
 fn friction(c: &mut Ctx, wish: Vec3, redirect: f32) {
@@ -254,9 +280,9 @@ fn friction(c: &mut Ctx, wish: Vec3, redirect: f32) {
         g += a;
         r -= a;
     }
-    // 3. which deceleration
+    // 3. which deceleration (0x140a36580; stance numbers from `move_stance`)
     let speed = r.length();
-    let st = *c.stance();
+    let st = move_stance(c);
     let mut fric = -1.0f32;
     let cap = c.p.speed_scale * st.speed;
     if v.length_squared() > cap * cap {
@@ -294,7 +320,7 @@ fn friction(c: &mut Ctx, wish: Vec3, redirect: f32) {
     }
 }
 
-/// Accelerate 0x140b9c610: linear (u/s^2) acceleration toward the wish speed, never past max(|v|, wishspeed).
+/// Accelerate, S21 0x140a4a0d0 (ds 0x140b9c610): linear (u/s^2) acceleration toward the wish speed, never past max(|v|, wishspeed).
 fn accelerate(c: &mut Ctx, dir: Vec3, ws: f32, accel: f32) {
     let v = c.p.vel;
     let max2 = v.length_squared().max(ws * ws);
@@ -311,7 +337,8 @@ fn accelerate(c: &mut Ctx, dir: Vec3, ws: f32, accel: f32) {
     c.p.vel = nv;
 }
 
-/// WalkMove 0x140b9cdb0 (walkmove.md): the on-surface move. Upright: the ground walk (Friction + Accelerate).
+/// WalkMove, S21 0x140a4a7c0 (ds 0x140b9cdb0, walkmove.md): the on-surface move. S21's tail is the ds one for a stock
+/// pilot (base velocity / ride-along pushes, forced-slide pl+0x1dfc and moving ground are not ported). Upright: the ground walk (Friction + Accelerate).
 /// On a wall: the wallrun/climb branch (7W), then the shared tail (trace, StepSlide, SurfaceTransition).
 fn walk_move(c: &mut Ctx, dt: f32) {
     if upright(c.p.surface_normal) {
@@ -359,6 +386,12 @@ fn walk_move(c: &mut Ctx, dt: f32) {
         c.p.pos = tr.endpos;
     } else {
         let ov = c.p.vel;
+        // S21 WalkMove 0x140a4a7c0 tail (ds walkmove.md 8): a blocking plane steeper than 60 deg (0 < n.z < 0.5) hit while on
+        // upright ground is replaced by PlaneFromNormal (S21 0x140a4a720, ds 0x140818280): a vertical wall, so
+        // StepSlide does not ride up it
+        if 0.5 > tr.normal.z && tr.normal.z > 0.0 && has_q && upright(n) {
+            tr.normal = plane_from_normal(tr.normal, q);
+        }
         if !step::step_slide(c, &mut tr, true, Some(e), false) {
             let o = c.p.pos;
             if (o - tr.endpos).dot(tr.normal) > -0.03125 {
@@ -368,6 +401,16 @@ fn walk_move(c: &mut Ctx, dt: f32) {
         }
     }
     ground::stay_on_ground(c);
+}
+
+/// PlaneFromNormal, S21 0x140a4a720: the horizontal unit normal (-(a x b).y, (a x b).x, 0) of hit plane `a` against
+/// ground plane `b` (MAX(len, eps) as the binary; z is 0 * (1/len)).
+fn plane_from_normal(a: Vec3, b: Vec3) -> Vec3 {
+    let y = b.z * a.y - a.z * b.y;
+    let x = -(a.z * b.x - b.z * a.x);
+    let l = (x * x + y * y + 0.0).sqrt().max(EPS);
+    let k = 1.0 / l;
+    Vec3::new(x * k, y * k, k * 0.0)
 }
 
 /// WalkMove steps 1-7G, upright: ground input (sprint x1.25, soft clamp), Friction, Accelerate.
@@ -402,17 +445,20 @@ fn ground_walk(c: &mut Ctx) {
     let dw = n.dot(w);
     let mut ww = w - n * dw;
     // 7G: while sliding the wish loses its component along the velocity (you steer, you don't push)
+    // (S21 0x140a4a7c0 operand order: the residual is float noise whose sign decides whether Accelerate pulls
+    // the slide back by up to slideAccel * ft, so it has to round like the binary)
     if c.p.sliding {
         let v = c.p.vel;
-        let dv = v.dot(ww);
+        let dv = ((ww.x * v.x) + (ww.y * v.y)) + (ww.z * v.z);
         if dv > 0.0 {
-            let i = 1.0 / v.length_squared();
-            ww -= v * (dv * i);
+            let i = 1.0 / (((v.x * v.x) + (v.y * v.y)) + (v.z * v.z));
+            ww = Vec3::new(ww.x - ((v.x * dv) * i), ww.y - ((v.y * dv) * i), ww.z - ((v.z * dv) * i));
         }
     }
-    let l = ww.length();
-    let dir = ww * (1.0 / l.max(EPS));
+    let l = (((ww.x * ww.x) + (ww.y * ww.y)) + (ww.z * ww.z)).sqrt();
     let ws = l.min(1.0) * c.max_speed;
+    let inv = 1.0 / l.max(EPS);
+    let dir = Vec3::new(ww.x * inv, ww.y * inv, ww.z * inv);
     let acc = get_accelerate(c);
     friction(c, dir, ws);
     accelerate(c, dir, ws, acc);
@@ -585,7 +631,7 @@ fn wall_walk(c: &mut Ctx) {
     }
 }
 
-/// AirAccelerate 0x140b9b510. Below the wish speed along the wish direction: plain accel*dt. Otherwise the
+/// AirAccelerate, S21 0x140a485e0 (ds 0x140b9b510). Below the wish speed along the wish direction: plain accel*dt. Otherwise the
 /// air-control step that turns without gaining speed.
 fn air_accelerate(c: &mut Ctx, dir: Vec3, ws: f32, accel: f32, dt: f32) {
     let v = c.p.vel;
@@ -596,7 +642,8 @@ fn air_accelerate(c: &mut Ctx, dir: Vec3, ws: f32, accel: f32, dt: f32) {
         return;
     }
     let max2 = v.length_squared().max(ws * ws);
-    let mut nv = dir * (c.ft * c.cv.air_control) + v;
+    // (dir * ft) * player_extraairaccelleration, gpGlobals frametime (not the dt argument)
+    let mut nv = (dir * c.ft) * c.cv.air_control + v;
     let n2 = nv.length_squared();
     if n2 > max2 {
         nv *= (max2 / n2).sqrt();
@@ -736,7 +783,10 @@ fn jump_grace(c: &mut Ctx) {
     // 0x140a58ec0 -> 0x140a58560 (jump assist toward a ledge target): not ported, as in the S3 port
 }
 
-/// AirMove 0x140b9b740 (airmove.md).
+/// AirMove, S21 0x140a48f90 (ds 0x140b9b740, airmove.md). Same numbers for a stock pilot: wish from mv+0x78,
+/// airSpeed x min(|wish|, 1) (0 with airStrafeEnabled), airDrag/airFriction, AirAccelerate with airAcceleration,
+/// then the lurch. Not ported (not stock): slipAirRestrictDuration, jetpack pitch movement and post-effect drag,
+/// grapple swing, the pl+0x4960 launch fall limiter, base-velocity push.
 fn air_move(c: &mut Ctx, dt: f32) {
     let now = c.now;
     // steps 1-4 (no slip / jetpack / grapple): wish direction from mv+0x78, keeping its analog length
@@ -750,7 +800,9 @@ fn air_move(c: &mut Ctx, dt: f32) {
     let v = c.p.vel;
     let h = (v.y * v.y + v.x * v.x).sqrt();
     if h > 0.0 {
-        let dd = ((h * c.s.air_drag) + c.s.air_friction) * (h * dt);
+        // S21: (((drag*h + friction) * ramp) * h) * dt, ramp (pl+0x2a50) = 1; S21 picks jetpackPostEffectDrag
+        // instead of airDrag right after a jetpack (0x140b00f50), not a stock-pilot path
+        let dd = (((h * c.s.air_drag) + c.s.air_friction) * h) * dt;
         let f = (h - dd).max(0.0) / h;
         c.p.vel = Vec3::new((v.x - v.x) + f * v.x, (v.y - v.y) + f * v.y, v.z);
     }
@@ -811,6 +863,9 @@ fn air_move(c: &mut Ctx, dt: f32) {
     let vz = c.p.vel.z;
     if nz > 0.0 && 0.7 > nz && c.p.pos.z == o.z && vz >= 0.0 && 0.013531647 >= vz {
         tr.normal = c.p.surface_normal;
+        // S21 also caches this faked trace for CategorizePosition (ctx+0x4a0 / 0x620, end origin - 2n) and
+        // remembers the origin (pl+0x369c)
+        ground::remember_stall(c, &tr);
     }
     c.p.contact_plane = tr.normal;
     // SurfaceTransition: attach to the wall the move was blocked by

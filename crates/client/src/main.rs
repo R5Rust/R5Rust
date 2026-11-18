@@ -394,7 +394,7 @@ impl App {
             while g.accum >= TICK {
                 self.input.begin_tick();
                 // the menu freezes input (the sim keeps running, like Apex's Esc menu)
-                let input = if menu_open { Input { yaw: g.yaw, pitch: g.pitch, ..Default::default() } } else { bind_input(&self.input, &binds, auto_sprint, g.yaw, g.pitch) };
+                let input = if menu_open { Input { yaw: g.yaw, pitch: g.pitch, ..Default::default() } } else { bind_input(&self.input, &binds, auto_sprint && sim::auto_sprint(&g.player), g.yaw, g.pitch) };
                 self.input.end_tick();
                 g.prev_eye = g.player.eye();
                 sim::simulate(&mut g.player, &input, TICK, &g.world.collision);
@@ -504,7 +504,18 @@ impl App {
 /// Movement input for one sim tick from the rebindable actions.
 fn bind_input(st: &InputState, binds: &Binds, auto_sprint: bool, yaw: f32, pitch: f32) -> Input {
     let d = |a| st.down(binds, a);
-    let ax = |p, n| (d(p) as i32 - d(n) as i32) as f32;
+    // the S21 client's KeyState (r5apex_dx12 0x140900e40): a key that went down this tick counts 0.5, one pressed
+    // and released within the tick (a wheel notch) 0.25, held 1.0
+    let ks = |a| {
+        let held = binds.get(a).iter().flatten().any(|b| st.held.contains(b));
+        match (held, st.pressed(binds, a)) {
+            (true, true) => 0.5,
+            (true, false) => 1.0,
+            (false, true) => 0.25,
+            (false, false) => 0.0,
+        }
+    };
+    let ax = |p, n| ks(p) - ks(n);
     Input {
         forward: ax(Action::Forward, Action::Back),
         right: ax(Action::Right, Action::Left),

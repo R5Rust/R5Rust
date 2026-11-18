@@ -1,11 +1,13 @@
 //! Ground handling: CategorizePosition, SetGroundEntity, StayOnGround / GroundSnapTrace, step smoothing,
-//! CheckStuck, LandingSpeedScale (playermove.md sections 4-8).
+//! CheckStuck, LandingSpeedScale (playermove.md sections 4-8), checked against the S21 client (r5apex_dx12.exe):
+//! CategorizePosition 0x140a51bc0, SetGroundEntity 0x140a51650, StayOnGround 0x140a348a0, GroundSnapTrace
+//! 0x140a34670, StepSmooth 0x140a47d70, LandingSpeedScale 0x140b09a60.
 
 use super::{duck, upright, wall, Ctx, MoveType};
 use crate::collision::Trace;
 use glam::Vec3;
 
-/// CategorizePosition 0x140ba4f30 (playermove.md 4), forceVel = 0 at every caller here. The world is the only
+/// CategorizePosition S21 0x140a51bc0 = ds 0x140ba4f30 (playermove.md 4), forceVel = 0 at every caller here. The world is the only
 /// ground entity, so base velocity / standable-entity / push-off branches drop out. On a wall the probe runs
 /// along -n and any hit counts: the wall is the ground entity.
 pub(super) fn categorize_position(c: &mut Ctx) {
@@ -31,8 +33,24 @@ pub(super) fn categorize_position(c: &mut Ctx) {
         c.p.ground_normal = Vec3::ZERO;
         return;
     }
-    // 4.6
-    let t = c.trace(o0, pend);
+    // 4.6: reuse this tick's StayOnGround / stall trace when it ended within 2 units of our probe end
+    let t = match c.ground_cache {
+        Some((e, t)) if {
+            let d = pend - e;
+            4.0 > ((d.y * d.y) + (d.x * d.x)) + (d.z * d.z)
+        } =>
+        {
+            t
+        }
+        _ => {
+            let mut t = c.trace(o0, pend);
+            // a steep hit ending exactly where AirMove last stalled on a steep slope counts as flat ground
+            if 1.0 > t.fraction && 0.7 > t.normal.z && t.endpos == c.p.stall_pos {
+                t.normal = Vec3::new(0.0, 0.0, 1.0);
+            }
+            t
+        }
+    };
     let hit = t.fraction < 1.0;
     let mut tn = t.normal;
     let mut dn = tn.dot(n);
@@ -118,7 +136,7 @@ fn finish(c: &mut Ctx, t: &Trace, tn: Vec3, snap: bool) {
     c.p.ground_normal = if c.gnd() && (1.0 > t.fraction || t.allsolid || t.startsolid) { tn } else { Vec3::ZERO };
 }
 
-/// SetGroundEntity 0x140ba46d0 (playermove.md 5). `tr` = the ground trace (normal used), None = leave the ground.
+/// SetGroundEntity S21 0x140a51650 = ds 0x140ba46d0 (playermove.md 5; same math in S21). `tr` = the ground trace (normal used), None = leave the ground.
 pub(super) fn set_ground(c: &mut Ctx, tr: Option<&Trace>) {
     let n = c.p.surface_normal;
     let old = c.p.ground;
@@ -166,7 +184,7 @@ pub(super) fn set_ground(c: &mut Ctx, tr: Option<&Trace>) {
     }
 }
 
-/// LandingSpeedScale 0x140bf5200 (disassembled for this port): 1 unless within landSlowdownDuration of a landing
+/// LandingSpeedScale S21 0x140b09a60 = ds 0x140bf5200 (disassembled for this port, identical in S21): 1 unless within landSlowdownDuration of a landing
 /// whose impact height exceeded landSlowdownHeightMin.
 pub(super) fn landing_speed_scale(c: &Ctx) -> f32 {
     let s = &c.s;
@@ -186,12 +204,17 @@ pub(super) fn landing_speed_scale(c: &Ctx) -> f32 {
     1.0 - ((1.0 - r) * hf) * (1.0 - s.land_slowdown_frac)
 }
 
-/// StayOnGround 0x140b8b9f0 (6.1): keep the feet on the floor down slopes and stairs. On a wall it only
-/// reports the wall (no snap).
+/// StayOnGround S21 0x140a348a0 = ds 0x140b8b9f0 (6.1): keep the feet on the floor down slopes and stairs. On a
+/// wall it only reports the wall (no snap). Its trace is cached for CategorizePosition (ctx+0x620/0x490/0x4a0),
+/// whatever GroundSnapTrace returned.
 pub(super) fn stay_on_ground(c: &mut Ctx) -> bool {
     let o = c.p.pos;
     let n = c.p.surface_normal;
-    let Some(t) = ground_snap_trace(c, o, c.s.step_height, n) else { return false };
+    let (t, ok) = ground_snap_trace(c, o, c.s.step_height, n);
+    c.ground_cache = Some((o - n * c.s.step_height, t));
+    if !ok {
+        return false;
+    }
     if !upright(n) {
         return true;
     }
@@ -203,8 +226,9 @@ pub(super) fn stay_on_ground(c: &mut Ctx) -> bool {
     true
 }
 
-/// GroundSnapTrace 0x140b8b7c0 (6.2)
-fn ground_snap_trace(c: &Ctx, start: Vec3, dist: f32, dir: Vec3) -> Option<Trace> {
+/// GroundSnapTrace S21 0x140a34670 = ds 0x140b8b7c0 (6.2). Returns the trace (as the caller's buffer holds it)
+/// and whether to snap.
+fn ground_snap_trace(c: &Ctx, start: Vec3, dist: f32, dir: Vec3) -> (Trace, bool) {
     let mut s = start;
     let e = s - dir * dist;
     let mut t = c.trace(s, e);
@@ -212,27 +236,38 @@ fn ground_snap_trace(c: &Ctx, start: Vec3, dist: f32, dir: Vec3) -> Option<Trace
         s += dir;
         t = c.trace(s, e);
         if t.startsolid {
-            return None;
+            return (t, false);
         }
     }
     let f = t.fraction;
     if !(0.0 < f) {
-        return Some(t);
+        return (t, true);
     }
     if f >= 1.0 {
-        return None;
+        return (t, false);
     }
     if 0.7 > dir.dot(t.normal) {
-        return None;
+        return (t, false);
     }
     let off = (t.endpos - start).dot(dir);
     if off.abs() <= 0.015625 {
         t.endpos = start;
     }
-    Some(t)
+    (t, true)
 }
 
-/// StepSmooth 0x140b9ac40 (6.3): the camera lags a step by its height, then DecayStepSmooth eases it back.
+/// AirMove's steep-slope stall (S21 0x140a48f90, tail; ds airmove.md step 13): the faked contact trace (normal =
+/// the surface normal) is cached for CategorizePosition with the end point origin - 2n, and the origin is
+/// remembered so a later steep hit ending there counts as flat ground. For the AirMove owner to call where it sets
+/// `tr.normal = surface_normal`.
+pub(super) fn remember_stall(c: &mut Ctx, tr: &Trace) {
+    let o = c.p.pos;
+    let n = c.p.surface_normal;
+    c.ground_cache = Some((o - n * 2.0, *tr));
+    c.p.stall_pos = o;
+}
+
+/// StepSmooth S21 0x140a47d70 (inlined again in TryPlayerMoveStep) = ds 0x140b9ac40 (6.3): the camera lags a step by its height, then DecayStepSmooth eases it back.
 pub(super) fn step_smooth(c: &mut Ctx, d: Vec3) {
     let n = c.p.surface_normal;
     let dn = n.dot(d);
@@ -240,7 +275,7 @@ pub(super) fn step_smooth(c: &mut Ctx, d: Vec3) {
     c.p.step_smooth -= n * s;
 }
 
-/// DecayStepSmooth 0x140be80c0
+/// DecayStepSmooth S21 0x140afb2f0 = ds 0x140be80c0 (identical)
 pub(super) fn decay_step_smooth(c: &mut Ctx) {
     let w = c.p.step_smooth;
     if w == Vec3::ZERO {

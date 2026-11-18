@@ -89,3 +89,15 @@ each spot (default: the three reported ones) and counts hangs: 30+ ticks with no
 (docs/movement.md "Collision"), 1 after. That one is a real wedge (a 54 degree slope running into the underside edge
 of a ledge, narrower than the hull) that frees itself after 30 ticks.
 
+
+## Which prop tree players collide with (open)
+
+The 86-run R5Flowstate comparison (`probecmp`, 2026-11-17) says neither tree is right for every prop. Exporting with
+each prop's physics tree in place of tree 0 (`R5_PROPCOLL=physics` on `export-map --collision`) moved the runs
+within 2 u/s and 10 u from 31 to 33 of 87: big wins where runs touch props (lurch_wd_150 136 -> 12 u, lurch_d_250
+15 -> 0.7 u, lurch_d_150 14 -> 0.1 u, air_strafe_d 76 -> 37 u) but regressions elsewhere (lurch_d_50 14 -> 70 u,
+drop_71 3 -> 11 u), and the tall-ledge mantles stay ~90 u off with either. So the game most likely picks per prop
+(candidates: the static prop's `solid` byte, 6 on most props and 0/1/7 on some; its prop leaf's contents mask; or a
+model flag), or traces both. The default stays tree 0; `D:\...\collision.detailed.bin` and `collision.physics.bin` hold
+both exports for A/B tests. Next step: read the S21 client's static-prop trace path (how a prop leaf picks its
+collision tree) and port that rule.

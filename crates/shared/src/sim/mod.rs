@@ -146,6 +146,9 @@ pub struct Traversal {
     pub ledge_point: Vec3,
     /// progress per second used last tick (for the mantle-boost window)
     pub rate: f32,
+    /// S21 pl+0x2234 m_traversalAnimProgress: the smoothed animation cycle TraversalMove keeps (traversal_anim 1).
+    /// Needs no animation data; it gates TraversalMove's END test and the mantle boost's frac test.
+    pub cycle: f32,
 }
 
 /// Mantle boost FSM (R5Regenis mantle_boost.cpp `MantleBoostSlot_t`): 0 idle, 1 invalid (hang),
@@ -173,7 +176,10 @@ pub struct Player {
     pub settings: PlayerSettings,
     /// movement cvars (per player so tests and the server can flip them)
     pub cvars: Cvars,
-    /// pl+0x6134 speed scale (1.0 = weapon out; Apex holstered is ~1.15)
+    /// Speed scale without the landing slowdown: the active weapon's move_speed_modifier x pl+0x3274 (S21
+    /// SetupMove 0x140a47030). 1.0 = a weapon with modifier 1; 1.15 = holstered (the melee weapon's
+    /// move_speed_modifier, which is what R5Flowstate's probe sprints at: 299 = 260 x 1.15). During a tick it
+    /// holds the full S21 pl+0x3278 = LandingSpeedScale x this (see `simulate`).
     pub speed_scale: f32,
     pub move_type: MoveType,
     /// pl+0x65f0: 0 standing, 1 ducking, 2 ducked, 3 unducking
@@ -193,6 +199,9 @@ pub struct Player {
     /// pl+0x662c: the surface up-normal. World up, or the wall's normal while on a wall (climbing).
     pub surface_normal: Vec3,
     pub wall: Wall,
+    /// CUserCmd command_number (S21 `**(int**)(pl+0x34b8)`), +1 per simulate. CheckAutoMantle's ledge probe picks
+    /// its probe height from command_number % 7; WallRunUpdate picks its wall probe from command_number % 4.
+    pub cmd_number: u32,
 
     time: f64,
     ground: bool,
@@ -223,6 +232,9 @@ pub struct Player {
     near_ground_time: f32,
     /// pl+0x6938: contact plane from the last blocked move
     contact_plane: Vec3,
+    /// S21 pl+0x369c (ds pl+0x623c): origin of the last AirMove steep-slope stall; CategorizePosition treats a
+    /// steep hit ending exactly here as flat ground
+    stall_pos: Vec3,
     /// pl+0x6bd8 / pl+0x5a88 / stuck retry time
     start_solid: bool,
     stuck_last: i32,
@@ -230,6 +242,8 @@ pub struct Player {
     /// CheckVelocity's cache (gameMovement+0x46c)
     cv_cache: Vec3,
     old_buttons: u32,
+    /// S21 pl+0x3280 (the last processed usercmd) +0x24 / +0x28: its forward / side move, read by auto-sprint
+    last_cmd_move: (f32, f32),
 }
 
 impl Player {
@@ -259,6 +273,7 @@ impl Player {
             grace: JumpGrace::default(),
             surface_normal: UP,
             wall: Wall { ref_height: pos.z, ..Wall::default() },
+            cmd_number: 0,
             time: 0.0,
             ground: false,
             duck_timer_ms: 0,
@@ -280,11 +295,13 @@ impl Player {
             land_impact: 0.0,
             near_ground_time: -100.0,
             contact_plane: Vec3::ZERO,
+            stall_pos: Vec3::ZERO,
             start_solid: false,
             stuck_last: 0,
             stuck_check_time: -100.0,
             cv_cache: Vec3::ZERO,
             old_buttons: 0,
+            last_cmd_move: (0.0, 0.0),
         }
     }
 
@@ -351,6 +368,25 @@ pub fn find_free(col: &Collision, pos: Vec3) -> Vec3 {
     pos
 }
 
+/// The S21 client's auto-sprint (`player_setting_autosprint`, checked by 0x140902f10): the usercmd builder
+/// 0x140905d80 adds IN_SPEED (a sprint press) when CanSprint passes on the state the last tick left, the move
+/// input is at least 0.94 long (0.8 while already sprinting) and within 45 deg of forward, the player is not
+/// crouching (duck state 1/2; a slide keeps its sprint through the latch instead), and attack / zoom are not
+/// held. The move axes are the LAST processed cmd's (pl+0x3280), so the first tick after W goes down sends no
+/// sprint, and a crouch-walk never builds a sprint request. So the tick a full crouch stands up walks, and sprint
+/// resumes the tick after. A caller with auto-sprint on ORs this into `Input::sprint` before `simulate`.
+pub fn auto_sprint(p: &Player) -> bool {
+    let (f, s) = p.last_cmd_move;
+    let m2 = f * f + s * s;
+    // CanSprint 0x140b02ff0 on the player as it is now
+    let crouching = p.duck_state == 1 || p.duck_state == 2;
+    if 0.64 > m2 || (m2 != 0.0 && -0.707 > f / m2.sqrt()) || (p.ground && !p.sliding && crouching) {
+        return false;
+    }
+    let thr: f32 = if p.sprinting { 0.8 } else { 0.94 };
+    thr * thr <= m2 && m2 != 0.0 && 0.707 <= f / m2.sqrt() && !crouching
+}
+
 /// World up (and the surface normal pl+0x662c while not on a wall).
 pub(crate) const UP: Vec3 = Vec3::Z;
 
@@ -386,6 +422,17 @@ pub(crate) struct Ctx<'a> {
     pub wish: Vec3,
     /// mv+0xd4 GetMaxSpeed
     pub max_speed: f32,
+    /// S21 PlayerMove entry 0x140a54ebe: ctx+0x20/0x28 = the stance block of FL_DUCKING (pl+0xc8 bit 1) as it was
+    /// BEFORE Duck ran this tick. GetAccelerate / Friction read their stance numbers from it (one tick stale when
+    /// the stance changes); GetMaxSpeed reads the new stance.
+    pub move_ducked: bool,
+    /// S21 ctx+0x620 / ctx+0x490 / ctx+0x4a0 (cleared each tick by ProcessMovement): the ground trace StayOnGround
+    /// (or AirMove's steep-slope stall) made this tick and its end point; CategorizePosition reuses it when its own
+    /// probe would end within 2 units of that point
+    pub ground_cache: Option<(Vec3, crate::collision::Trace)>,
+    /// S21 pl+0x37c m_vecVelocity: the velocity as the last tick left it (AllowSprint 0x140b02ca0 reads it, not
+    /// the CMoveData copy that Duck / StartSliding may already have changed this tick)
+    pub vel0: Vec3,
 }
 
 impl Ctx<'_> {
@@ -400,7 +447,8 @@ impl Ctx<'_> {
         let (mn, mx) = self.p.hull();
         self.col.trace_hull(a, b, mn, mx)
     }
-    /// SpeedCap 0x140bf5350 / SprintSpeedCap 0x140bf53c0 for the current stance
+    /// SpeedCap 0x140bf5350 / SprintSpeedCap 0x140bf53c0 for the current stance (S21 0x140b09ba0 / 0x140b09c00:
+    /// pl+0x3278 x `speed` / `sprintspeed`; GetMaxSpeed 0x140a32be0 multiplies by the ADS scale, 1 here)
     pub fn speed_cap(&self, sprint: bool) -> f32 {
         let st = self.stance();
         self.p.speed_scale * if sprint { st.sprintspeed } else { st.speed }
@@ -415,6 +463,7 @@ impl Ctx<'_> {
 /// Advances the player by `dt` seconds (one usercmd). The client calls this at its fixed tick.
 pub fn simulate(p: &mut Player, input: &Input, dt: f32, col: &Collision) {
     p.time += dt as f64;
+    p.cmd_number = p.cmd_number.wrapping_add(1);
     let now = p.time as f32;
 
     // SetupMove: buttons, pressed edges, flat basis, the input vector mv+0x78
@@ -464,6 +513,7 @@ pub fn simulate(p: &mut Player, input: &Input, dt: f32, col: &Collision) {
     if p.flying {
         fly_move(p, input, dt, col);
         p.old_buttons = b;
+        p.last_cmd_move = (fwd, side);
         return;
     }
 
@@ -485,16 +535,32 @@ pub fn simulate(p: &mut Player, input: &Input, dt: f32, col: &Collision) {
         yaw: input.yaw,
         wish,
         max_speed: 0.0,
+        move_ducked: false,
+        ground_cache: None,
+        vel0: Vec3::ZERO,
     };
+    c.vel0 = c.p.vel;
+    // S21 SetupMove 0x140a47030 tail: pl+0x3278 = LandingSpeedScale 0x140b09a60 x weapon move_speed_modifier x
+    // pl+0x3274 x (status-effect slows: none here). Computed once per usercmd, before PlayerMove, so a landing
+    // this tick slows the caps from the next tick on. SpeedCap / SprintSpeedCap / GetAccelerate / the skip cap /
+    // the lurch cap all read pl+0x3278, so `speed_scale` holds it for the tick and gets its base back after.
+    let base_scale = c.p.speed_scale;
+    c.p.speed_scale = ground::landing_speed_scale(&c) * base_scale;
     player_move(&mut c);
+    c.p.speed_scale = base_scale;
     c.p.on_ground = c.p.ground;
     c.p.old_buttons = b;
+    c.p.last_cmd_move = (fwd, side);
 }
 
-/// PlayerMove 0x140ba8fc0 (playermove.md section 3), the steps that matter without weapons, ziplines,
-/// grapple, doors, water or networking.
+/// PlayerMove, S21 0x140a54e80 (ds 0x140ba8fc0, playermove.md section 3), the steps that matter without weapons,
+/// ziplines, grapple, doors, water or networking. The S21 order is the ds one (duck timer, ground maintenance with
+/// sv_optimizedmovement 1 and the 200 u/s threshold, Duck 0x140a54080, UpdateSprint 0x140b033f0, GetMaxSpeed
+/// 0x140a32be0, dispatch, DecayStepSmooth 0x140afb2f0), minus CheckStuck.
 fn player_move(c: &mut Ctx) {
     let mt0 = c.p.move_type;
+    // step 1 (S21 0x140a54ebe): the stance block Friction / GetAccelerate use, latched before Duck
+    c.move_ducked = c.p.ducked;
 
     // step 6: integer-millisecond duck timer
     if c.p.duck_timer_ms > 0 {
@@ -506,6 +572,8 @@ fn player_move(c: &mut Ctx) {
 
     // step 13: CheckStuck, only after a move that started in solid. EA skips the rest of the tick while a nudge
     // keeps failing; here the tick still runs (our trace lets an embedded hull walk out), see docs/movement.md.
+    // The S21 client's PlayerMove 0x140a54e80 has no CheckStuck at all (it is server-side, ds step 13); it stays
+    // here because this sim is also the authority.
     if c.p.start_solid && mt0 == MoveType::Walk && ground::check_stuck(c) != 0 {
         c.p.vel = Vec3::ZERO;
     }
@@ -534,6 +602,8 @@ fn player_move(c: &mut Ctx) {
     match c.p.move_type {
         MoveType::Traverse => traversal::traversal_move(c, false),
         MoveType::Walk => {
+            // S21 0x140a561a2 also needs traversal_cooldown + pl+0x350 <= now (an entity timestamp, not resolved),
+            // no jetpack (pl+0x2fd8) and !(pl+0x326a & 1); none of them block a stock pilot here
             if c.cv.traversal_enable && !(c.cv.traversal_cooldown + c.p.traversal.end_time > c.now) && traversal::check_auto_mantle(c) {
                 traversal::traversal_move(c, true);
             } else {
@@ -565,7 +635,8 @@ fn player_move(c: &mut Ctx) {
     }
 }
 
-/// CanSprint 0x140bed930: keeps the sprint latch alive.
+/// CanSprint, S21 0x140b02ff0 (ds 0x140bed930; same constants 0.64 / -0.707): keeps the sprint latch alive.
+/// (S21's weapon gate 0x140b02b40 and the sprint-toggle branch (only needs fwd >= -0.25), are not stock paths.)
 fn can_sprint(c: &Ctx) -> bool {
     let m2 = c.fwd * c.fwd + c.side * c.side;
     if 0.64 > m2 {
@@ -580,7 +651,10 @@ fn can_sprint(c: &Ctx) -> bool {
     true
 }
 
-/// AllowSprint 0x140bed5a0: whether the player actually sprints this tick.
+/// AllowSprint, S21 0x140b02ca0 (ds 0x140bed5a0): whether the player actually sprints this tick. Skipped gates
+/// (all pass for a stock pilot with nothing in hand): ADS held (IN_ATTACK2 0x800), the weapon's sprint rules
+/// 0x140b02b40, the sprint-toggle double-tap state pl+0x2a34/0x2a38 (never set without the toggle option),
+/// pl+0x2a2d, the status-effect slow (<= 0.05), pl+0x19b0 and pl+0x322c.
 fn allow_sprint(c: &Ctx) -> bool {
     if !c.s.sprint {
         return false;
@@ -589,6 +663,10 @@ fn allow_sprint(c: &Ctx) -> bool {
         return false;
     }
     if c.p.move_type != MoveType::Walk {
+        return false;
+    }
+    // S21: never on a wall (S21_NotUpright 0x140b04b30)
+    if !upright(c.p.surface_normal) {
         return false;
     }
     let m2 = c.fwd * c.fwd + c.side * c.side;
@@ -601,10 +679,15 @@ fn allow_sprint(c: &Ctx) -> bool {
     if c.s.land_slowdown_no_sprint_frac > ground::landing_speed_scale(c) {
         return false;
     }
-    true
+    // S21: the velocity the last tick left (pl+0x37c) must point along the view: both projected off gravity
+    // (0,0,-1), so the z terms cancel to 0. From a standstill this fails, so the first tick walks.
+    let (f, v) = (c.view_f, c.vel0);
+    let d = ((f.x - 0.0) * (v.x - 0.0) + (f.y - 0.0) * (v.y - 0.0)) + 0.0;
+    0.0 < d
 }
 
-/// UpdateSprint 0x140bedf60. A sprint press requests sprint for 3 s (holding keeps extending it by 0.1 s);
+/// UpdateSprint, S21 0x140b033f0 (ds 0x140bedf60; identical with the sprint-toggle option pl+0x2a2e/0x2a2f off,
+/// and sprint power pl+0x1dd8 >= 10, which a pilot always has). A sprint press requests sprint for 3 s (holding keeps extending it by 0.1 s);
 /// the request latches while CanSprint holds (moving forward-ish, not crouched), so one tap of Shift keeps
 /// you sprinting until you stop or crouch. StartSprint/StopSprint only drive view/animation timers
 /// (sprintStartDelay etc.), so they are not ported.

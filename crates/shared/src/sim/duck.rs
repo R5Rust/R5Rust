@@ -1,5 +1,9 @@
 //! Duck 0x140ba7500 (playermove.md 7 / slide.md 2C), CanUnduck, FinishUnDuck, SetDuckViewOffset,
 //! StartSliding 0x140ba7ed0, StopSliding 0x140ba8250 (slide.md 2A/2B).
+//! Checked against the S21 client (r5apex_dx12.exe): Duck 0x140a54080, StartSliding 0x140a54890, StopSliding
+//! 0x140a54be0, FinishUnDuck 0x140a53bf0, SetDuckViewOffset 0x140a53f30, CanUnduck 0x140b135d0, DuckFrac
+//! 0x1409d9750, GetDuckFraction 0x140b09540. Same math and constants as the 2019 server; S21 adds two cvars
+//! (gamemovement_duck_debounce_threshold, slide_max_duck_frac_to_start) whose stock values change nothing.
 
 use super::{ground, upright, Ctx, MoveType, IN_DUCK, UP};
 use glam::Vec3;
@@ -13,6 +17,22 @@ fn duck_frac(ms: i32, sliding: bool) -> f32 {
     clamp01(ms as f32 / if sliding { 200.0 } else { 400.0 })
 }
 
+/// GetDuckFraction (S21 0x140b09540): 0 standing .. 1 crouched, smoothstepped like the eye height.
+fn get_duck_fraction(c: &Ctx) -> f32 {
+    match c.p.duck_state {
+        1 => {
+            let f = duck_frac(c.p.duck_timer_ms, c.p.sliding);
+            1.0 - ((3.0 - (f + f)) * f) * f
+        }
+        2 => 1.0,
+        3 => {
+            let f = clamp01(c.p.duck_timer_ms as f32 / 200.0);
+            ((3.0 - (f + f)) * f) * f
+        }
+        _ => 0.0,
+    }
+}
+
 /// Duck 0x140ba7500: the 4-state crouch machine. The hull swaps when the 400 ms (200 ms when sliding) timer
 /// runs out; only the eye height eases (smoothstep). A crouch press while fast enough starts a slide.
 pub(super) fn duck(c: &mut Ctx) {
@@ -21,8 +41,25 @@ pub(super) fn duck(c: &mut Ctx) {
     let mut want = c.buttons & IN_DUCK != 0;
     let v = c.p.vel;
     let msp = c.s.slide_max_stop_speed;
-    if c.p.sliding && (v.x * v.x + v.y * v.y) > msp * msp {
-        want = true; // can't stand up out of a slide faster than slideMaxStopSpeed
+    if c.p.sliding {
+        if (v.x * v.x + v.y * v.y) > msp * msp {
+            want = true; // can't stand up out of a slide faster than slideMaxStopSpeed
+        }
+    } else {
+        // S21 0x140a5424f gamemovement_duck_debounce_threshold (default 0 = off): a released crouch keeps
+        // ducking until it is that far in; a re-press during the unduck is ignored while the unduck timer
+        // fraction (/400, not /200) is below it
+        let th = c.cv.duck_debounce_threshold;
+        if 0.0 < th {
+            let f = clamp01(c.p.duck_timer_ms as f32 / 400.0);
+            if c.p.duck_state == 1 && !want {
+                if th > 1.0 - f {
+                    want = true;
+                }
+            } else if c.p.duck_state == 3 && want && f < th {
+                want = false;
+            }
+        }
     }
     if !upright(c.p.surface_normal) {
         want = false; // no crouch on a wall
@@ -177,7 +214,13 @@ pub(super) fn start_sliding(c: &mut Ctx, ground_normal: Vec3, from_air: bool) {
     let v = c.p.vel;
     let m2 = (v.y * v.y + v.x * v.x) + 0.0;
     let mut req = c.s.slide_required_start_speed;
-    if from_air {
+    if !from_air {
+        // S21 0x140a5491e: no slide once the crouch is further in than slide_max_duck_frac_to_start (stock 1.0,
+        // which the fraction never exceeds)
+        if get_duck_fraction(c) > c.cv.slide_max_duck_frac_to_start {
+            return;
+        }
+    } else {
         let up = v.dot(UP);
         if !(up > -200.0) {
             req = c.s.slide_required_start_speed_air;
@@ -187,7 +230,9 @@ pub(super) fn start_sliding(c: &mut Ctx, ground_normal: Vec3, from_air: bool) {
         return;
     }
     if c.gnd() {
-        let a = c.wish.dot(c.flat_f);
+        let (w, f) = (c.wish, c.flat_f);
+        let a = ((w.y * f.y) + (w.x * f.x)) + (w.z * f.z); // S21 0x140a549b8 term order
+
         if c.cv.slide_max_angle_dot > a {
             return;
         }

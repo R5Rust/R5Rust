@@ -227,7 +227,7 @@ pub const STOCK: PlayerSettings = PlayerSettings {
 pub struct Cvars {
     pub sv_gravity: f32,                     // exe "750"
     pub sv_maxvelocity: f32,                 // exe "34000" (ConVar the rebuilt CheckVelocity reads)
-    pub air_control: f32,                    // exe "2.0" (AirAccelerate's second-branch ConVar 0x1423705d8; name not resolved)
+    pub air_control: f32,                    // player_extraairaccelleration "2.0" (S21 reg 0x1401a4980, ConVar 0x1427f91e0; ds 0x1423705d8)
     pub jump_graceperiod: f32,               // exe "0.2"
     pub skip_time: f32,                      // exe "1.0"
     pub skip_jump_height_speed: f32,         // exe "450"
@@ -257,6 +257,8 @@ pub struct Cvars {
     pub slide_while_in_air: bool,            // exe "0"
     pub slide_auto_stand: bool,              // exe "0"
     pub slide_step_velocity_reduction: f32,  // exe "10"
+    pub slide_max_duck_frac_to_start: f32,   // dx12 "1.0" (reg 0x1401b2300) StartSliding refuses above this duck fraction
+    pub duck_debounce_threshold: f32,        // dx12 "0.0" (reg 0x1401b5230, gamemovement_duck_debounce_threshold) Duck
     pub sv_optimizedmovement: bool,          // exe "1"
     pub traversal_enable: bool,              // exe "1"
     pub traversal_cooldown: f32,             // exe "0.5"
@@ -272,13 +274,25 @@ pub struct Cvars {
     pub automantle_rest_frac: f32,           // exe "0.4"
     pub automantle_rest_frac_below: f32,     // exe "0.3"
     pub automantle_backoff_anim_maxfrac: f32,// exe "0.7"
+    // S21 dx12 CheckAutoMantle 0x140a43060 / its ledge probe 0x140a40c90 (ConVar+0x40 pointer, default string)
+    pub automantle_forwarddist: f32,           // dx12 0x1427fbd00 "26.f": how far over the lip the probe reaches
+    pub automantle_dangle_required_space: f32, // dx12 0x1427f8610 "60": wall below the lip needed to hang
+    pub automantle_disable_hang: bool,         // dx12 0x1428000a0 "0"
     // Mantle boost and its tap-strafe gate: R5Flowstate SDK (s21-r5sdk) mantle_boost.cpp defaults. The client SDK
     // hooks AirMove_TapStrafe and skips it while a full boost is in the air (not in r5apex_dx12.exe itself).
-    pub mantle_boost_enabled: bool,              // "1" (playlist var mantle_boost_enabled, default true)
+    /// "1" in the SDK (playlist var mantle_boost_enabled). Default false here: the live R5Flowstate client has
+    /// mantle_boost_input_setting 0 (off), and R5Rust folds that "off" into this flag so the client's Mantle Boost
+    /// toggle (which sets this flag) turns the boost on with the SDK's own jump input.
+    pub mantle_boost_enabled: bool,
     pub mantle_boost_disables_tap_strafes: bool, // "1"
     pub mantle_boost_min_valid_traversal_frac: f32, // "0.5"
     pub mantle_boost_sprint_mult: f32,           // "1.3" (bridge_mantle_boost_sprint_mult)
     pub mantle_boost_jump_height: f32,           // "90" (bridge_mantle_boost_jump_height)
+    /// mantle_boost_input_setting: 0 = Off, 1 = Jump, 2 = Crouch, 3 = custom button mask (SDK source default "1",
+    /// FCVAR_ARCHIVE|USERINFO). The live R5Flowstate client recorded 2026-11-17 has 0, so the boost never latches
+    /// and every mantle runs the native TraversalMove (jump-off, hop-back, native superglide). R5Rust keeps the
+    /// SDK default 1 here and expresses "off" through `mantle_boost_enabled = false` (same behaviour).
+    pub mantle_boost_input_setting: i32,
     // Wall climb cvars (ConVar pointer -> name from the registration code, default from ConVar+0x50)
     pub wallrun_enable: bool,                    // 0x1422e9e28 exe "1"
     pub wallrun_retry_interval: f32,             // 0x14236f348 exe "0.07"
@@ -292,6 +306,8 @@ pub struct Cvars {
     pub wallrun_angle_change_min_cos: f32,       // 0x142385238 exe "0.8"
     pub wallrun_push_away_fall_off_time: f32,    // 0x1422e8648 exe "0.05"
     pub wallrun_fall_away_speed: f32,            // 0x142372ef8 exe "70.0"
+    /// S21 dx12 ConVar 0x142800100 (registered by 0x1401a81b0) "3000": WallRunUpdate's head-probe slowdown
+    pub wallrun_avoid_wall_top_decel: f32,
     pub wallclimb_vertical_gain_reduction: f32,  // 0x142373ad8 exe "128"
     pub wallrun_rotate_max_rate: f32,            // 0x142315b18 exe "3"
     pub wallrun_slipstarttime: f32,              // 0x142372af8 exe "1.5"
@@ -333,6 +349,8 @@ pub const CVARS: Cvars = Cvars {
     slide_while_in_air: false,
     slide_auto_stand: false,
     slide_step_velocity_reduction: 10.0,
+    slide_max_duck_frac_to_start: 1.0,
+    duck_debounce_threshold: 0.0,
     sv_optimizedmovement: true,
     traversal_enable: true,
     traversal_cooldown: 0.5,
@@ -348,11 +366,15 @@ pub const CVARS: Cvars = Cvars {
     automantle_rest_frac: 0.4,
     automantle_rest_frac_below: 0.3,
     automantle_backoff_anim_maxfrac: 0.7,
-    mantle_boost_enabled: true,
+    automantle_forwarddist: 26.0,
+    automantle_dangle_required_space: 60.0,
+    automantle_disable_hang: false,
+    mantle_boost_enabled: false,
     mantle_boost_disables_tap_strafes: true,
     mantle_boost_min_valid_traversal_frac: 0.5,
     mantle_boost_sprint_mult: 1.3,
     mantle_boost_jump_height: 90.0,
+    mantle_boost_input_setting: 1,
     wallrun_enable: true,
     wallrun_retry_interval: 0.07,
     wallrun_same_wall_dot: 0.9,
@@ -365,6 +387,7 @@ pub const CVARS: Cvars = Cvars {
     wallrun_angle_change_min_cos: 0.8,
     wallrun_push_away_fall_off_time: 0.05,
     wallrun_fall_away_speed: 70.0,
+    wallrun_avoid_wall_top_decel: 3000.0,
     wallclimb_vertical_gain_reduction: 128.0,
     wallrun_rotate_max_rate: 3.0,
     wallrun_slipstarttime: 1.5,

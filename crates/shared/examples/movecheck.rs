@@ -117,7 +117,14 @@ fn start_mantle(col: &Collision, sprint_tap: bool) -> Player {
         sim::simulate(&mut p, &Input { sprint: true, forward: 1.0, ..Default::default() }, TICK, col);
     }
     run(&mut p, col, 30, inp(1.0, 0.0));
-    sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, col);
+    // S21 CheckAutoMantle probes one height per usercmd (command_number % 7), so the mantle can start a few ticks
+    // after the press (in the air, off the jump): hold W+jump until it does
+    for _ in 0..15 {
+        sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, col);
+        if p.mantling() {
+            break;
+        }
+    }
     p
 }
 
@@ -599,11 +606,14 @@ fn mantle_checks(c: &mut Checks, col: &Collision) {
     c.near("hop-back: away from the wall at wallrunJumpOutwardSpeed 188", -p.vel.x, 188.0, 0.5);
     c.near("hop-back: up at wallrunJumpUpSpeed 240", p.vel.z, 240.0, 0.5);
     c.near("hop-back fires after automantle_jumpoff_duration 0.1 s", n as f32 * TICK, 0.1, 0.02);
-    // cancel: let go of W early -> traversal ends, you drop
+    // let go of W early on a ledge with wall below it (S21 CheckAutoMantle grants "can rest"): climb to
+    // automantle_rest_frac and hang there (state 11); pulling back then drops you
     let mut p = native(start_mantle(col, false));
     run(&mut p, col, 2, inp(1.0, 0.0));
-    sim::simulate(&mut p, &Input::default(), TICK, col);
-    c.truth("releasing W below the rest fraction cancels the mantle", !p.mantling() && p.vel.length() < 1.0, format!("{:?} v {:.0}", p.move_type, p.vel.length()));
+    run(&mut p, col, 40, Input::default());
+    c.truth("releasing W below the rest fraction on a hangable ledge: hangs at 0.4", p.mantling() && p.traversal.state == 11 && (p.traversal.p - 0.4).abs() < 1e-4, format!("{:?} st {} P {:.3}", p.move_type, p.traversal.state, p.traversal.p));
+    run(&mut p, col, 60, inp(-1.0, 0.0));
+    c.truth("  then S drops off the hang", !p.mantling() && p.pos.z < 1.0, format!("{:?} z {:.1}", p.move_type, p.pos.z));
     let mut p = native(start_mantle(col, false));
     run(&mut p, col, 2, inp(1.0, 0.0));
     sim::simulate(&mut p, &inp(-1.0, 0.0), TICK, col);
@@ -623,9 +633,15 @@ fn mantle_checks(c: &mut Checks, col: &Collision) {
     }
     c.truth("jumping into the ledge mantles automatically in the air", mantled && p.pos.z > 59.9, format!("z {:.1}", p.pos.z));
 
-    // ------------------------------------------------------------ mantle boost (default on)
+    // ------------------------------------------------------------ mantle boost (SDK hook; live R5F has
+    // mantle_boost_input_setting 0 = off; R5Rust folds that into mantle_boost_enabled = false, so these turn it on)
+    let boost = |mut p: Player| {
+        p.cvars.mantle_boost_enabled = true;
+        p.cvars.mantle_boost_input_setting = 1;
+        p
+    };
     let sweet = |p: &Player| p.traversal.rate > 0.0 && (1.0 - p.traversal.p) / p.traversal.rate <= 0.1 && p.traversal.p > 0.5;
-    let mut p = start_mantle(col, false);
+    let mut p = boost(start_mantle(col, false));
     mantle_until(&mut p, &sweet, inp(1.0, 0.0));
     let sweet_frac = p.mantle_boost.sweet_spot_frac;
     sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, col);
@@ -651,7 +667,7 @@ fn mantle_checks(c: &mut Checks, col: &Collision) {
     c.range("no tap-strafe after a mantle boost (deg, air accel only)", ang, 0.0, 3.0);
     c.range("  (same press without the boost state: tap-strafe turns, deg)", ang_free, 15.0, 60.0);
     // press outside the sweet spot: plain mantle jump (state 3)
-    let mut p = start_mantle(col, false);
+    let mut p = boost(start_mantle(col, false));
     mantle_until(&mut p, &|p| p.traversal.p > 0.3, inp(1.0, 0.0));
     sim::simulate(&mut p, &Input { forward: 1.0, jump: true, ..Default::default() }, TICK, col);
     c.truth("jump outside the sweet spot latches state 3", p.mantle_boost.state == 3, format!("state {}", p.mantle_boost.state));
@@ -662,7 +678,7 @@ fn mantle_checks(c: &mut Checks, col: &Collision) {
     c.near("state 3 vz = sqrt(2*750*56)", p.vel.z, (2.0f32 * 750.0 * 56.0).sqrt(), 0.5);
     c.truth("state 3: no slide granted", !p.sliding, format!("sliding {}", p.sliding));
     // no press: ordinary finish
-    let mut p = start_mantle(col, false);
+    let mut p = boost(start_mantle(col, false));
     while p.mantling() {
         sim::simulate(&mut p, &inp(1.0, 0.0), TICK, col);
     }
@@ -760,6 +776,16 @@ fn wall_checks(c: &mut Checks, col: &Collision) {
     // ---- glancing approach: the view must face the wall within ~45.6 deg (cos^2 > 0.49)
     c.truth("approach at 50 deg: no climb", climb_start(col, 4200.0, 50.0).is_none(), String::new());
     c.truth("approach at 44 deg: climbs", climb_start(col, 4200.0, 44.0).is_some(), String::new());
+    // ---- S21 classifier 0x140a4e650: crouch held (duck / toggle duck) never attaches
+    let mut p = settle(col, Vec3::new(-100.0, 4200.0, 0.1));
+    let (mut jumped, mut climbed) = (false, false);
+    for _ in 0..120 {
+        let jump = !jumped && p.pos.x > 120.0;
+        jumped |= jump;
+        sim::simulate(&mut p, &Input { forward: 1.0, sprint: true, jump, crouch: jumped && !jump, ..Default::default() }, TICK, col);
+        climbed |= p.on_wall();
+    }
+    c.truth("crouch held into the wall: no climb (S21)", jumped && !climbed, format!("jumped {jumped} climbed {climbed}"));
 
     // ---- 150u wall: climb, then the mantle takes the ledge once it is within mantleHeight
     match climb_start(col, 5200.0, 0.0) {
@@ -787,7 +813,9 @@ fn wall_checks(c: &mut Checks, col: &Collision) {
         mantled |= p.mantling();
         climbed |= p.on_wall();
     }
-    c.truth("60u ledge from a running jump: mantles, no wall climb", mantled && !climbed && (p.pos.z - 60.0).abs() < 0.1, format!("mantled {mantled} climbed {climbed} z {:.2}", p.pos.z));
+    // (S21: the 4.5u probe meets the wall only when the lip is 14u above the feet; a rise under stepHeight while
+    // moving into it is left to the step code, so this jump steps up instead of mantling)
+    c.truth("60u ledge from a running jump: gets on top, no wall climb", (mantled || p.on_ground) && !climbed && (p.pos.z - 60.0).abs() < 0.1, format!("mantled {mantled} climbed {climbed} z {:.2}", p.pos.z));
 }
 
 /// Settings consts vs the game's own file (tolerant line regex `"key": value`; poseSettings blocks in order).
