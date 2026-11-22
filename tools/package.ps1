@@ -23,7 +23,9 @@ param(
   [string]$Repo = 'R5Rust/R5Rust',
   [string]$TargetDir = 'D:\R5Rust\_build\game',
   [string]$Exe = '',
-  [string]$Commit = 'HEAD'
+  [string]$Commit = 'HEAD',
+  # big update: R5Rust Bot pings the Update Ping role for this one (it posts every build silently otherwise)
+  [switch]$Ping
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -98,7 +100,9 @@ try {
     $lines = @(git log $range --format='- %s' $(if ($range -eq '-n20') { $Commit }))
     $patch = if ($Notes.Count) { "### Patch notes`n" + (($Notes | ForEach-Object { "- $_" }) -join "`n") + "`n`n" } else { '' }
     $body = "Game build $hash. Get it with the **R5Rust Launcher** (Play page > Download / Update); you don't need to download this zip by hand.`n`n" + $patch +
-      "### Changes`n" + ($lines -join "`n") + "`n`nNeeds install tools ``tools-$Tools``. No game files are included: the launcher's Install builds them from your own Apex install."
+      "### Changes`n" + ($lines -join "`n") + "`n`nNeeds install tools ``tools-$Tools``. No game files are included: the launcher's Install builds them from your own Apex install." + $(if ($Ping) { "
+
+<!-- ping -->" } else { '' })
     $notesFile = Join-Path $dist "notes-$tag.md"
     [IO.File]::WriteAllText($notesFile, $body)
     gh release create $tag $zip -R $Repo --target main --title "Build $((Get-Date -Format 'yyyy-MM-dd')) ($hash)" --notes-file $notesFile

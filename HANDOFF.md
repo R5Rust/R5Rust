@@ -103,8 +103,11 @@ content -- --all`. `content/README.md` + `mods/README.md` explain the format.
 
 Players use the **R5Rust Launcher** (`C:\Code\apps\r5rust-launcher`, player mode): it installs itself, downloads game
 builds + the install toolchain from this repo's GitHub Releases and updates itself from R5Rust/launcher's.
-- Game build: `pwsh -c "& .\tools\package.ps1 -Publish -Notes 'short line','short line'"` (call it in-process: `-File`
-  mangles the list) -> release `build-<date>-<hash>`, zip with `play\next\r5rust.exe` (static CRT, paths remapped).
+- Game build: Kainz decides when. **Build latest** (tools\publish.ps1) only builds for him (player-style: static CRT,
+  paths remapped); **Push build** in his launcher (tools\push.ps1 -NotesFile) releases the exact exe he's playing
+  (play\current) with that commit's files -> release `build-<yyyy.MM.dd.HHmm>-<hash>` + `release.txt`. Never publish
+  on build (Kainz, 2026-11-22: no bugged builds for players). By hand: `& .\tools\package.ps1 -Publish -Notes ...`
+  in-process (`-File` mangles the list).
 - Install toolchain: `pwsh tools\bundle_tools.ps1 -Version n` -> publish `dist\r5rust-tools-n.zip` as release
   `tools-n`; package builds with `-Tools n`. Clean-PC test: `D:\R5Rust\_standalone_test` (mirror lacks the grade file
   and loadscreen rpak; real installs have both).
@@ -121,7 +124,7 @@ builds + the install toolchain from this repo's GitHub Releases and updates itse
 (game), `export-map`, `r5f-probe`, `docs` (movement docs for now), `.github` (public org profile with screenshots),
 `launcher` (`C:\Code\apps\r5rust-launcher`). Before going public every repo's history was rewritten (git-filter-repo:
 author email -> the gorpnostic noreply address, `C:\Users\<name>\` -> `%USERPROFILE%\`) and pushed to fresh repos;
-the pre-rewrite repos are `*-old`, private, safe to delete. Anything pushed is public: no personal email (commit
+the pre-rewrite repos are `*-old`, private, safe to delete. R5Rust was recreated once more the same day (`R5Rust-old2`, private) to drop an email domain from a script; its releases were re-uploaded byte-identical, same tags and order. Anything pushed is public: no personal email (commit
 as the noreply address), no user-folder paths, no secrets, no extracted game files. Old staging clones have the
 pre-rewrite SHAs: re-clone.
 Publishing: staging clones live in the session scratchpad (`...\scratchpad\gh\<repo>`); if they're gone, re-clone the
