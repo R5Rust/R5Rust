@@ -99,6 +99,22 @@ content -- --all`. `content/README.md` + `mods/README.md` explain the format.
 - Debug examples in `crates/shared/examples/` (movecheck, probecmp, hangscan, stuckdbg, collvsrender, ...).
 - F8 in game appends the current spot to `r5rust_marks.txt`.
 
+## Releases (players)
+
+Players use the **R5Rust Launcher** (`C:\Code\apps\r5rust-launcher`, player mode): it installs itself, downloads game
+builds + the install toolchain from this repo's GitHub Releases and updates itself from R5Rust/launcher's.
+- Game build: `pwsh -c "& .\tools\package.ps1 -Publish -Notes 'short line','short line'"` (call it in-process: `-File`
+  mangles the list) -> release `build-<date>-<hash>`, zip with `play\next\r5rust.exe` (static CRT, paths remapped).
+- Install toolchain: `pwsh tools\bundle_tools.ps1 -Version n` -> publish `dist\r5rust-tools-n.zip` as release
+  `tools-n`; package builds with `-Tools n`. Clean-PC test: `D:\R5Rust\_standalone_test` (mirror lacks the grade file
+  and loadscreen rpak; real installs have both).
+- Launcher: `pwsh tools\release.ps1 -Publish -Notes ...` in the launcher repo.
+- Discord (discord.gg/kcmDzhJfk8): R5Rust Bot (`C:\Code\apps\r5rust-bot`, task "R5Rust Bot") posts new builds and
+  launcher versions to #patch-notes by itself; big news: `node tools/announce.mjs <folder> --post` there.
+- Shipped 2026-11-22: tools-1, build 2026.11.22-99922c5 (first public build), launcher 0.4.1. Players get the map,
+  lighting, movement, ziplines; not yet the first-person items (one-off exports), the HUD (RUI host needs node + S21
+  ui.dll) or zipline braid textures (cables draw dark). `$PipelineVersion` is 4: older installs show "update needed".
+
 ## GitHub
 
 **Public** org **github.com/R5Rust** (public since 2026-11-22, Kainz's call), split like R5Flowstate: `R5Rust`
