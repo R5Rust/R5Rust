@@ -33,6 +33,8 @@ pub struct Trace {
     pub normal: Vec3,
     pub startsolid: bool,
     pub allsolid: bool,
+    /// what the hit triangle is made of: surfaceproperties id (collision.bin v2), 255 = unknown / no hit
+    pub surface: u8,
 }
 
 impl Trace {
@@ -54,8 +56,12 @@ struct Node {
 pub struct Collision {
     pos: Vec<[f32; 3]>,
     tris: Vec<[u32; 3]>,
+    /// per triangle (BVH order): surfaceproperties id; empty when built without
+    surf: Vec<u8>,
     nodes: Vec<Node>,
     pub build_ms: f64,
+    /// the map's ziplines (zipline.rs): the movement sim mounts and rides them
+    pub ziplines: Vec<crate::zipline::Zipline>,
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -147,18 +153,26 @@ fn build_rec(ids: &mut [u32], base: u32, tris: &[[u32; 3]], pos: &[[f32; 3]], ce
 impl Collision {
     /// Builds the BVH over `indices` (triples into `positions`). Takes ownership of both.
     pub fn build(positions: Vec<[f32; 3]>, indices: &[u32]) -> Collision {
+        Self::build_tagged(positions, indices, &[])
+    }
+
+    /// `build` with a surface id per triangle (`tags[i]` for `indices[3i..3i+3]`; empty = none), which traces report.
+    pub fn build_tagged(positions: Vec<[f32; 3]>, indices: &[u32], tags: &[u8]) -> Collision {
         let t0 = Instant::now();
-        let tris_in: Vec<[u32; 3]> = indices.par_chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        let tagged = tags.len() * 3 == indices.len() && !tags.is_empty();
+        let tris_in: Vec<([u32; 3], u8)> = indices.par_chunks_exact(3).enumerate().map(|(i, c)| ([c[0], c[1], c[2]], if tagged { tags[i] } else { 255 })).collect();
         // drop degenerate triangles (zero area): they only cost time
-        let tris_in: Vec<[u32; 3]> = tris_in
+        let tris_in: Vec<([u32; 3], u8)> = tris_in
             .into_par_iter()
-            .filter(|t| {
+            .filter(|(t, _)| {
                 let a = v3(positions[t[0] as usize]);
                 let b = v3(positions[t[1] as usize]);
                 let c = v3(positions[t[2] as usize]);
                 (b - a).cross(c - a).length_squared() > 1e-8
             })
             .collect();
+        let surf_in: Vec<u8> = tris_in.iter().map(|t| t.1).collect();
+        let tris_in: Vec<[u32; 3]> = tris_in.into_iter().map(|t| t.0).collect();
         let cent: Vec<[f32; 3]> = tris_in
             .par_iter()
             .map(|t| {
@@ -171,7 +185,8 @@ impl Collision {
         let mut ids: Vec<u32> = (0..tris_in.len() as u32).collect();
         let nodes = if ids.is_empty() { vec![Node { min: [0.0; 3], max: [0.0; 3], a: 0, n: 0 }] } else { build_rec(&mut ids, 0, &tris_in, &positions, &cent) };
         let tris: Vec<[u32; 3]> = ids.par_iter().map(|&i| tris_in[i as usize]).collect();
-        Collision { pos: positions, tris, nodes, build_ms: t0.elapsed().as_secs_f64() * 1000.0 }
+        let surf: Vec<u8> = if tagged { ids.par_iter().map(|&i| surf_in[i as usize]).collect() } else { Vec::new() };
+        Collision { pos: positions, tris, surf, nodes, build_ms: t0.elapsed().as_secs_f64() * 1000.0, ziplines: Vec::new() }
     }
 
     pub fn tri_count(&self) -> usize {
@@ -411,12 +426,13 @@ impl Collision {
         let half = (maxs - mins) * 0.5;
         let c0 = start + (mins + maxs) * 0.5;
         let d = end - start;
-        let mut out = Trace { fraction: 1.0, endpos: end, normal: Vec3::ZERO, startsolid: false, allsolid: false };
+        let mut out = Trace { fraction: 1.0, endpos: end, normal: Vec3::ZERO, startsolid: false, allsolid: false, surface: 255 };
         let pad = Vec3::splat(DIST_EPSILON + 0.01);
         let lo = c0.min(c0 + d) - half - pad;
         let hi = c0.max(c0 + d) + half + pad;
         let mut best = 1.0f32;
         let mut best_n = Vec3::ZERO;
+        let mut best_slot = u32::MAX;
         let mut hit = false;
         let mut stack = [0u32; 64];
         let mut sp = 1usize;
@@ -450,6 +466,7 @@ impl Collision {
                             if !hit || best > 0.0 || n.z > best_n.z {
                                 best = 0.0;
                                 best_n = n;
+                                best_slot = s;
                                 hit = true;
                                 out.allsolid = true;
                             }
@@ -466,6 +483,7 @@ impl Collision {
                         if !hit || f < best - 1e-6 || (tie && better) {
                             best = if f < best { f } else { best };
                             best_n = n;
+                            best_slot = s;
                             hit = true;
                         }
                     }
@@ -476,6 +494,7 @@ impl Collision {
             out.fraction = best;
             out.normal = best_n;
             out.endpos = start + d * best;
+            out.surface = self.surf.get(best_slot as usize).copied().unwrap_or(255);
         }
         out
     }

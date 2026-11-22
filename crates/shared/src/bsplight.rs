@@ -85,7 +85,8 @@ pub struct Cubemap {
 
 pub struct BspLighting {
     pub headers: Vec<LmHeader>,
-    /// image 0 of every sky page (RGBM baked light)
+    /// image 0 of every sky page, RGBA16F: baked light as RGBM (rgb * (a * 3.984375 + 0.015625), what the world
+    /// shader decodes); type-11 HDR pages store the raw value with a = 0.2470588 (RGBM scale 1.0)
     pub sky0: Atlas,
     /// image 1 of every sky page
     pub sky1: Atlas,
@@ -103,12 +104,75 @@ fn lump(dir: &Path, id: u16) -> Vec<u8> {
     std::fs::read(dir.join(format!("{id:04X}.bin"))).unwrap_or_default()
 }
 
+/// BC7 blocks (`w x h`, both multiples of 4) to RGBA8.
+pub fn bc7_to_rgba(src: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w * h * 4];
+    let (bw, bh) = (w / 4, h / 4);
+    for by in 0..bh {
+        for bx in 0..bw {
+            let i = (by * bw + bx) * 16;
+            let Some(block) = src.get(i..i + 16) else { return out };
+            let at = (by * 4 * w + bx * 4) * 4;
+            bcdec_rs::bc7(block, &mut out[at..], w * 4);
+        }
+    }
+    out
+}
+
 fn cast_vec<T: bytemuck::Pod>(b: &[u8]) -> Vec<T> {
     let sz = std::mem::size_of::<T>();
     b.chunks_exact(sz).map(bytemuck::pod_read_unaligned::<T>).collect()
 }
 
 /// Copies a `w x h` image with `bpp` bytes/texel and `src_stride` bytes/row into the atlas at x0.
+/// f32 -> IEEE half bits (round to nearest even; no NaN inputs here).
+pub fn f16_bits(f: f32) -> u16 {
+    let x = f.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let e = ((x >> 23) & 0xFF) as i32 - 127 + 15;
+    let m = x & 0x7F_FFFF;
+    if e >= 31 {
+        return sign | 0x7BFF; // clamp to the largest finite half
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = m | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rem = m & ((1 << shift) - 1);
+        let mid = 1 << (shift - 1);
+        let r = half + ((rem > mid || (rem == mid && half & 1 == 1)) as u32);
+        return sign | r as u16;
+    }
+    let half = ((e as u32) << 10) | (m >> 13);
+    let rem = m & 0x1FFF;
+    let r = half + ((rem > 0x1000 || (rem == 0x1000 && half & 1 == 1)) as u32);
+    sign | r as u16
+}
+
+/// RGBA8 texels -> RGBA16F texels (x / 255).
+fn rgba8_to_f16(src: &[u8]) -> Vec<u8> {
+    src.iter().flat_map(|&b| f16_bits(b as f32 / 255.0).to_le_bytes()).collect()
+}
+
+/// RGB9E5 (9-bit mantissas, shared 5-bit exponent, bias 15) -> RGBA16F with a = 0.2470588: the world shader's RGBM
+/// decode (a * 3.984375 + 0.015625) is then x1, so it reads the HDR value raw, like S30 does for type 9/10/11 pages.
+fn rgb9e5_to_f16(src: &[u8]) -> Vec<u8> {
+    let a = f16_bits(0.984375 / 3.984375).to_le_bytes();
+    src.chunks_exact(4)
+        .flat_map(|c| {
+            let v = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let s = 2f32.powi((v >> 27) as i32 - 15 - 9);
+            let r = f16_bits((v & 0x1FF) as f32 * s).to_le_bytes();
+            let g = f16_bits(((v >> 9) & 0x1FF) as f32 * s).to_le_bytes();
+            let b = f16_bits(((v >> 18) & 0x1FF) as f32 * s).to_le_bytes();
+            [r[0], r[1], g[0], g[1], b[0], b[1], a[0], a[1]]
+        })
+        .collect()
+}
+
 fn blit(dst: &mut Atlas, x0: u32, src: &[u8], w: u32, h: u32, src_stride: usize, bpp: usize) {
     let dw = dst.width as usize;
     for y in 0..h as usize {
@@ -132,18 +196,40 @@ impl BspLighting {
         let ah: u32 = headers.iter().map(|h| h.height).max().unwrap_or(1);
 
         let sky = lump(dir, 0x62);
+        let comp = lump(dir, 0x61);
+        let mut at_c = 0usize;
         let rtl = lump(dir, 0x69);
-        let mut sky0 = Atlas::new(aw, ah, 4);
+        let mut sky0 = Atlas::new(aw, ah, 8);
         let mut sky1 = Atlas::new(aw, ah, 4);
         let (mut at_s, mut x) = (0usize, 0u32);
         for h in &headers {
+            if h.kind == 11 {
+                // Retail / S30 type 11 (R5Flowstate s30-port-kit docs/10-lightmaps.md): lump 0x62 holds per page plane 0
+                // = RGB9E5 HDR baked light (4 B/texel) and plane 1 = RGBA8 (sky direction *2-1, sun visibility). The S30
+                // engine sets the RGBM branch flag (0x8000) only for page types 1 / 4..8, so the retail world PS reads
+                // type 11 raw. Until 2026-11-21 r5rust RGBM-decoded the BC7 copy in lump 0x61 instead: per texel 0.16-2.2x
+                // the exact value (median 0.52). 0x61 stays the fallback when 0x62 is missing.
+                let (w, hh) = (h.width as usize, h.height as usize);
+                let n = w * hh;
+                if at_s + 8 * n <= sky.len() {
+                    blit(&mut sky0, x, &rgb9e5_to_f16(&sky[at_s..at_s + 4 * n]), h.width, h.height, w * 8, 8);
+                    blit(&mut sky1, x, &sky[at_s + 4 * n..at_s + 8 * n], h.width, h.height, w * 4, 4);
+                    at_s += 8 * n;
+                } else if at_c + 2 * n <= comp.len() {
+                    blit(&mut sky0, x, &rgba8_to_f16(&bc7_to_rgba(&comp[at_c..at_c + n], w, hh)), h.width, h.height, w * 8, 8);
+                    blit(&mut sky1, x, &bc7_to_rgba(&comp[at_c + n..at_c + 2 * n], w, hh), h.width, h.height, w * 4, 4);
+                }
+                at_c += 2 * n;
+                x += h.width;
+                continue;
+            }
             if h.kind != 1 && h.kind != 10 {
                 return Err(format!("lightmap page type {} not supported", h.kind));
             }
             let (w, hh) = (h.width as usize, h.height as usize);
             let n = w * hh * 4;
             if at_s + 2 * n <= sky.len() {
-                blit(&mut sky0, x, &sky[at_s..at_s + n], h.width, h.height, w * 4, 4);
+                blit(&mut sky0, x, &rgba8_to_f16(&sky[at_s..at_s + n]), h.width, h.height, w * 8, 8);
                 blit(&mut sky1, x, &sky[at_s + n..at_s + 2 * n], h.width, h.height, w * 4, 4);
             }
             at_s += 2 * n;
@@ -155,8 +241,10 @@ impl BspLighting {
         let probes = cast_vec::<LightProbe>(&lump(dir, 0x65));
         let probe_tree = cast_vec::<ProbeTreeNode>(&lump(dir, 0x67));
         let probe_refs = cast_vec::<ProbeRef>(&lump(dir, 0x68));
+        // retail (BSP v54, lightmap pages type 11) cubemap records are 24 bytes: origin i32x3, u32, u64 (S21: 16)
+        let cube_rec = if headers.iter().any(|h| h.kind == 11) { 24 } else { 16 };
         let cubemaps = lump(dir, 0x2A)
-            .chunks_exact(16)
+            .chunks_exact(cube_rec)
             .map(|c| {
                 let i = |k: usize| i32::from_le_bytes([c[k], c[k + 1], c[k + 2], c[k + 3]]);
                 Cubemap { origin: [i(0), i(4), i(8)], guid: i(12) as u32 }

@@ -53,31 +53,35 @@ pub struct GpuLighting {
     pub probe_count: usize,
     /// the map's baked reflection cubemaps (BC6H HDR), one cube per BSP cubemap record
     pub cubes: wgpu::TextureView,
-    /// per cubemap: 1 / luminance of its average (CUBEMAPS_AMBIENT_RCP stand-in; the shipped lump is zeros)
+    /// per cubemap: the reflection normalisation reciprocal, `cube_ambient_rcp`
     pub cube_ambient: wgpu::Buffer,
 }
 
-const CUBE_AMBIENT_WGSL: &str = r#"
-@group(0) @binding(0) var cubes: texture_cube_array<f32>;
-@group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var<storage, read_write> outv: array<f32>;
-@compute @workgroup_size(16)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let n = textureNumLayers(cubes);
-    if (id.x >= n) { return; }
-    let lvl = f32(textureNumLevels(cubes) - 1);
-    var c = vec3<f32>(0.0);
-    let dirs = array<vec3<f32>, 6>(vec3(1.0, 0.0, 0.0), vec3(-1.0, 0.0, 0.0), vec3(0.0, 1.0, 0.0), vec3(0.0, -1.0, 0.0), vec3(0.0, 0.0, 1.0), vec3(0.0, 0.0, -1.0));
-    for (var k = 0; k < 6; k++) {
-        c += textureSampleLevel(cubes, samp, dirs[k], i32(id.x), lvl).rgb;
-    }
-    let l = dot(c / 6.0, vec3<f32>(0.2126, 0.7152, 0.0722));
-    outv[id.x] = 1.0 / max(l, 1e-3);
+/// Per cubemap: 1 / max(0.001, |sky vector| * lum(c_skyColor) + lum(SH DC)) of the light probe nearest its origin
+/// (probe refs, lump 0x68). S30 rebuilds this every frame from that probe (R5Flowstate s30-port-kit
+/// tools/client/build_cubemaps.py); the world PS multiplies its own probe/lightmap ambient by it, so a reflection
+/// comes out as bright as the light around the pixel relative to the light where the cubemap was baked. Until
+/// 2026-11-21 r5rust used 1 / lum(the cube's mean colour) instead (the cube asset's +0x24 term, not this one).
+fn cube_ambient_rcp(bsp: &BspLighting, probes: &[GpuProbe], sky: [f32; 3]) -> Vec<f32> {
+    let lum = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let sky_lum = lum(sky);
+    bsp.cubemaps
+        .iter()
+        .map(|c| {
+            let o = [c.origin[0] as f32, c.origin[1] as f32, c.origin[2] as f32];
+            let near = bsp.probe_refs.iter().min_by(|a, b| {
+                let d = |r: &shared::bsplight::ProbeRef| (0..3).map(|k| (r.origin[k] - o[k]).powi(2)).sum::<f32>();
+                d(a).total_cmp(&d(b))
+            });
+            let Some(p) = near.and_then(|r| probes.get(r.probe as usize)) else { return 1.0 };
+            let dc = lum([p.sh[0][3], p.sh[1][3], p.sh[2][3]]);
+            let sky_len = (p.sky[0] * p.sky[0] + p.sky[1] * p.sky[1] + p.sky[2] * p.sky[2]).sqrt();
+            1.0 / (sky_len * sky_lum + dc).max(0.001)
+        })
+        .collect()
 }
-"#;
 
-fn load_cubes(device: &wgpu::Device, queue: &wgpu::Queue, path: &std::path::Path, count: usize) -> (wgpu::TextureView, wgpu::Buffer) {
-    let n = count.max(1);
+fn load_cubes(device: &wgpu::Device, queue: &wgpu::Queue, path: &std::path::Path, rcp: &[f32]) -> (wgpu::TextureView, wgpu::Buffer) {
     let tex = match crate::dds::load(path) {
         Ok(d) if d.layers as usize >= 6 => crate::dds::upload(device, queue, &d, "cubemaps"),
         r => {
@@ -90,28 +94,11 @@ fn load_cubes(device: &wgpu::Device, queue: &wgpu::Queue, path: &std::path::Path
     };
     let layers = tex.depth_or_array_layers();
     let view = tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::CubeArray), array_layer_count: Some(layers / 6 * 6), ..Default::default() });
-    let buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("cube ambient"), size: (n.max((layers / 6) as usize) * 4) as u64, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
-    let samp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
-    let sh = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("cube ambient"), source: wgpu::ShaderSource::Wgsl(CUBE_AMBIENT_WGSL.into()) });
-    let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some("cube ambient"), layout: None, module: &sh, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
-    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("cube ambient"),
-        layout: &pipe.get_bind_group_layout(0),
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&samp) },
-            wgpu::BindGroupEntry { binding: 2, resource: buf.as_entire_binding() },
-        ],
-    });
-    let mut enc = device.create_command_encoder(&Default::default());
-    {
-        let mut cp = enc.begin_compute_pass(&Default::default());
-        cp.set_pipeline(&pipe);
-        cp.set_bind_group(0, &bg, &[]);
-        cp.dispatch_workgroups((layers / 6).div_ceil(16), 1, 1);
-    }
-    queue.submit([enc.finish()]);
-    log::info!("cubemaps: {} ({}x{}, {} mips)", layers / 6, tex.width(), tex.height(), tex.mip_level_count());
+    let mut v = rcp.to_vec();
+    v.resize(v.len().max((layers / 6) as usize).max(1), 1.0);
+    let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("cube ambient"), contents: bytemuck::cast_slice(&v), usage: wgpu::BufferUsages::STORAGE });
+    let (lo, hi) = rcp.iter().fold((f32::MAX, 0f32), |(a, b), &x| (a.min(x), b.max(x)));
+    log::info!("cubemaps: {} ({}x{}, {} mips), ambient rcp {lo:.3}..{hi:.3}", layers / 6, tex.width(), tex.height(), tex.mip_level_count());
     (view, buf)
 }
 
@@ -170,7 +157,8 @@ fn gpu_light(l: &WorldLight) -> GpuLight {
 impl GpuLighting {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, bsp: &BspLighting, cube_path: &std::path::Path) -> Self {
         let (aw, ah) = (bsp.sky0.width, bsp.sky0.height);
-        let lm0 = tex(device, queue, aw, ah, wgpu::TextureFormat::Rgba8Unorm, &bsp.sky0.rgba, aw * 4, ah, "lm0");
+        // RGBA16F (bsplight.rs): RGBM pages as x/255, type-11 HDR pages raw with a = 0.247 (RGBM scale 1)
+        let lm0 = tex(device, queue, aw, ah, wgpu::TextureFormat::Rgba16Float, &bsp.sky0.rgba, aw * 8, ah, "lm0");
         let lm1 = tex(device, queue, aw, ah, wgpu::TextureFormat::Rgba8Unorm, &bsp.sky1.rgba, aw * 4, ah, "lm1");
 
         // RTL: per page, R32 light IDs (w*h*4) then BC5 visibility at w x 2h. Atlas pages side by side.
@@ -241,12 +229,12 @@ impl GpuLighting {
         }
         let probes = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("probes"), contents: bytemuck::cast_slice(&gp), usage: wgpu::BufferUsages::STORAGE });
 
-        let (cubes, cube_ambient) = load_cubes(device, queue, cube_path, bsp.cubemaps.len());
         let sun = bsp.lights.iter().find(|l| l.emit_type == 3);
         let sky = bsp.lights.iter().find(|l| l.emit_type == 5);
         let sun_color = sun.map(|l| l.intensity).unwrap_or([1.5, 1.4, 1.2]);
         let sun_dir = sun.map(|l| [-l.normal[0], -l.normal[1], -l.normal[2]]).unwrap_or([0.5, -0.3, 0.8]);
         let sky_color = sky.map(|l| l.intensity).unwrap_or([0.22, 0.49, 0.9]);
+        let (cubes, cube_ambient) = load_cubes(device, queue, cube_path, &cube_ambient_rcp(bsp, &gp, sky_color));
         log::info!(
             "lighting: {} rtl lights, {} probes, sun {:?} dir {:?}, sky {:?}",
             list.len(),

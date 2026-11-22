@@ -1,8 +1,9 @@
 //! The map's real collision (`collision.bin`, written by `tools/export-map`): Apex's own BVH4
 //! collision decoded into triangles with their contents masks. See docs/collision.md.
 //!
-//! Layout (little endian): magic `R5COLL\0\0`, u32 version 1, u32 vertex count V, u32 triangle
-//! count T, u32 0, V x [f32; 3], T x [u32; 3], T x u32 contents, T x u8 source.
+//! Layout (little endian): magic `R5COLL\0\0`, u32 version 1 or 2, u32 vertex count V, u32 triangle
+//! count T, u32 0, V x [f32; 3], T x [u32; 3], T x u32 contents, T x u8 source; version 2 adds T x u8
+//! surface (surfaceproperties id, the map's surfaces.json names it; 255 unknown).
 
 use crate::assets::Config;
 use crate::collision::Collision;
@@ -25,6 +26,8 @@ pub struct CollMesh {
     pub tris: Vec<[u32; 3]>,
     pub contents: Vec<u32>,
     pub source: Vec<u8>,
+    /// per triangle: surfaceproperties id (255 = unknown, version 1 files)
+    pub surface: Vec<u8>,
 }
 
 impl CollMesh {
@@ -34,11 +37,12 @@ impl CollMesh {
         if b.len() < 24 || &b[..8] != b"R5COLL\0\0" {
             return Err(format!("{}: not a collision.bin", path.display()));
         }
-        if u32_at(8) != 1 {
+        let version = u32_at(8);
+        if version != 1 && version != 2 {
             return Err(format!("{}: unknown version {}", path.display(), u32_at(8)));
         }
         let (nv, nt) = (u32_at(12) as usize, u32_at(16) as usize);
-        let need = 24 + nv * 12 + nt * 12 + nt * 4 + nt;
+        let need = 24 + nv * 12 + nt * 12 + nt * 4 + nt + if version >= 2 { nt } else { 0 };
         if b.len() < need {
             return Err(format!("{}: truncated ({} of {need} bytes)", path.display(), b.len()));
         }
@@ -55,10 +59,12 @@ impl CollMesh {
         let contents: Vec<u32> = words(&b[o..o + nt * 4]).collect();
         o += nt * 4;
         let source = b[o..o + nt].to_vec();
+        o += nt;
+        let surface = if version >= 2 { b[o..o + nt].to_vec() } else { vec![255; nt] };
         if tris.iter().flatten().any(|&i| i as usize >= nv) {
             return Err(format!("{}: index out of range", path.display()));
         }
-        Ok(CollMesh { positions, tris, contents, source })
+        Ok(CollMesh { positions, tris, contents, source, surface })
     }
 
     /// Whether triangle `i` blocks player movement.
@@ -69,6 +75,11 @@ impl CollMesh {
     /// Flat indices of the triangles player movement collides with.
     pub fn player_indices(&self) -> Vec<u32> {
         (0..self.tris.len()).filter(|&i| self.player_solid(i)).flat_map(|i| self.tris[i]).collect()
+    }
+
+    /// The surface of each triangle `player_indices` returns, in the same order.
+    pub fn player_surfaces(&self) -> Vec<u8> {
+        (0..self.tris.len()).filter(|&i| self.player_solid(i)).map(|i| self.surface[i]).collect()
     }
 }
 

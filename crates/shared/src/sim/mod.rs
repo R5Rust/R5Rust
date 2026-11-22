@@ -22,6 +22,8 @@ mod step;
 mod traversal;
 mod walk;
 mod wall;
+pub mod zipline;
+pub use zipline::ZipState;
 
 use crate::collision::{Collision, Trace};
 pub use crate::settings::{Cvars, PlayerSettings, Stance, CVARS, STOCK};
@@ -105,6 +107,8 @@ pub struct Input {
     pub null_fwd: bool,
     /// crouch held (crouch / slide)
     pub crouch: bool,
+    /// use (E) pressed since the last tick: mounts a zipline in reach (sim/zipline.rs)
+    pub use_pressed: bool,
     /// fly mode: descend
     pub down: bool,
     /// degrees, 0 = +X, 90 = +Y (Source convention)
@@ -171,6 +175,8 @@ pub struct Player {
     pub on_ground: bool,
     /// dev noclip-ish fly (still collides)
     pub flying: bool,
+    /// console `noclip`: while flying, pass through everything
+    pub noclip: bool,
     pub fly_speed: f32,
     /// the legend's settings block
     pub settings: PlayerSettings,
@@ -199,6 +205,8 @@ pub struct Player {
     /// pl+0x662c: the surface up-normal. World up, or the wall's normal while on a wall (climbing).
     pub surface_normal: Vec3,
     pub wall: Wall,
+    /// zipline state (sim/zipline.rs)
+    pub zip: ZipState,
     /// CUserCmd command_number (S21 `**(int**)(pl+0x34b8)`), +1 per simulate. CheckAutoMantle's ledge probe picks
     /// its probe height from command_number % 7; WallRunUpdate picks its wall probe from command_number % 4.
     pub cmd_number: u32,
@@ -257,6 +265,7 @@ impl Player {
             vel: Vec3::ZERO,
             on_ground: false,
             flying: false,
+            noclip: false,
             fly_speed: 1200.0,
             settings,
             cvars: CVARS,
@@ -273,6 +282,7 @@ impl Player {
             grace: JumpGrace::default(),
             surface_normal: UP,
             wall: Wall { ref_height: pos.z, ..Wall::default() },
+            zip: ZipState::default(),
             cmd_number: 0,
             time: 0.0,
             ground: false,
@@ -308,6 +318,11 @@ impl Player {
     /// Camera position: feet + the stance's (eased) view height + the step-smoothing offset.
     pub fn eye(&self) -> Vec3 {
         self.pos + Vec3::new(0.0, 0.0, self.view_z) + self.step_smooth
+    }
+
+    /// The sim clock (seconds of simulated usercmds): traversal start times etc. are on it.
+    pub fn sim_time(&self) -> f64 {
+        self.time
     }
 
     pub fn hull(&self) -> (Vec3, Vec3) {
@@ -512,6 +527,19 @@ pub fn simulate(p: &mut Player, input: &Input, dt: f32, col: &Collision) {
 
     if p.flying {
         fly_move(p, input, dt, col);
+        p.old_buttons = b;
+        p.last_cmd_move = (fwd, side);
+        return;
+    }
+
+    // ziplines (S30 TryUseZipline 0x1407c5630 on use, then the zipline states replace the move)
+    if p.zip.state == 0 && input.use_pressed && p.move_type == MoveType::Walk {
+        if let Some((line, q, reverse)) = zipline::find_mount(p, col, view_f, now) {
+            zipline::start_mount(p, line, q, reverse);
+        }
+    }
+    if p.zip.state != 0 {
+        zipline::tick(p, col, pressed, view_f, dt, now);
         p.old_buttons = b;
         p.last_cmd_move = (fwd, side);
         return;
@@ -731,12 +759,16 @@ fn fly_move(p: &mut Player, input: &Input, dt: f32, col: &Collision) {
     let speed = p.fly_speed * if input.sprint { 3.0 } else { 1.0 };
     let target = wish.normalize_or_zero() * speed;
     p.vel += (target - p.vel) * (1.0 - (-12.0 * dt).exp());
-    let (mn, mx) = p.hull();
-    let mut pos = p.pos;
-    let mut vel = p.vel;
-    step::try_player_move_core(col, mn, mx, &mut pos, &mut vel, dt, None);
-    p.pos = pos;
-    p.vel = vel;
+    if p.noclip {
+        p.pos += p.vel * dt;
+    } else {
+        let (mn, mx) = p.hull();
+        let mut pos = p.pos;
+        let mut vel = p.vel;
+        step::try_player_move_core(col, mn, mx, &mut pos, &mut vel, dt, None);
+        p.pos = pos;
+        p.vel = vel;
+    }
     p.on_ground = false;
     p.ground = false;
     p.move_type = MoveType::Walk;

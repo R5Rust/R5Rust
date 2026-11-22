@@ -5,7 +5,7 @@
 use crate::loader::LoadedWorld;
 use glam::{Mat4, Vec3, Vec4Swizzles};
 
-pub const RES: u32 = 2048;
+/// max cascades (the shader's array size); `Csm::count` is how many are in use
 pub const N: usize = 4;
 /// half-width of each cascade, Source units (inches)
 pub const RADII: [f32; N] = [600.0, 2000.0, 6500.0, 20000.0];
@@ -21,11 +21,18 @@ struct CascadeUniform {
 }
 
 pub struct Csm {
+    /// shadow map resolution
+    pub res: u32,
+    /// cascades rendered and read (0 = real-time shadows off, baked only)
+    pub count: usize,
     pub array_view: wgpu::TextureView,
     layer_views: Vec<wgpu::TextureView>,
     pub cmp_samp: wgpu::Sampler,
     pipe_opaque: wgpu::RenderPipeline,
     pipe_mask: wgpu::RenderPipeline,
+    /// instanced static props (props.rs), opaque / alpha-tested
+    pipe_prop: [wgpu::RenderPipeline; 2],
+    prop_sel: crate::props::Selection,
     ubs: Vec<wgpu::Buffer>,
     bgs: Vec<wgpu::BindGroup>,
     pub mats: [Mat4; N],
@@ -40,10 +47,11 @@ fn light_basis(to_sun: Vec3) -> (Vec3, Vec3) {
 }
 
 impl Csm {
-    pub fn new(device: &wgpu::Device, mat_layout: &wgpu::BindGroupLayout, mat_samp: &wgpu::Sampler) -> Self {
+    pub fn new(device: &wgpu::Device, mat_layout: &wgpu::BindGroupLayout, mat_samp: &wgpu::Sampler, res: u32, count: usize) -> Self {
+        let count = count.min(N);
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("csm"),
-            size: wgpu::Extent3d { width: RES, height: RES, depth_or_array_layers: N as u32 },
+            size: wgpu::Extent3d { width: res, height: res, depth_or_array_layers: N as u32 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -89,16 +97,19 @@ impl Csm {
             })
             .collect();
 
-        let sh = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("shadow"), source: wgpu::ShaderSource::Wgsl(include_str!("shadow.wgsl").into()) });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("shadow"), bind_group_layouts: &[Some(&layout), Some(mat_layout)], immediate_size: 0 });
+        let sh = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("shadow"), source: wgpu::ShaderSource::Wgsl(concat!(include_str!("mat.wgsl"), include_str!("shadow.wgsl")).into()) });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("shadow"), bind_group_layouts: &[Some(&layout), Some(mat_layout)], immediate_size: 4 });
         let vattrs = wgpu::vertex_attr_array![0 => Float32x3, 2 => Float32x2];
         let vattrs = [vattrs[0], wgpu::VertexAttribute { offset: 16, ..vattrs[1] }];
         let vl = wgpu::VertexBufferLayout { array_stride: 32, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vattrs };
-        let mk = |mask: bool| {
+        let iattrs = wgpu::vertex_attr_array![6 => Float32x4, 7 => Float32x4, 8 => Float32x4];
+        let il = wgpu::VertexBufferLayout { array_stride: crate::props::INST_STRIDE, step_mode: wgpu::VertexStepMode::Instance, attributes: &iattrs };
+        let mk = |mask: bool, prop: bool| {
+            let bufs = [Some(vl.clone()), Some(il.clone())];
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(if mask { "shadow mask" } else { "shadow" }),
                 layout: Some(&pl),
-                vertex: wgpu::VertexState { module: &sh, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[Some(vl.clone())] },
+                vertex: wgpu::VertexState { module: &sh, entry_point: Some(if prop { "vs_prop" } else { "vs_main" }), compilation_options: Default::default(), buffers: if prop { &bufs } else { &bufs[..1] } },
                 // no culling: lots of Apex world geometry is single-sided
                 primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
                 depth_stencil: Some(wgpu::DepthStencilState {
@@ -114,7 +125,26 @@ impl Csm {
                 cache: None,
             })
         };
-        Csm { array_view, layer_views, cmp_samp, pipe_opaque: mk(false), pipe_mask: mk(true), ubs, bgs, mats: [Mat4::IDENTITY; N], centers: [None; N], renders: 0 }
+        Csm {
+            res,
+            count,
+            array_view,
+            layer_views,
+            cmp_samp,
+            pipe_opaque: mk(false, false),
+            pipe_mask: mk(true, false),
+            pipe_prop: [mk(false, true), mk(true, true)],
+            prop_sel: Default::default(),
+            ubs,
+            bgs,
+            mats: [Mat4::IDENTITY; N],
+            centers: [None; N],
+            renders: 0,
+        }
+    }
+
+    pub fn invalidate_one(&mut self, i: usize) {
+        self.centers[i] = None;
     }
 
     pub fn invalidate(&mut self) {
@@ -122,12 +152,13 @@ impl Csm {
     }
 
     /// Re-renders the cascades the camera has moved away from. Returns how many were rendered.
-    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, cam: Vec3, to_sun: Vec3, world: &LoadedWorld) -> u32 {
+    /// `lod`: static props at the LODs the camera sees them with (None = no props in the shadows).
+    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, cam: Vec3, to_sun: Vec3, world: &LoadedWorld, lod: Option<&crate::props::LodParams>, mat_bg: &wgpu::BindGroup) -> u32 {
         let (dir, up) = light_basis(to_sun);
         let rot = glam::camera::rh::view::look_to_mat4(Vec3::ZERO, dir, up);
         let mut enc: Option<wgpu::CommandEncoder> = None;
         let mut n = 0;
-        for i in 0..N {
+        for i in 0..self.count {
             let r = RADII[i];
             if let Some(c) = self.centers[i] {
                 if (cam - c).length() < r * MOVE_FRAC {
@@ -135,7 +166,7 @@ impl Csm {
                 }
             }
             // snap the centre to the texel grid in light space
-            let texel = 2.0 * r / RES as f32;
+            let texel = 2.0 * r / self.res as f32;
             let mut lc = (rot * cam.extend(1.0)).xyz();
             lc.x = (lc.x / texel).round() * texel;
             lc.y = (lc.y / texel).round() * texel;
@@ -161,9 +192,10 @@ impl Csm {
                 multiview_mask: None,
             });
             rp.set_bind_group(0, &self.bgs[i], &[]);
+            rp.set_bind_group(1, mat_bg, &[]);
             rp.set_vertex_buffer(0, world.vbuf.slice(..));
             rp.set_index_buffer(world.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            let mut cur = 255u8;
+            let (mut cur, mut cur_mat) = (255u8, u32::MAX);
             for d in &world.draws {
                 let alpha = d.key / 2;
                 if alpha >= 2 || !d.shadow || !overlaps(&view, r, d.min, d.max) {
@@ -173,8 +205,45 @@ impl Csm {
                     cur = alpha;
                     rp.set_pipeline(if alpha == 1 { &self.pipe_mask } else { &self.pipe_opaque });
                 }
-                rp.set_bind_group(1, &world.mat_groups[d.material as usize], &[]);
+                // only the alpha-tested pipeline reads the material
+                if d.material != cur_mat && alpha == 1 {
+                    cur_mat = d.material;
+                    rp.set_immediates(0, &d.material.to_le_bytes());
+                }
                 rp.draw_indexed(d.first_index..d.first_index + d.index_count, 0, 0..1);
+            }
+            // static props overlapping the cascade, each in its own region of the instance buffer (cascade i + 1)
+            if let (Some(props), Some(buf), Some(lp)) = (&world.props, &world.inst_buf, lod) {
+                let m = glam::Mat3::from_mat4(view);
+                props.select(&mut self.prop_sel, lp, true, |c, rad| {
+                    let lc = (view * c.extend(1.0)).xyz();
+                    let _ = m;
+                    lc.x.abs() < r + rad && lc.y.abs() < r + rad
+                });
+                let sel = &self.prop_sel;
+                if !sel.data.is_empty() {
+                    // regions are (static + DYNAMIC_CAP) instances apiece, like loader.rs sizes the buffer (they were spaced
+                    // by the static count alone, so a cascade's ground loot could spill into the next one's region)
+                    let region = (i as u64 + 1) * (props.instances.len() + crate::props::DYNAMIC_CAP) as u64 * crate::props::INST_STRIDE;
+                    queue.write_buffer(buf, region, bytemuck::cast_slice(&sel.data));
+                    rp.set_vertex_buffer(1, buf.slice(region..));
+                    let mut cur = (255u8, u32::MAX);
+                    for d in &sel.draws {
+                        let alpha = d.key / 2;
+                        if alpha >= 2 {
+                            continue;
+                        }
+                        if alpha != cur.0 {
+                            cur.0 = alpha;
+                            rp.set_pipeline(&self.pipe_prop[alpha as usize]);
+                        }
+                        if d.material != cur.1 && alpha == 1 {
+                            cur.1 = d.material;
+                            rp.set_immediates(0, &d.material.to_le_bytes());
+                        }
+                        rp.draw_indexed(d.first_index..d.first_index + d.index_count, 0, d.inst_first..d.inst_first + d.inst_count);
+                    }
+                }
             }
             n += 1;
         }

@@ -7,3 +7,6 @@ tools/r5f-probe/out/
 mapcache/
 r5rust_marks.txt
 __pycache__/
+r5rust_console_history.txt
+condump.txt
+/cfg/autoexec.cfg

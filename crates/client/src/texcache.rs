@@ -170,20 +170,39 @@ pub fn load(root: &Path, cache: &Path, rel: &str, kind: Kind, cap: u32) -> Optio
     Some(e)
 }
 
-pub fn upload(device: &wgpu::Device, queue: &wgpu::Queue, e: &Encoded) -> wgpu::Texture {
+/// How many top mips to drop for Video > Texture Quality (`picmip` = (wanted, floor)): at most `wanted`, never taking
+/// the longest side below `floor`, and only onto a level BC can start at (both sides a multiple of 4).
+pub fn base_level(e: &Encoded, (wanted, floor): (u32, u32)) -> usize {
+    let mut s = 0usize;
+    while (s as u32) < wanted && s + 1 < e.mips.len() {
+        let (w, h) = (e.width >> (s + 1), e.height >> (s + 1));
+        if w.max(h) < floor || w == 0 || h == 0 || w % 4 != 0 || h % 4 != 0 {
+            break;
+        }
+        s += 1;
+    }
+    s
+}
+
+/// Uploads the chain from mip `skip` down. Returns the texture and its size in bytes.
+pub fn upload(device: &wgpu::Device, queue: &wgpu::Queue, e: &Encoded, skip: usize) -> (wgpu::Texture, u64) {
+    let skip = skip.min(e.mips.len() - 1);
+    let (bw0, bh0) = (e.width >> skip, e.height >> skip);
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("material"),
-        size: wgpu::Extent3d { width: e.width, height: e.height, depth_or_array_layers: 1 },
-        mip_level_count: e.mips.len() as u32,
+        size: wgpu::Extent3d { width: bw0, height: bh0, depth_or_array_layers: 1 },
+        mip_level_count: (e.mips.len() - skip) as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: e.kind.format(),
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    for (lvl, data) in e.mips.iter().enumerate() {
-        let w = (e.width >> lvl).max(1);
-        let h = (e.height >> lvl).max(1);
+    let mut bytes = 0u64;
+    for (lvl, data) in e.mips[skip..].iter().enumerate() {
+        bytes += data.len() as u64;
+        let w = (bw0 >> lvl).max(1);
+        let h = (bh0 >> lvl).max(1);
         let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
         queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: lvl as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
@@ -192,5 +211,5 @@ pub fn upload(device: &wgpu::Device, queue: &wgpu::Queue, e: &Encoded) -> wgpu::
             wgpu::Extent3d { width: bw * 4, height: bh * 4, depth_or_array_layers: 1 },
         );
     }
-    tex
+    (tex, bytes)
 }

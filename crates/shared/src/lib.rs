@@ -7,8 +7,10 @@ pub mod bsplight;
 pub mod collision;
 pub mod collmesh;
 pub mod glb;
+pub mod loot;
 pub mod registry;
 pub mod settings;
 pub mod sim;
+pub mod zipline;
 
 pub use glam::{Vec2, Vec3};

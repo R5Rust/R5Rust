@@ -223,7 +223,7 @@ pub const STOCK: PlayerSettings = PlayerSettings {
 };
 
 /// Movement cvars. `exe` = default string read from r5apex_ds.exe (ConVar+0x50); `spec` = value the spec states.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Cvars {
     pub sv_gravity: f32,                     // exe "750"
     pub sv_maxvelocity: f32,                 // exe "34000" (ConVar the rebuilt CheckVelocity reads)

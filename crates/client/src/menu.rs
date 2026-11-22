@@ -2,6 +2,7 @@
 //! egui drawn over the finished frame; while it's open the game gets no input and the cursor is free.
 
 use crate::binds::{Action, Bind, UserSettings};
+use crate::graphics::{ModelDetail, Preset, Shadows, TextureQuality};
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::Window;
@@ -11,6 +12,8 @@ enum Tab {
     Controls,
     Mouse,
     Gameplay,
+    Video,
+    Mods,
 }
 
 pub struct Menu {
@@ -24,6 +27,12 @@ pub struct Menu {
     pub settings: UserSettings,
     dirty: bool,
     pub quit_requested: bool,
+    /// the heirloom pick changed (main.rs swaps the melee item)
+    pub heirloom_changed: bool,
+    /// installed mods (content sources other than core): (name, version, enabled), read when the Mods tab opens
+    mods: Option<Vec<(String, String, bool)>>,
+    /// texture quality the map was loaded with (changing it needs a restart)
+    loaded_textures: TextureQuality,
 }
 
 impl Menu {
@@ -32,7 +41,8 @@ impl Menu {
         ctx.set_visuals(egui::Visuals::dark());
         let state = egui_winit::State::new(ctx.clone(), egui::ViewportId::ROOT, window, Some(window.scale_factor() as f32), None, None);
         let renderer = egui_wgpu::Renderer::new(device, format, egui_wgpu::RendererOptions::default());
-        Menu { ctx, state: Some(state), renderer, open: false, tab: Tab::Controls, listening: None, settings, dirty: false, quit_requested: false }
+        let loaded_textures = settings.graphics.texture_quality;
+        Menu { ctx, state: Some(state), renderer, open: false, tab: Tab::Controls, listening: None, settings, dirty: false, quit_requested: false, heirloom_changed: false, mods: None, loaded_textures }
     }
 
     /// Window-less menu for the headless screenshot mode (verification only).
@@ -43,9 +53,12 @@ impl Menu {
         let tab = match std::env::var("R5_MENU_TAB").as_deref() {
             Ok("mouse") => Tab::Mouse,
             Ok("gameplay") => Tab::Gameplay,
+            Ok("video") => Tab::Video,
+            Ok("mods") => Tab::Mods,
             _ => Tab::Controls,
         };
-        Menu { ctx, state: None, renderer, open: true, tab, listening: None, settings, dirty: false, quit_requested: false }
+        let loaded_textures = settings.graphics.texture_quality;
+        Menu { ctx, state: None, renderer, open: true, tab, listening: None, settings, dirty: false, quit_requested: false, heirloom_changed: false, mods: None, loaded_textures }
     }
 
     pub fn is_listening(&self) -> bool {
@@ -124,12 +137,16 @@ impl Menu {
                     ui.selectable_value(&mut self.tab, Tab::Controls, "Controls");
                     ui.selectable_value(&mut self.tab, Tab::Mouse, "Mouse & View");
                     ui.selectable_value(&mut self.tab, Tab::Gameplay, "Gameplay");
+                    ui.selectable_value(&mut self.tab, Tab::Video, "Video");
+            ui.selectable_value(&mut self.tab, Tab::Mods, "Mods");
                 });
                 ui.separator();
                 match self.tab {
                     Tab::Controls => self.controls_tab(ui),
                     Tab::Mouse => self.mouse_tab(ui),
                     Tab::Gameplay => self.gameplay_tab(ui),
+                    Tab::Video => self.video_tab(ui),
+            Tab::Mods => self.mods_tab(ui),
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -178,16 +195,164 @@ impl Menu {
         }
     }
 
+    fn mods_tab(&mut self, ui: &mut egui::Ui) {
+        let mods = self.mods.get_or_insert_with(|| {
+            let root = shared::registry::find_root().unwrap_or_else(|| std::path::PathBuf::from("."));
+            shared::registry::discover(&root, true).into_iter().filter(|s| s.namespace != "core").map(|s| (s.name, s.version, s.enabled)).collect()
+        });
+        let on = mods.iter().filter(|m| m.2).count();
+        ui.label(egui::RichText::new(format!("Mods installed: {}  ({} enabled)", mods.len(), on)).strong());
+        if mods.is_empty() {
+            ui.label("None yet. Mods go in the mods\\ folder next to the game (content/ is the base game).");
+        }
+        for (name, version, enabled) in mods.iter() {
+            ui.label(format!("{}  {}  {}", if *enabled { "[on] " } else { "[off]" }, name, version));
+        }
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new("Heirloom").strong());
+        ui.label("The melee slot (key 3 / Holster): what you hold instead of fists. Retail's own models, animations, sounds and effects.");
+        for (id, name) in crate::HEIRLOOMS {
+            if ui.radio(self.settings.heirloom == id, name).clicked() && self.settings.heirloom != id {
+                self.settings.heirloom = id.to_string();
+                self.heirloom_changed = true;
+                self.dirty = true;
+            }
+        }
+    }
+
     fn gameplay_tab(&mut self, ui: &mut egui::Ui) {
         if ui.checkbox(&mut self.settings.auto_sprint, "Auto Sprint").changed() {
             self.dirty = true;
         }
         ui.label("Like Apex's Auto Sprint option: pushing forward sprints without holding the sprint key.");
         ui.add_space(8.0);
+        if ui.checkbox(&mut self.settings.toggle_ads, "Toggle Aim Down Sights").changed() {
+            self.dirty = true;
+        }
+        ui.label("Like Apex's ADS Toggle: press the aim key once to aim, again to stop. Sprinting drops out of aim.");
+        ui.add_space(8.0);
         if ui.checkbox(&mut self.settings.mantle_boost, "Mantle Boost").changed() {
             self.dirty = true;
         }
         ui.label("Jump in the sweet spot at the end of a mantle to launch out of it. With it off, every jump during a mantle is Apex's normal jump-off / hop-back, and superglides (crouch + jump at the end of the mantle) work.");
+    }
+
+    fn video_tab(&mut self, ui: &mut egui::Ui) {
+        let g = &mut self.settings.graphics;
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Preset");
+            for p in Preset::FIXED {
+                if ui.selectable_label(g.preset == p, p.label()).clicked() && g.preset != p {
+                    g.apply_preset(p);
+                    changed = true;
+                }
+            }
+            if g.preset == Preset::Custom {
+                ui.label(egui::RichText::new("Custom").strong());
+            }
+        });
+        ui.add_space(6.0);
+        let mut knobs = false;
+        egui::Grid::new("video").num_columns(2).spacing([16.0, 6.0]).striped(true).show(ui, |ui| {
+            ui.label("Texture Quality");
+            egui::ComboBox::from_id_salt("tex").selected_text(g.texture_quality.label()).show_ui(ui, |ui| {
+                for t in TextureQuality::ALL.into_iter().rev() {
+                    knobs |= ui.selectable_value(&mut g.texture_quality, t, t.label()).changed();
+                }
+            });
+            ui.end_row();
+            ui.label("Model Detail");
+            egui::ComboBox::from_id_salt("model").selected_text(g.model_detail.label()).show_ui(ui, |ui| {
+                for m in ModelDetail::ALL.into_iter().rev() {
+                    knobs |= ui.selectable_value(&mut g.model_detail, m, m.label()).changed();
+                }
+            });
+            ui.end_row();
+            ui.label("Anisotropic Filtering");
+            egui::ComboBox::from_id_salt("aniso").selected_text(format!("{}x", g.anisotropic)).show_ui(ui, |ui| {
+                for a in [1, 2, 4, 8, 16] {
+                    knobs |= ui.selectable_value(&mut g.anisotropic, a, if a == 1 { "Off".to_string() } else { format!("{a}x") }).changed();
+                }
+            });
+            ui.end_row();
+            ui.label("Sun Shadows");
+            egui::ComboBox::from_id_salt("shadows").selected_text(g.sun_shadows.label()).show_ui(ui, |ui| {
+                for s in Shadows::ALL.into_iter().rev() {
+                    knobs |= ui.selectable_value(&mut g.sun_shadows, s, s.label()).changed();
+                }
+            });
+            ui.end_row();
+            ui.label("Anti-aliasing");
+            egui::ComboBox::from_id_salt("msaa").selected_text(if g.msaa >= 4 { "4x MSAA" } else { "Off" }).show_ui(ui, |ui| {
+                knobs |= ui.selectable_value(&mut g.msaa, 4, "4x MSAA").changed();
+                knobs |= ui.selectable_value(&mut g.msaa, 1, "Off").changed();
+            });
+            ui.end_row();
+            ui.label("Render Scale");
+            changed |= ui.add(egui::Slider::new(&mut g.render_scale, 50..=100).suffix("%")).changed();
+            ui.end_row();
+            // Apex-style stretched resolution: the game renders at this size and is stretched to the window
+            ui.label("Stretched Res");
+            let name = |s: [u32; 2]| if s[0] == 0 { "Off".to_string() } else { format!("{}x{}", s[0], s[1]) };
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("stretch").selected_text(name(g.stretch)).show_ui(ui, |ui| {
+                    for s in [[0, 0], [1300, 1070], [1440, 1080], [1600, 1080], [1728, 1080], [1280, 960], [1280, 1024]] {
+                        changed |= ui.selectable_value(&mut g.stretch, s, name(s)).changed();
+                    }
+                    // a custom size (the fields beside, the file or console r_stretch 1300 1070) stays listed
+                    if ![[0, 0], [1300, 1070], [1440, 1080], [1600, 1080], [1728, 1080], [1280, 960], [1280, 1024]].contains(&g.stretch) {
+                        let cur = g.stretch;
+                        changed |= ui.selectable_value(&mut g.stretch, cur, name(cur)).changed();
+                    }
+                });
+                // custom: any width x height (0 = off)
+                ui.label("Custom");
+                let (mut w, mut h) = (g.stretch[0], g.stretch[1]);
+                let cw = ui.add(egui::DragValue::new(&mut w).range(0..=7680).speed(1.0)).changed();
+                ui.label("x");
+                let ch = ui.add(egui::DragValue::new(&mut h).range(0..=4320).speed(1.0)).changed();
+                if cw || ch {
+                    g.stretch = if w == 0 || h == 0 { [0, 0] } else { [w.max(320), h.max(240)] };
+                    changed = true;
+                }
+            });
+            ui.end_row();
+            ui.label("V-Sync");
+            changed |= ui.checkbox(&mut g.vsync, "").changed();
+            ui.end_row();
+            ui.label("FPS Cap");
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("cap").selected_text(if g.fps_cap == 0 { "Unlimited".to_string() } else { g.fps_cap.to_string() }).show_ui(ui, |ui| {
+                    for c in [0, 60, 120, 144, 165, 180, 240, 360] {
+                        changed |= ui.selectable_value(&mut g.fps_cap, c, if c == 0 { "Unlimited".to_string() } else { c.to_string() }).changed();
+                    }
+                    // a custom cap (the field beside, the file or console fps_max) stays listed
+                    if ![0, 60, 120, 144, 165, 180, 240, 360].contains(&g.fps_cap) {
+                        let cur = g.fps_cap;
+                        changed |= ui.selectable_value(&mut g.fps_cap, cur, cur.to_string()).changed();
+                    }
+                });
+                // custom: any cap 20..1000 (0 = unlimited), same range the console accepts
+                ui.label("Custom");
+                let mut c = g.fps_cap;
+                if ui.add(egui::DragValue::new(&mut c).range(0..=1000).speed(1.0)).changed() {
+                    g.fps_cap = if c == 0 { 0 } else { c.clamp(20, 1000) };
+                    changed = true;
+                }
+            });
+            ui.end_row();
+        });
+        if knobs {
+            g.preset = g.detect_preset();
+        }
+        if g.texture_quality != self.loaded_textures {
+            ui.add_space(4.0);
+            ui.colored_label(egui::Color32::from_rgb(230, 180, 60), "Texture Quality applies the next time the game starts.");
+        }
+        if changed || knobs {
+            self.dirty = true;
+        }
     }
 
     fn mouse_tab(&mut self, ui: &mut egui::Ui) {
@@ -252,16 +417,22 @@ impl Menu {
     }
 
     fn render(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView, size: [u32; 2], out: egui::FullOutput) {
-        let ctx = self.ctx.clone();
+        paint(&mut self.renderer, &self.ctx, device, queue, target, size, out);
+    }
+}
+
+/// Tessellates one egui frame and draws it over `target` (the menu and the console share this).
+pub fn paint(renderer: &mut egui_wgpu::Renderer, ctx: &egui::Context, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView, size: [u32; 2], out: egui::FullOutput) {
+    {
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: size, pixels_per_point: out.pixels_per_point };
         for (id, deltas) in &out.textures_delta.set {
             for delta in deltas.iter() {
-                self.renderer.update_texture(device, queue, *id, delta);
+                renderer.update_texture(device, queue, *id, delta);
             }
         }
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("menu") });
-        let extra = self.renderer.update_buffers(device, queue, &mut enc, &prims, &screen);
+        let extra = renderer.update_buffers(device, queue, &mut enc, &prims, &screen);
         {
             let rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("menu"),
@@ -272,11 +443,11 @@ impl Menu {
                 multiview_mask: None,
             });
             let mut rp = rp.forget_lifetime();
-            self.renderer.render(&mut rp, &prims, &screen);
+            renderer.render(&mut rp, &prims, &screen);
         }
         queue.submit(extra.into_iter().chain(std::iter::once(enc.finish())));
         for id in &out.textures_delta.free {
-            self.renderer.free_texture(id);
+            renderer.free_texture(id);
         }
     }
 }

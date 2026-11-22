@@ -7,6 +7,7 @@ use shared::assets::Config;
 use shared::collision::Collision;
 use shared::collmesh;
 use crate::lighting::{self, GpuLighting};
+use crate::graphics::TextureQuality;
 use crate::texcache::{self, Kind};
 use shared::bsplight::BspLighting;
 use shared::glb::{self, Meta};
@@ -46,26 +47,40 @@ fn decal_bias(e: &serde_json::Value) -> bool {
 /// Splits every draw into spatial chunks (grid cells in X/Y) so the camera and the shadow cascades can cull.
 /// Returns the re-ordered index buffer and the chunk list: opaque, alpha-tested, blended; inside each class the
 /// depth-biased decal materials after the rest (they are drawn over what is already there).
-fn chunk_draws(world: &glb::World, mats_json: &serde_json::Value) -> (Vec<u32>, Vec<DrawCmd>) {
-    const CELL: f32 = 4096.0;
-    const MIN_SPLIT_TRIS: u32 = 6000;
+/// Chunk grid cell (units). Every material with at least MIN_SPLIT_TRIS triangles is split by it, so a material
+/// used all over the map doesn't become one map-sized draw that's never culled.
+const CELL: f32 = 4096.0;
+const MIN_SPLIT_TRIS: u32 = 6000;
+
+/// Also returns where each prop-library material's indices start in the new buffer (they are model space, drawn
+/// instanced by props.rs, never as world chunks).
+fn chunk_draws(world: &glb::World, mats_json: &serde_json::Value) -> (Vec<u32>, Vec<DrawCmd>, HashMap<u32, u32>) {
+    // R5_CELL / R5_MINSPLIT: A/B knobs for the chunk grid (perf experiments)
+    let cell: f32 = std::env::var("R5_CELL").ok().and_then(|v| v.parse().ok()).unwrap_or(CELL);
+    let min_split: u32 = std::env::var("R5_MINSPLIT").ok().and_then(|v| v.parse().ok()).unwrap_or(MIN_SPLIT_TRIS);
     let pos = |i: u32| world.vertices[i as usize].pos;
     let mut out_idx: Vec<u32> = Vec::with_capacity(world.indices.len());
     let mut cmds = Vec::new();
+    let mut lib_first = HashMap::new();
     for d in &world.draws {
         let m = &world.materials[d.material as usize];
+        if m.prop_lib {
+            lib_first.insert(d.material, out_idx.len() as u32);
+            out_idx.extend_from_slice(&world.indices[d.first_index as usize..(d.first_index + d.index_count) as usize]);
+            continue;
+        }
         let key = if m.sky { 6 } else { m.alpha_mode * 2 + m.double_sided as u8 };
         let pipe = if key != 6 && decal_bias(&mats_json[&m.name]) { key + DECAL_PIPES } else { key };
         let (shadow, skybox) = (!m.no_shadow && !m.skybox, m.skybox);
         let tris = &world.indices[d.first_index as usize..(d.first_index + d.index_count) as usize];
         let mut cells: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
-        let split = d.index_count / 3 >= MIN_SPLIT_TRIS;
+        let split = d.index_count / 3 >= min_split;
         for t in tris.chunks_exact(3) {
             let k = if split {
                 let (a, b, c) = (pos(t[0]), pos(t[1]), pos(t[2]));
                 let cx = (a[0] + b[0] + c[0]) / 3.0;
                 let cy = (a[1] + b[1] + c[1]) / 3.0;
-                ((cx / CELL).floor() as i32, (cy / CELL).floor() as i32)
+                ((cx / cell).floor() as i32, (cy / cell).floor() as i32)
             } else {
                 (0, 0)
             };
@@ -89,14 +104,15 @@ fn chunk_draws(world: &glb::World, mats_json: &serde_json::Value) -> (Vec<u32>, 
     }
     // stable: opaque, then alpha-tested, then blended (glb order kept inside each class), decals last in each
     cmds.sort_by_key(|c| (c.key / 2, c.pipe >= DECAL_PIPES, c.key, c.material));
-    (out_idx, cmds)
+    (out_idx, cmds, lib_first)
 }
 
 pub struct LoadedWorld {
     pub vbuf: wgpu::Buffer,
     pub ibuf: wgpu::Buffer,
     pub draws: Vec<DrawCmd>,
-    pub mat_groups: Vec<wgpu::BindGroup>,
+    /// every material's constants + textures (bindless, registered by Gfx::set_world); DrawCmd.material indexes it
+    pub mats: MatSet,
     /// per-vertex light probe index (u32::MAX = lightmapped / none), vertex stream 1
     pub probe_vbuf: wgpu::Buffer,
     pub light: GpuLighting,
@@ -108,6 +124,76 @@ pub struct LoadedWorld {
     pub collision: Collision,
     pub meta: Meta,
     pub stats: String,
+    /// runtime-LOD static props (props.json), None for older exports where props are baked into world.glb
+    pub props: Option<crate::props::Props>,
+    /// probe tree + cubemaps, for lighting things that move (the first-person weapon)
+    pub probe_lookup: BspLighting,
+    /// per-frame instance data: the main view, and one region per shadow cascade after it
+    pub inst_buf: Option<wgpu::Buffer>,
+    /// the level's env_exposure (auto_speed, auto_min, auto_max, auto_compensation), see `map_exposure`
+    pub exposure: Option<[f32; 4]>,
+}
+
+/// A set of materials for the bindless material table (mat.wgsl): their constants, with `tix` indexing `views`.
+/// Gfx::register_materials appends it to the global table and offsets the indices.
+pub struct MatSet {
+    pub views: Vec<wgpu::TextureView>,
+    pub mats: Vec<MatUniform>,
+}
+
+/// Builds a MatSet's view list: each distinct view once (by identity), its index for MatUniform.tix.
+pub(crate) struct TexIndex<'a> {
+    list: Vec<&'a wgpu::TextureView>,
+    at: HashMap<*const wgpu::TextureView, u32>,
+}
+
+impl<'a> TexIndex<'a> {
+    pub fn new() -> Self {
+        TexIndex { list: Vec::new(), at: HashMap::new() }
+    }
+    pub fn idx(&mut self, v: &'a wgpu::TextureView) -> u32 {
+        let n = self.list.len() as u32;
+        *self.at.entry(v as *const _).or_insert_with(|| {
+            self.list.push(v);
+            n
+        })
+    }
+    /// tix for 16 slots (mat.wgsl order)
+    pub fn tix(&mut self, slots: [&'a wgpu::TextureView; 16]) -> [[u32; 4]; 4] {
+        let mut t = [[0u32; 4]; 4];
+        for (k, v) in slots.into_iter().enumerate() {
+            t[k / 4][k % 4] = self.idx(v);
+        }
+        t
+    }
+    pub fn views(self) -> Vec<wgpu::TextureView> {
+        self.list.into_iter().cloned().collect()
+    }
+}
+
+/// The level-wide `env_exposure` from the BSP's entity lump (lump 0; the .ent files don't carry it): the one with no
+/// targetname (the others belong to `exposure_volume`s, e.g. the character-select room). The engine's exposure
+/// controller copies its auto_* keys over mat_autoexposure_* every frame. Retail Firing Range: speed 0.05, min 0.75,
+/// max 4.5, compensation -0.4 (S21's BSP had 0.15 / 1 / 4.5 / 0).
+fn map_exposure(bsp_dir: &std::path::Path) -> Option<[f32; 4]> {
+    let raw = std::fs::read(bsp_dir.join("0000.bin")).ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    let mut at = 0;
+    while let Some(o) = text[at..].find('{') {
+        let s = at + o;
+        let e = s + text[s..].find('}')?;
+        let blk = &text[s..e];
+        at = e + 1;
+        let kv: HashMap<&str, &str> = blk.split('"').collect::<Vec<_>>().chunks(4).filter_map(|c| (c.len() >= 4).then(|| (c[1], c[3]))).collect();
+        if kv.get("classname") != Some(&"env_exposure") || kv.contains_key("targetname") {
+            continue;
+        }
+        let f = |k: &str| kv.get(k).and_then(|v| v.trim().parse::<f32>().ok());
+        let out = [f("auto_speed")?, f("auto_min")?, f("auto_max")?, f("auto_compensation").unwrap_or(0.0)];
+        log::info!("exposure: env_exposure speed {} min {} max {} compensation {}", out[0], out[1], out[2], out[3]);
+        return Some(out);
+    }
+    None
 }
 
 pub struct Progress(pub AtomicU32);
@@ -122,48 +208,67 @@ impl Progress {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct MatUniform {
-    color: [f32; 4],
+pub(crate) struct MatUniform {
+    pub color: [f32; 4],
     /// x = alpha cutoff, y = lightmapped, z = alpha mode, w = world surface (uses vertex colour)
-    params: [f32; 4],
+    pub params: [f32; 4],
     /// x = has AO texture, y = has emissive texture
-    params2: [f32; 4],
+    pub params2: [f32; 4],
     /// c_L0_albedoTint (rgb)
-    albedo_tint: [f32; 4],
+    pub albedo_tint: [f32; 4],
     /// c_L0_emissiveTint (rgb)
-    emissive_tint: [f32; 4],
+    pub emissive_tint: [f32; 4],
     /// c_emissiveEdgeFade exponent, inner, outer
-    emissive_edge: [f32; 4],
+    pub emissive_edge: [f32; 4],
     /// x = two-layer blend, y = c_layerBlendRamp, z = layer 0 world-planar mapped, w = has detail normal
-    blend: [f32; 4],
+    pub blend: [f32; 4],
     /// c_uv1RotScaleX.xy, c_uv1RotScaleY.xy
-    uv1: [f32; 4],
+    pub uv1: [f32; 4],
     /// c_uv1Translate.xy, c_uv2Translate.xy
-    uv_t: [f32; 4],
+    pub uv_t: [f32; 4],
     /// c_uv2RotScaleX.xy, c_uv2RotScaleY.xy
-    uv2: [f32; 4],
+    pub uv2: [f32; 4],
     /// layer 1 albedo tint (rgb)
-    albedo2_tint: [f32; 4],
+    pub albedo2_tint: [f32; 4],
     /// x = has gloss2, y = has spec2, z = perf gloss L0, w = perf gloss L1
-    layer2: [f32; 4],
+    pub layer2: [f32; 4],
     /// perf spec colour L0 (rgb), w = has spec texture
-    perf_spec: [f32; 4],
+    pub perf_spec: [f32; 4],
     /// perf spec colour L1 (rgb)
-    perf_spec2: [f32; 4],
+    pub perf_spec2: [f32; 4],
     /// c_uv1..5 RotScaleX.xy, RotScaleY.xy
-    uv_rs: [[f32; 4]; 5],
+    pub uv_rs: [[f32; 4]; 5],
     /// c_uv1..5 Translate.xy
-    uv_tr: [[f32; 4]; 5],
+    pub uv_tr: [[f32; 4]; 5],
     /// UV per texture slot (ROUTE_SLOTS order): uv index 0..5 (0 = untransformed) | 8 if world-planar (x, -y)
-    route: [[u32; 4]; 4],
+    pub route: [[u32; 4]; 4],
     /// x = has detail (layer 0), y = has detail2 (layer 1), z = detail2 overlaid (else 2x multiply)
-    detail: [f32; 4],
+    pub detail: [f32; 4],
+    /// viewmodel item materials (heirlooms; world materials leave these zero): x = 1 emissive x scrolling multiply
+    /// texture, 2 = glass (premultiplied alpha), y = c_opacity, zw = c_uvDistortionIntensity
+    pub vmfx: [f32; 4],
+    /// c_uv1 / c_uv2 as these shaders read them: (angle, scaleU, scaleV, 0); translate (uv1.xy, uv2.xy) per second
+    pub vm_uv1: [f32; 4],
+    pub vm_uv2: [f32; 4],
+    pub vm_tr: [f32; 4],
+    /// rgb = c_L1_emissiveTint (layer-1 emissive of two-layer blends), w = has emissive2Texture
+    pub emis2: [f32; 4],
+    /// x = c_uvN transforms in retail rotation form (bit N-1, build_materials.py uv_rot), y = has emissiveMultiplyTexture
+    pub fx2: [f32; 4],
+    /// zUp rock blend (build_materials.py `zup` + `triplanar2`): c_zUpBlendingMinAngleCos, MaxAngleCos, VertexAlpha, 1 = on
+    pub zup: [f32; 4],
+    /// opacityMultiplyTexture alpha (build_materials.py `opacity`): c_opacity, distance-fade scale, bias, 1 = on
+    pub opac: [f32; 4],
+    /// alpha edge fade: exponent, inner, outer
+    pub opac_edge: [f32; 4],
+    /// texture indices (mat.wgsl slot order) into the MatSet's views, then the global table's
+    pub tix: [[u32; 4]; 4],
 }
 
 /// texture slots with a UV route, in MatUniform::route order (world.wgsl R_* constants)
-const ROUTE_SLOTS: [&str; 13] = ["albedo", "normal", "gloss", "spec", "ao", "albedo2", "normal2", "gloss2", "spec2", "blend", "detail_normal", "detail", "detail2"];
+const ROUTE_SLOTS: [&str; 16] = ["albedo", "normal", "gloss", "spec", "ao", "albedo2", "normal2", "gloss2", "spec2", "blend", "detail_normal", "detail", "detail2", "emissive_mult", "emissive2", "emissive"];
 
-const TEX_SLOTS: [(&str, Kind); 14] = [
+const TEX_SLOTS: [(&str, Kind); 17] = [
     ("albedo", Kind::Albedo),
     ("normal", Kind::Normal),
     ("gloss", Kind::Gloss),
@@ -178,6 +283,11 @@ const TEX_SLOTS: [(&str, Kind); 14] = [
     ("detail_normal", Kind::Normal),
     ("detail", Kind::Detail),
     ("detail2", Kind::Detail),
+    // emissive = emissiveTexture * emissiveMultiplyTexture * c_L0_emissiveTint (retail uber PS); layer-1 emissive
+    ("emissive_mult", Kind::Emissive),
+    ("emissive2", Kind::Emissive),
+    // opacityMultiplyTexture (decals, foam, glass): rides in the mask slot when the material has no layer blend
+    ("opacity_mult", Kind::Gloss),
 ];
 
 /// Six faces `<leaf>_albedoTexture_000..005.png` (D3D face order) of the sky material, as one cube texture.
@@ -269,6 +379,12 @@ fn load_grading(device: &wgpu::Device, queue: &wgpu::Queue, map_dir: &std::path:
     Some(tex.create_view(&Default::default()))
 }
 
+/// "_vc" (vertex colour) as a name part: `..._bm_vc`, `..._vc_dirty`
+fn vc_name(name: &str) -> bool {
+    let leaf = name.rsplit('/').next().unwrap_or(name);
+    leaf.ends_with("_vc") || leaf.contains("_vc_")
+}
+
 fn tint(v: &serde_json::Value) -> [f32; 4] {
     let a = v.as_array();
     let c = |i: usize| a.and_then(|a| a.get(i)).and_then(|x| x.as_f64()).unwrap_or(1.0) as f32;
@@ -280,11 +396,8 @@ fn spec_const(v: &serde_json::Value) -> [f32; 4] {
     if v.is_array() { tint(v) } else { [0.04, 0.04, 0.04, 1.0] }
 }
 
-fn tv(b: u32, v: &wgpu::TextureView) -> wgpu::BindGroupEntry<'_> {
-    wgpu::BindGroupEntry { binding: b, resource: wgpu::BindingResource::TextureView(v) }
-}
 
-fn solid(device: &wgpu::Device, queue: &wgpu::Queue, rgba: [u8; 4], format: wgpu::TextureFormat, label: &str) -> wgpu::TextureView {
+pub(crate) fn solid(device: &wgpu::Device, queue: &wgpu::Queue, rgba: [u8; 4], format: wgpu::TextureFormat, label: &str) -> wgpu::TextureView {
     upload_rgba(device, queue, &[image::RgbaImage::from_pixel(4, 4, image::Rgba(rgba))], format, label).create_view(&Default::default())
 }
 
@@ -306,6 +419,32 @@ fn mip_chain(img: image::RgbaImage, max: u32) -> Vec<image::RgbaImage> {
         out.push(next);
     }
     out
+}
+
+/// Alpha-tested textures: scale each mip's alpha so the share of texels at or above `cutoff` stays mip 0's
+/// (a plain box-filtered chain loses coverage per level: distant foliage thins out to sticks). Retail's own mip
+/// chains are authored that way; ours are rebuilt from the exported top level.
+fn preserve_coverage(mips: &mut [image::RgbaImage], cutoff: f32) {
+    let cov = |im: &image::RgbaImage, k: f32| {
+        let n = im.pixels().filter(|p| p[3] as f32 / 255.0 * k >= cutoff).count();
+        n as f32 / (im.width() * im.height()).max(1) as f32
+    };
+    let Some(first) = mips.first() else { return };
+    let target = cov(first, 1.0);
+    if target <= 0.0 {
+        return;
+    }
+    for im in mips.iter_mut().skip(1) {
+        let (mut lo, mut hi) = (0.0f32, 8.0f32);
+        for _ in 0..12 {
+            let mid = 0.5 * (lo + hi);
+            if cov(im, mid) < target { lo = mid } else { hi = mid }
+        }
+        let k = hi;
+        for px in im.pixels_mut() {
+            px[3] = (px[3] as f32 * k).round().min(255.0) as u8;
+        }
+    }
 }
 
 pub fn upload_rgba(device: &wgpu::Device, queue: &wgpu::Queue, mips: &[image::RgbaImage], format: wgpu::TextureFormat, label: &str) -> wgpu::Texture {
@@ -332,7 +471,68 @@ pub fn upload_rgba(device: &wgpu::Device, queue: &wgpu::Queue, mips: &[image::Rg
     tex
 }
 
-pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout: &wgpu::BindGroupLayout, progress: &Progress) -> Result<LoadedWorld, String> {
+/// Zipline cables as world geometry: an 8-sided tube of diameter `Width` along each line's rest points, retail
+/// material `cable/zipline` (rgdu: _col braid, _nml, _gls, _spc, _ilm). The texture spans the tube once around
+/// and repeats every Width * 2 units along it (64 x 128 texels, square texels like Source's cables).
+fn add_cables(world: &mut glb::World, mats_json: &mut serde_json::Value, lines: &[shared::zipline::Zipline]) {
+    if lines.is_empty() {
+        return;
+    }
+    use glam::Vec3;
+    const NAME: &str = "cable/zipline";
+    const SIDES: usize = 8;
+    if let Some(obj) = mats_json.as_object_mut() {
+        obj.insert(
+            NAME.into(),
+            serde_json::json!({
+                "shader": "rgdu",
+                "albedo": "images/textures/cable/zipline_col.png",
+                "normal": "images/textures/cable/zipline_nml.png",
+                "gloss": "images/textures/cable/zipline_gls.png",
+                "spec": "images/textures/cable/zipline_spc.png",
+                "all": {"albedoTexture": "", "normalTexture": "", "glossTexture": "", "specTexture": ""},
+            }),
+        );
+    }
+    let mi = world.materials.len() as u32;
+    world.materials.push(glb::Material { name: NAME.into(), base_color: [1.0; 4], alpha_cutoff: 0.5, no_shadow: false, ..Default::default() });
+    let first_index = world.indices.len() as u32;
+    let has_lighting = !world.lighting.is_empty();
+    let enc = |v: Vec3| [(v.x * 127.0) as i8, (v.y * 127.0) as i8, (v.z * 127.0) as i8, 0];
+    for z in lines {
+        let r = z.width * 0.5;
+        let tile = z.width * 2.0;
+        for (i, &p) in z.points.iter().enumerate() {
+            // direction: averaged over the neighbouring segments
+            let a = z.points[i.saturating_sub(1)];
+            let b = z.points[(i + 1).min(z.points.len() - 1)];
+            let t = (b - a).normalize_or(Vec3::X);
+            let side = if t.z.abs() > 0.99 { Vec3::X } else { Vec3::Z }.cross(t).normalize();
+            let up = t.cross(side);
+            let base = world.vertices.len() as u32;
+            for k in 0..=SIDES {
+                let ang = k as f32 / SIDES as f32 * std::f32::consts::TAU;
+                let n = side * ang.cos() + up * ang.sin();
+                world.vertices.push(glb::Vertex { pos: (p + n * r).to_array(), nrm: enc(n), uv0: [k as f32 / SIDES as f32, z.dist[i] / tile], uv1: [0, 0], color: [255; 4] });
+                if has_lighting {
+                    world.lighting.push(u32::MAX);
+                }
+            }
+            if i > 0 {
+                let prev = base - (SIDES as u32 + 1);
+                for k in 0..SIDES as u32 {
+                    let (a0, a1, b0, b1) = (prev + k, prev + k + 1, base + k, base + k + 1);
+                    world.indices.extend_from_slice(&[a0, b0, a1, a1, b0, b1]);
+                }
+            }
+        }
+    }
+    let index_count = world.indices.len() as u32 - first_index;
+    world.draws.push(glb::Draw { material: mi, first_index, index_count });
+    log::info!("ziplines: {} lines, {} cable triangles", lines.len(), index_count / 3);
+}
+
+pub fn load(cfg: &Config, tq: TextureQuality, device: &wgpu::Device, queue: &wgpu::Queue, progress: &Progress) -> Result<LoadedWorld, String> {
     let t0 = Instant::now();
     let meta = glb::load_meta(&cfg.meta_json())?;
     progress.set(0.02);
@@ -351,8 +551,9 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
             match collmesh::CollMesh::load(&bin) {
                 Ok(m) => {
                     let idx = m.player_indices();
+                    let surf = m.player_surfaces();
                     log::info!("collision: game collision.bin, {} of {} triangles block players", idx.len() / 3, m.tris.len());
-                    return Collision::build(m.positions, &idx);
+                    return Collision::build_tagged(m.positions, &idx, &surf);
                 }
                 Err(e) => log::warn!("{e}"),
             }
@@ -361,20 +562,8 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
         Collision::build(positions, &render_idx)
     });
 
-    // Baked lighting from the raw BSP lumps + one probe per static prop.
-    let bsp = BspLighting::load(&cfg.bsp_dir())?;
-    let sky_probe = meta.sky_probe.map(|(p, c)| (p & 0xFFFFFF) | ((c & 0xFF) << 24));
-    let probe_ix = lighting::assign_probes(&bsp, &world.vertices, &world.lighting, &world.indices, &world.draws, |m| world.materials[m as usize].lightmapped, |m| {
-        if world.materials[m as usize].skybox { sky_probe } else { None }
-    });
-    let probe_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("probe vb"), contents: bytemuck::cast_slice(&probe_ix), usage: wgpu::BufferUsages::VERTEX });
-    drop(probe_ix);
-    let light = GpuLighting::new(device, queue, &bsp, &cfg.map_dir().join("cubemaps.dds"));
-    drop(bsp);
-    let t_light = t0.elapsed().as_secs_f64();
-
     // The game's own material textures + render state (materials.json from tools/build_materials.py).
-    let mats_json: serde_json::Value = std::fs::read_to_string(cfg.map_dir().join("materials.json"))
+    let mut mats_json: serde_json::Value = std::fs::read_to_string(cfg.map_dir().join("materials.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| {
@@ -384,14 +573,63 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     if world.materials.iter().any(|m| mats_json[&m.name].is_object()) && !world.materials.iter().any(|m| mats_json[&m.name]["raster_flags"].is_u64()) {
         log::warn!("materials.json has no raster_flags (re-run tools/build_materials.py): decals drawn without depth bias");
     }
+    // The map's ziplines (BSP script entities): their cables join the world geometry with the retail material.
+    let ziplines = shared::zipline::load(&cfg.bsp_dir(), &cfg.map);
+    add_cables(&mut world, &mut mats_json, &ziplines);
+    // Geometry: world chunks + the prop library's index runs (the buffer is swapped in below).
+    let (chunk_idx, draws, lib_first) = chunk_draws(&world, &mats_json);
 
-    // Geometry buffers (index buffer re-ordered into spatial chunks).
-    let (chunk_idx, draws) = chunk_draws(&world, &mats_json);
+    // Baked lighting from the raw BSP lumps + one probe per static prop.
+    let bsp = BspLighting::load(&cfg.bsp_dir())?;
+    let sky_probe = meta.sky_probe.map(|(p, c)| (p & 0xFFFFFF) | ((c & 0xFF) << 24));
+    // library meshes take their probe from the instance (props.rs), not per vertex
+    let probe_draws: Vec<glb::Draw> = world.draws.iter().filter(|d| !world.materials[d.material as usize].prop_lib).cloned().collect();
+    let probe_ix = lighting::assign_probes(&bsp, &world.vertices, &world.lighting, &world.indices, &probe_draws, |m| world.materials[m as usize].lightmapped, |m| {
+        if world.materials[m as usize].skybox { sky_probe } else { None }
+    });
+    let probe_count = bsp.probes.len() as u32;
+    let props = crate::props::Props::load(
+        &cfg.map_dir().join("props.json"),
+        &lib_first,
+        |m| {
+            let mat = world.materials.get(m as usize)?;
+            let key = if mat.sky { 6 } else { mat.alpha_mode * 2 + mat.double_sided as u8 };
+            let pipe = if key != 6 && decal_bias(&mats_json[&mat.name]) { key + DECAL_PIPES } else { key };
+            Some((key, pipe, !mat.no_shadow && !mat.skybox))
+        },
+        |l| (l & 0xFF_FFFF) < probe_count,
+        |p| match bsp.nearest_probe(p.to_array()) {
+            Some(r) => (r.probe & 0xFFFFFF) | ((r.cube_index as u32 & 0xFF) << 24),
+            None => 0xFFFFFF | (bsp.nearest_cubemap(p.to_array()) << 24),
+        },
+    )?;
+    if lib_first.is_empty() != props.is_none() {
+        log::warn!("props.json and world.glb don't match (re-export the map): static props may be missing");
+    }
+    let probe_vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("probe vb"), contents: bytemuck::cast_slice(&probe_ix), usage: wgpu::BufferUsages::VERTEX });
+    drop(probe_ix);
+    let light = GpuLighting::new(device, queue, &bsp, &cfg.map_dir().join("cubemaps.dds"));
+    let t_light = t0.elapsed().as_secs_f64();
+
+    // Geometry buffers (index buffer re-ordered into spatial chunks + the prop library).
     world.indices = chunk_idx;
-    let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("world vb"), contents: bytemuck::cast_slice(&world.vertices), usage: wgpu::BufferUsages::VERTEX });
-    let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("world ib"), contents: bytemuck::cast_slice(&world.indices), usage: wgpu::BufferUsages::INDEX });
+    let inst_buf = props.as_ref().map(|p| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("prop instances"),
+            // + room for the runtime instances (loot on the ground)
+            size: ((p.instances.len() + crate::props::DYNAMIC_CAP).max(1) * (1 + crate::csm::N)) as u64 * crate::props::INST_STRIDE,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    });
+    // ray-traced shadows (rt.rs) build their acceleration structures straight from these
+    let blas_in = if device.features().contains(crate::rt::FEATURES) { wgpu::BufferUsages::BLAS_INPUT } else { wgpu::BufferUsages::empty() };
+    let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("world vb"), contents: bytemuck::cast_slice(&world.vertices), usage: wgpu::BufferUsages::VERTEX | blas_in });
+    let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("world ib"), contents: bytemuck::cast_slice(&world.indices), usage: wgpu::BufferUsages::INDEX | blas_in });
     let vb_mb = (world.vertices.len() * 32) as f64 / 1e6;
-    let tris = world.tri_count();
+    // world chunks + one copy of each prop at LOD0 (what a frame could draw at most), not the library
+    let lod0: u64 = props.as_ref().map_or(0, |p| p.instances.iter().map(|i| p.variants[i.variant as usize].lods.first().map_or(0, |l| l.draws.iter().map(|d| d.index_count as u64 / 3).sum::<u64>())).sum());
+    let tris = draws.iter().map(|d| d.index_count as usize / 3).sum::<usize>() + lod0 as usize;
     world.vertices = Vec::new();
     world.lighting = Vec::new();
     world.indices = Vec::new();
@@ -417,11 +655,23 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     wanted.dedup();
     let done = AtomicU32::new(0);
     let total = wanted.len().max(1) as f32;
+    // Video > Texture Quality: the cache keeps the full chain, the upload starts lower down
+    let picmip = tq.picmip();
+    let tex_bytes = std::sync::atomic::AtomicU64::new(0);
     let mat_tex: HashMap<(String, u8), wgpu::TextureView> = wanted
         .par_iter()
         .filter_map(|(rel, kind)| {
+            // HDR textures (BC6H, e.g. the 3D skybox's sky dome) ship as DDS: uploaded as they are, never re-encoded
+            if rel.ends_with(".dds") {
+                let d = crate::dds::load(&root.join(rel)).map_err(|e| log::warn!("{e}")).ok()?;
+                let t = crate::dds::upload(device, queue, &d, rel);
+                tex_bytes.fetch_add(d.data.len() as u64, Ordering::Relaxed);
+                done.fetch_add(1, Ordering::Relaxed);
+                return Some(((rel.clone(), *kind as u8), t.create_view(&Default::default())));
+            }
             let e = texcache::load(&root, &cache, rel, *kind, cap)?;
-            let t = texcache::upload(device, queue, &e);
+            let (t, bytes) = texcache::upload(device, queue, &e, texcache::base_level(&e, picmip));
+            tex_bytes.fetch_add(bytes, Ordering::Relaxed);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
             progress.set(0.3 + 0.5 * n as f32 / total);
             Some(((rel.clone(), *kind as u8), t.create_view(&Default::default())))
@@ -430,6 +680,14 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
 
     // glb base colours: fallback albedo, and the alpha source for cut-outs
     let mut used: Vec<u32> = world.materials.iter().filter(|m| m.alpha_mode != 0 || mats_json[&m.name]["albedo"].as_str().is_none()).filter_map(|m| m.base_tex).collect();
+    // cut-out materials' alpha cutoff per base image (lowest wins): their mips keep alpha coverage
+    let mut cut_of: HashMap<u32, f32> = HashMap::new();
+    for m in world.materials.iter().filter(|m| m.alpha_mode == 1) {
+        if let Some(t) = m.base_tex {
+            let c = cut_of.entry(t).or_insert(m.alpha_cutoff);
+            *c = c.min(m.alpha_cutoff);
+        }
+    }
     used.sort();
     used.dedup();
     let max = cfg.max_texture_size.max(16);
@@ -438,13 +696,44 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
         .filter_map(|&ii| {
             let bytes = world.image_bytes(ii)?;
             let img = image::load_from_memory(bytes).ok()?.to_rgba8();
-            let tex = upload_rgba(device, queue, &mip_chain(img, max), wgpu::TextureFormat::Rgba8UnormSrgb, "base");
+            // same picmip as the material textures, by halving the size cap
+            let (w, h) = img.dimensions();
+            let (mut lim, mut skip) = (max.min(w.max(h)), 0);
+            while skip < picmip.0 && lim / 2 >= picmip.1.max(16) {
+                lim /= 2;
+                skip += 1;
+            }
+            let mut chain = mip_chain(img, lim);
+            if let Some(&c) = cut_of.get(&ii) {
+                preserve_coverage(&mut chain, c.clamp(0.01, 0.99));
+            }
+            tex_bytes.fetch_add(chain.iter().map(|m| m.as_raw().len() as u64).sum(), Ordering::Relaxed);
+            let tex = upload_rgba(device, queue, &chain, wgpu::TextureFormat::Rgba8UnormSrgb, "base");
             Some((ii, tex.create_view(&wgpu::TextureViewDescriptor::default())))
         })
         .collect();
     let t_tex = t0.elapsed().as_secs_f64();
 
     let sky_cube = load_sky_cube(device, queue, &root, &cfg.map_dir(), world.materials.iter().find(|m| m.sky).map(|m| m.name.as_str()));
+
+    // what fell back to plain white (a texture that didn't load, or a material with none): say so
+    let failed: Vec<&(String, Kind)> = wanted.iter().filter(|w| !mat_tex.contains_key(&(w.0.clone(), w.1 as u8))).collect();
+    if !failed.is_empty() {
+        log::warn!("{} of {} material textures didn't load, e.g. {:?}", failed.len(), wanted.len(), failed.iter().take(6).map(|w| &w.0).collect::<Vec<_>>());
+    }
+    let white_mats: Vec<&str> = world
+        .materials
+        .iter()
+        .filter(|m| {
+            let e = &mats_json[&m.name];
+            let tex = if m.alpha_mode == 0 || (m.alpha_mode == 2 && e["blend"].is_string()) { e["albedo"].as_str().filter(|r| mat_tex.contains_key(&(r.to_string(), Kind::Albedo as u8))) } else { None };
+            tex.is_none() && m.base_tex.is_none_or(|t| !views.contains_key(&t)) && !m.sky
+        })
+        .map(|m| m.name.as_str())
+        .collect();
+    if !white_mats.is_empty() {
+        log::warn!("{} materials have no albedo (drawn white): {:?}", white_mats.len(), white_mats.iter().take(12).collect::<Vec<_>>());
+    }
 
     use wgpu::TextureFormat as F;
     let white = solid(device, queue, [255; 4], F::Rgba8UnormSrgb, "white");
@@ -455,7 +744,8 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
     let black = solid(device, queue, [0, 0, 0, 255], F::Rgba8UnormSrgb, "black");
     let grey = solid(device, queue, [128, 128, 128, 255], F::Rgba8Unorm, "detail 0.5");
 
-    let mat_groups: Vec<wgpu::BindGroup> = world
+    let mut ti = TexIndex::new();
+    let mat_list: Vec<MatUniform> = world
         .materials
         .iter()
         .enumerate()
@@ -474,10 +764,15 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
             let normal2 = get("normal2", Kind::Normal);
             let gloss2 = get("gloss2", Kind::Gloss);
             let spec2 = get("spec2", Kind::Spec);
-            let mask = get("blend", Kind::Gloss);
+            let opac_t = get("opacity_mult", Kind::Gloss);
+            let opac_on = opac_t.is_some() && e["opacity"].is_array() && e["blend"].is_null() && m.alpha_mode != 0;
+            // the opacity mask rides in the (unused) layer-blend mask slot, on its own UV route
+            let mask = if opac_on { opac_t } else { get("blend", Kind::Gloss) };
             let detail_n = get("detail_normal", Kind::Normal);
             let detail = get("detail", Kind::Detail);
             let detail2 = get("detail2", Kind::Detail);
+            let emis_mult = get("emissive_mult", Kind::Emissive);
+            let emis2 = get("emissive2", Kind::Emissive);
             let f2 = |k: &str, d: [f32; 2]| -> [f32; 2] {
                 let a = e[k].as_array();
                 let c = |i: usize| a.and_then(|a| a.get(i)).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(d[i]);
@@ -495,7 +790,7 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
             }
             let two_layer = albedo2.is_some();
             // blended "transparent" overlays (e.g. sand over the range floor): opacity = (1 - blend) * albedo alpha
-            let overlay = !two_layer && m.alpha_mode == 2 && mask.is_some();
+            let overlay = !two_layer && m.alpha_mode == 2 && mask.is_some() && !opac_on;
             // a tiny layer-0 UV scale means the shader maps layer 0 from world position (terrain-style)
             let planar = (two_layer || overlay) && (rx[0].abs() + rx[1].abs()) < 0.05;
             // UV per texture: read from the material's pixel shader by build_materials.py (uv_route). Without one (no PS
@@ -510,7 +805,7 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
                     "detail_normal" | "detail" | "detail2" => 2 | ((planar as u32) << 3),
                     _ => 0,
                 };
-                let r = &e["uv_route"][*slot];
+                let r = if *slot == "blend" && opac_on { &e["uv_route"]["opacity_mult"] } else { &e["uv_route"][*slot] };
                 let code = match (r[0].as_u64(), r[1].as_str()) {
                     (Some(i), Some(b)) => i as u32 | (((b == "planar") as u32) << 3),
                     _ => def,
@@ -522,8 +817,14 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
             }
             let u = MatUniform {
                 color: m.base_color,
-                params: [m.alpha_cutoff, if m.lightmapped { 1.0 } else { 0.0 }, m.alpha_mode as f32, if m.name.starts_with("world/") && !is_blend { 1.0 } else { 0.0 }],
-                params2: [ao.is_some() as u32 as f32, emis.is_some() as u32 as f32, 0.0, 0.0],
+                // vertex RGB tints world surfaces; blends use vertex alpha as the blend factor, but the "_vc" ones
+                // (concrete_floor_01_bright_grey_bm_vc: the painted green bands on the Firing Range blocks) tint by RGB too
+                // props too when their PS multiplies albedo by the vertex colour (build_materials.py vertex_tint: the
+                // "*_vert_color" paints, white in the texture, coloured per model)
+                params: [m.alpha_cutoff, if m.lightmapped { 1.0 } else { 0.0 }, m.alpha_mode as f32, if (m.name.starts_with("world/") && (!is_blend || vc_name(&m.name))) || e["vertex_tint"].as_bool().unwrap_or(false) { 1.0 } else { 0.0 }],
+                // z = unlit (build_materials.py: the PS binds no shadow / light / cubemap: the HDR sky dome)
+                // w = AO takes vertex colour R too (build_materials.py vertex_ao: the foliage PS)
+                params2: [ao.is_some() as u32 as f32, emis.is_some() as u32 as f32, e["unlit"].as_bool().unwrap_or(false) as u32 as f32, e["vertex_ao"].as_bool().unwrap_or(false) as u32 as f32],
                 albedo_tint: tint(&e["albedo_tint"]),
                 emissive_tint: tint(&e["emissive_tint"]),
                 emissive_edge: {
@@ -549,44 +850,79 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
                 route,
                 // c_uberFeatureFlags bit 2: detail2 is overlaid like layer 0's detail (else albedo2 * detail2 * 2)
                 detail: [detail.is_some() as u32 as f32, detail2.is_some() as u32 as f32, ((e["feature_flags"].as_u64().unwrap_or(0) & 4) != 0) as u32 as f32, mi as f32],
-            };
-            let ub = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mat"), contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM });
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("mat"),
-                layout: mat_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() },
-                    tv(1, albedo),
-                    tv(2, normal),
-                    tv(3, gloss),
-                    tv(4, spec),
-                    tv(5, ao.unwrap_or(&one)),
-                    tv(6, emis.unwrap_or(&black)),
-                    tv(7, albedo2.unwrap_or(&white)),
-                    tv(8, normal2.unwrap_or(&flat_n)),
-                    tv(9, gloss2.unwrap_or(&def_gloss)),
-                    tv(10, spec2.unwrap_or(&def_spec)),
-                    tv(11, mask.unwrap_or(&one)),
-                    tv(12, detail_n.unwrap_or(&flat_n)),
-                    tv(13, detail.unwrap_or(&grey)),
-                    tv(14, detail2.unwrap_or(&grey)),
+                vmfx: [0.0; 4],
+                vm_uv1: [0.0; 4],
+                vm_uv2: [0.0; 4],
+                vm_tr: [0.0; 4],
+                emis2: { let t = tint(&e["emissive2_tint"]); [t[0], t[1], t[2], emis2.is_some() as u32 as f32] },
+                opac: match e["opacity"].as_array() {
+                    Some(o) if opac_on && o.len() >= 6 => {
+                        let g = |i: usize| o[i].as_f64().unwrap_or(0.0) as f32;
+                        [g(0), g(1), g(2), 1.0]
+                    }
+                    _ => [0.0; 4],
+                },
+                opac_edge: match e["opacity"].as_array() {
+                    Some(o) if opac_on && o.len() >= 6 => {
+                        let g = |i: usize| o[i].as_f64().unwrap_or(1.0) as f32;
+                        [g(3), g(4), g(5), 0.0]
+                    }
+                    _ => [1.0, 1.0, 1.0, 0.0],
+                },
+                zup: match (e["triplanar2"].as_bool(), e["zup"].as_array()) {
+                    (Some(true), Some(z)) if z.len() >= 3 => {
+                        let g = |i: usize| z[i].as_f64().unwrap_or(0.0) as f32;
+                        [g(0), g(1), g(2), 1.0]
+                    }
+                    _ => [0.0; 4],
+                },
+                // z / w: the PS binds no gloss / spec texture, so it shades with c_L0_perfGloss / c_L0_perfSpecColor
+                // (the water: gloss 1, F0 0.063); a missing PNG for a bound texture keeps the defaults
+                fx2: [
+                    e["uv_rot"].as_array().map_or(0, |a| a.iter().filter_map(|n| n.as_u64()).filter(|n| (1..=5).contains(n)).fold(0u32, |m, n| m | 1 << (n - 1))) as f32,
+                    emis_mult.is_some() as u32 as f32,
+                    (e["all"].get("glossTexture").is_none() && e["all"].get("gls").is_none() && e["perf_gloss"].is_number()) as u32 as f32,
+                    (e["all"].get("specTexture").is_none() && e["all"].get("spc").is_none() && e["perf_spec"].is_array()) as u32 as f32,
                 ],
-            })
+                tix: ti.tix([
+                    albedo,
+                    normal,
+                    gloss,
+                    spec,
+                    ao.unwrap_or(&one),
+                    emis.unwrap_or(&black),
+                    albedo2.unwrap_or(&white),
+                    normal2.unwrap_or(&flat_n),
+                    gloss2.unwrap_or(&def_gloss),
+                    spec2.unwrap_or(&def_spec),
+                    mask.unwrap_or(&one),
+                    detail_n.unwrap_or(&flat_n),
+                    detail.unwrap_or(&grey),
+                    detail2.unwrap_or(&grey),
+                    emis_mult.unwrap_or(&white),
+                    emis2.unwrap_or(&black),
+                ]),
+            };
+            u
         })
         .collect();
+    let mats = MatSet { views: ti.views(), mats: mat_list };
 
     progress.set(0.95);
-    let collision = col_thread.join().map_err(|_| "collision build panicked".to_string())?;
+    let mut collision = col_thread.join().map_err(|_| "collision build panicked".to_string())?;
+    collision.ziplines = ziplines;
     // make sure every upload has landed before the first frame uses it
     queue.submit([]);
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     progress.set(1.0);
     let stats = format!(
-        "{:.1} M tris, {} draws, {} material textures + {} glb, {} lights, {} probes, VB {:.0} MB, BVH {} nodes ({:.0} ms); glb {:.1}s, lighting {:.1}s, textures {:.1}s, total {:.1}s",
+        "{:.1} M tris, {} draws, {} material textures + {} glb ({:.0} MB, texture quality {}), {} lights, {} probes, VB {:.0} MB, BVH {} nodes ({:.0} ms); glb {:.1}s, lighting {:.1}s, textures {:.1}s, total {:.1}s",
         tris as f64 / 1e6,
         draws.len(),
         mat_tex.len(),
         views.len(),
+        tex_bytes.load(Ordering::Relaxed) as f64 / 1048576.0,
+        tq.label(),
         light.light_count,
         light.probe_count,
         vb_mb,
@@ -597,9 +933,14 @@ pub fn load(cfg: &Config, device: &wgpu::Device, queue: &wgpu::Queue, mat_layout
         t_tex - t_light,
         t0.elapsed().as_secs_f64()
     );
+    let stats = match &props {
+        Some(p) => format!("{stats}; props: {} instances of {} variants, runtime LOD ({:.2} M library tris)", p.instances.len(), p.variants.len(), p.lib_tris as f64 / 1e6),
+        None => format!("{stats}; props baked into world.glb (no props.json)"),
+    };
     log::info!("{stats}");
     let fog = crate::fog::Fog::from_map(&cfg.bsp_dir(), light.sun_dir);
     let grading = load_grading(device, queue, &cfg.map_dir(), &cfg.bsp_dir());
-    Ok(LoadedWorld { vbuf, ibuf, draws, mat_groups, probe_vbuf, light, sky_cube, fog, grading, collision, meta, stats })
+    let exposure = map_exposure(&cfg.bsp_dir());
+    Ok(LoadedWorld { exposure, vbuf, ibuf, draws, mats, probe_vbuf, light, sky_cube, fog, grading, collision, meta, stats, props, inst_buf, probe_lookup: bsp })
 }
 

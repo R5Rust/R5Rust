@@ -34,13 +34,15 @@ pub struct Material {
     pub no_shadow: bool,
     /// 3D skybox geometry (static prop flag 0x40): drawn only from the sky camera; extras `skybox`
     pub skybox: bool,
+    /// runtime-LOD prop library (model space, drawn instanced from props.json); extras `propLibrary`
+    pub prop_lib: bool,
 }
 
 impl Material {
     /// Does this surface block the player? Grass, leaves, bushes, wires, cables and decals don't
     /// (tree trunks, stumps and logs do). Blended (glass/fx) surfaces never do.
     pub fn solid(&self) -> bool {
-        if self.alpha_mode == 2 || self.sky || self.skybox {
+        if self.alpha_mode == 2 || self.sky || self.skybox || self.prop_lib {
             return false;
         }
         let n = self.name.to_ascii_lowercase();
@@ -276,6 +278,7 @@ fn parse_materials(j: &Value) -> Vec<Material> {
             sky: m["extras"]["sky"].as_bool().unwrap_or(false),
             no_shadow: m["extras"]["noShadow"].as_bool().unwrap_or(false),
             skybox: m["extras"]["skybox"].as_bool().unwrap_or(false),
+            prop_lib: m["extras"]["propLibrary"].as_bool().unwrap_or(false),
         });
     }
     out

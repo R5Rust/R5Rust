@@ -7,7 +7,7 @@ load it through `shared::collmesh`. Without that file they fall back to world.gl
 a warning.
 
 ```powershell
-cd ..\export-map
+cd export-map
 cargo run --release -- --collision --out D:\R5Rust\assets\maps\mp_rr_canyonlands_staging_mu1   # ~10-20 s
 ```
 

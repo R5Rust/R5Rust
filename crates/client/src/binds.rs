@@ -2,7 +2,7 @@
 //! direction. A bind lives in one slot only. Saved with the other settings in `r5rust_settings.toml`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use winit::event::MouseButton;
 use winit::keyboard::KeyCode;
 
@@ -20,10 +20,36 @@ pub enum Action {
     Respawn,
     Fullscreen,
     Mark,
+    Console,
+    Fire,
+    Ads,
+    Reload,
+    Inspect,
+    WeaponSlot1,
+    WeaponSlot2,
+    HolsterSlot,
+    Melee,
+    /// pick up / interact (Apex: E; hold to swap)
+    Use,
+    /// the inventory screen (Apex: TAB)
+    Inventory,
+    /// ping (Kainz's retail bind: X); shown in use prompts like the zipline flyout
+    Ping,
 }
 
 impl Action {
-    pub const ALL: [Action; 12] = [
+    pub const ALL: [Action; 24] = [
+        Action::Fire,
+        Action::Ads,
+        Action::Reload,
+        Action::Inspect,
+        Action::WeaponSlot1,
+        Action::WeaponSlot2,
+        Action::HolsterSlot,
+        Action::Melee,
+        Action::Use,
+        Action::Inventory,
+        Action::Ping,
         Action::Forward,
         Action::Back,
         Action::Left,
@@ -36,6 +62,7 @@ impl Action {
         Action::Respawn,
         Action::Fullscreen,
         Action::Mark,
+        Action::Console,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -51,6 +78,18 @@ impl Action {
             Action::Respawn => "Respawn",
             Action::Fullscreen => "Fullscreen",
             Action::Mark => "Mark spot (bug report)",
+            Action::Console => "Developer console",
+            Action::Fire => "Fire",
+            Action::Ads => "Aim down sights (hold)",
+            Action::Reload => "Reload",
+            Action::Inspect => "Inspect weapon",
+            Action::WeaponSlot1 => "Equip weapon 1",
+            Action::WeaponSlot2 => "Equip weapon 2",
+            Action::Use => "Use / pick up",
+            Action::Inventory => "Inventory",
+            Action::Ping => "Ping",
+            Action::HolsterSlot => "Holster / melee",
+            Action::Melee => "Melee",
         }
     }
 }
@@ -159,11 +198,26 @@ impl Default for Binds {
                 (Action::Jump, [k(K::Space), Some(Bind::WheelDown)]),
                 (Action::Crouch, [k(K::ControlLeft), k(K::KeyC)]),
                 (Action::Sprint, [k(K::ShiftLeft), None]),
-                (Action::FlyToggle, [k(K::KeyV), None]),
+                (Action::FlyToggle, [k(K::KeyB), None]),
                 (Action::FlyDown, [k(K::KeyX), None]),
-                (Action::Respawn, [k(K::KeyR), None]),
+                (Action::Respawn, [k(K::KeyK), None]),
                 (Action::Fullscreen, [k(K::F11), None]),
                 (Action::Mark, [k(K::F8), None]),
+                (Action::Console, [k(K::Backquote), None]),
+                (Action::Fire, [Some(Bind::Mouse(MouseBtn::Left)), None]),
+                (Action::Ads, [Some(Bind::Mouse(MouseBtn::Right)), None]),
+                (Action::Reload, [k(K::KeyR), None]),
+                // Apex's default
+                (Action::Inspect, [k(K::KeyN), None]),
+                // Apex's defaults: 1 / 2 = weapons, 3 = the melee slot (weaponSelectPrimary2), V = melee,
+                // E = use (hold to swap), TAB = inventory
+                (Action::WeaponSlot1, [k(K::Digit1), None]),
+                (Action::WeaponSlot2, [k(K::Digit2), None]),
+                (Action::HolsterSlot, [k(K::Digit3), None]),
+                (Action::Melee, [k(K::KeyV), None]),
+                (Action::Use, [k(K::KeyE), None]),
+                (Action::Inventory, [k(K::Tab), None]),
+                (Action::Ping, [k(K::KeyX), None]),
             ],
         }
     }
@@ -175,6 +229,17 @@ impl Binds {
         let def = Binds::default();
         for (a, s) in def.slots {
             if !self.slots.iter().any(|(b, _)| *b == a) {
+                // a new action takes its default keys from whatever had them only by the old defaults (R was
+                // Respawn before Reload existed): the old holder moves to its new default
+                for b in s.iter().flatten() {
+                    for (other, slots) in self.slots.iter_mut() {
+                        for slot in slots.iter_mut() {
+                            if slot.as_ref() == Some(b) {
+                                *slot = Binds::default().get(*other).into_iter().flatten().find(|d| d != b);
+                            }
+                        }
+                    }
+                }
                 self.slots.push((a, s));
             }
         }
@@ -301,11 +366,23 @@ pub struct UserSettings {
     pub mantle_boost: bool,
     /// Apex's player_setting_autosprint: moving forward sprints without the sprint key (on in Kainz's R5F profile)
     pub auto_sprint: bool,
+    /// Apex's ADS mode Toggle: the aim key flips aiming on/off instead of holding (sprint drops it)
+    pub toggle_ads: bool,
+    /// the melee slot's heirloom (Settings > Mods): main.rs HEIRLOOMS id, "" = empty hands
+    pub heirloom: String,
+    /// video settings (`[graphics]`), see graphics.rs
+    pub graphics: crate::graphics::GraphicsSettings,
+    /// console `cl_showfps` (0 off, 1 fps, 2 fps + frame time graph)
+    pub show_fps: u8,
+    /// console `cl_showpos`: position / angles / velocity readout
+    pub show_pos: bool,
+    /// console `bind <key> <command>`: key label (as the Controls tab shows it, e.g. F5, MOUSE4) -> command line
+    pub console_binds: BTreeMap<String, String>,
 }
 
 impl Default for UserSettings {
     fn default() -> Self {
-        UserSettings { binds: Binds::default(), sensitivity: 1.6, fov: 100.0, invert_y: false, mantle_boost: true, auto_sprint: true }
+        UserSettings { binds: Binds::default(), sensitivity: 1.6, fov: 100.0, invert_y: false, mantle_boost: true, auto_sprint: true, toggle_ads: false, heirloom: String::new(), graphics: Default::default(), show_fps: 0, show_pos: false, console_binds: BTreeMap::new() }
     }
 }
 
@@ -317,6 +394,7 @@ impl UserSettings {
         match std::fs::read_to_string(SETTINGS_FILE).ok().and_then(|s| toml::from_str::<UserSettings>(&s).map_err(|e| log::warn!("{SETTINGS_FILE}: {e}")).ok()) {
             Some(mut s) => {
                 s.binds = s.binds.normalised();
+                s.graphics = s.graphics.sanitised();
                 s
             }
             None => UserSettings { sensitivity: sens, fov, ..Default::default() },
