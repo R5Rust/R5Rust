@@ -18,6 +18,10 @@ if (-not (Test-Path $exe) -or -not (Test-Path $ver)) { throw "no build in $slot 
 $line = (Get-Content $ver -Raw).Trim()
 $hash = ($line -split '\s+')[2]
 if (-not $hash -or -not (git -C $root cat-file -t $hash 2>$null)) { throw "can't tell which commit $exe was built from ($line)" }
+# builds from before player-style builds (dev cargo build: this PC's paths inside, needs the VC++ runtime) can't go out
+if (Select-String -LiteralPath $exe -Pattern ([regex]::Escape($env:USERPROFILE)) -Encoding ascii -List) {
+  throw "this build ($hash) is an old dev build that can't be shared: press Build latest, play the new build, then push"
+}
 $notes = @()
 if ($NotesFile -and (Test-Path $NotesFile)) {
   $notes = @(Get-Content $NotesFile | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
