@@ -79,7 +79,7 @@ try {
 
   # 4. nothing personal may ship
   $leak = Get-ChildItem $stage -Recurse -File | Where-Object { $_.Extension -in '.ps1', '.py', '.json', '.txt', '.md', '.toml', '.cfg', '.mjs', '.js' } |
-    Select-String -Pattern ([regex]::Escape($env:USERPROFILE)), 'example\.invalid' -SimpleMatch:$false -List
+    Select-String -Pattern ([regex]::Escape($env:USERPROFILE)), ([regex]::Escape($env:USERNAME)) -List
   if ($leak) { throw "personal paths in the package: $($leak.Path -join ', ')" }
   foreach ($bin in Get-ChildItem $stage -Recurse -Filter *.exe) {
     if (Select-String -LiteralPath $bin.FullName -Pattern ([regex]::Escape($env:USERPROFILE)) -Encoding ascii -List) { throw "$($bin.Name) has the user folder baked in" }
