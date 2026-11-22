@@ -474,14 +474,17 @@ pub fn upload_rgba(device: &wgpu::Device, queue: &wgpu::Queue, mips: &[image::Rg
 /// Zipline cables as world geometry: an 8-sided tube of diameter `Width` along each line's rest points, retail
 /// material `cable/zipline` (rgdu: _col braid, _nml, _gls, _spc, _ilm). The texture spans the tube once around
 /// and repeats every Width * 2 units along it (64 x 128 texels, square texels like Source's cables).
-fn add_cables(world: &mut glb::World, mats_json: &mut serde_json::Value, lines: &[shared::zipline::Zipline]) {
+fn add_cables(world: &mut glb::World, mats_json: &mut serde_json::Value, lines: &[shared::zipline::Zipline], assets: &std::path::Path) {
     if lines.is_empty() {
         return;
     }
     use glam::Vec3;
     const NAME: &str = "cable/zipline";
     const SIDES: usize = 8;
-    if let Some(obj) = mats_json.as_object_mut() {
+    // the braid textures come from a one-off export, not the player install: without them the cable is plain dark
+    // steel (the untextured default is white, which reads as a glowing line)
+    let textured = assets.join("images/textures/cable/zipline_col.png").is_file();
+    if let Some(obj) = mats_json.as_object_mut().filter(|_| textured) {
         obj.insert(
             NAME.into(),
             serde_json::json!({
@@ -495,7 +498,8 @@ fn add_cables(world: &mut glb::World, mats_json: &mut serde_json::Value, lines: 
         );
     }
     let mi = world.materials.len() as u32;
-    world.materials.push(glb::Material { name: NAME.into(), base_color: [1.0; 4], alpha_cutoff: 0.5, no_shadow: false, ..Default::default() });
+    let base_color = if textured { [1.0; 4] } else { [0.055, 0.057, 0.062, 1.0] };
+    world.materials.push(glb::Material { name: NAME.into(), base_color, alpha_cutoff: 0.5, no_shadow: false, ..Default::default() });
     let first_index = world.indices.len() as u32;
     let has_lighting = !world.lighting.is_empty();
     let enc = |v: Vec3| [(v.x * 127.0) as i8, (v.y * 127.0) as i8, (v.z * 127.0) as i8, 0];
@@ -575,7 +579,7 @@ pub fn load(cfg: &Config, tq: TextureQuality, device: &wgpu::Device, queue: &wgp
     }
     // The map's ziplines (BSP script entities): their cables join the world geometry with the retail material.
     let ziplines = shared::zipline::load(&cfg.bsp_dir(), &cfg.map);
-    add_cables(&mut world, &mut mats_json, &ziplines);
+    add_cables(&mut world, &mut mats_json, &ziplines, &cfg.assets_root());
     // Geometry: world chunks + the prop library's index runs (the buffer is swapped in below).
     let (chunk_idx, draws, lib_first) = chunk_draws(&world, &mats_json);
 

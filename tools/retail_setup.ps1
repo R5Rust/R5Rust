@@ -23,6 +23,9 @@
   (mdl v20/v21), exports cubemaps, takes --exportguids, and sets formats with --exportsetting <type>=<n>. Our old
   patched build (tools\rsx-src) was deleted by Defender on 2026-11-18 and isn't needed any more.
   tools\install.ps1 (the launcher's Install button) runs these steps one at a time with its own paths.
+  Tools: tools\bin\* first (the tools zip from tools\bundle_tools.ps1: RSX, extractor, python, dxc, export-map.exe).
+  A game folder without source (no tools\export-map\Cargo.toml) uses only those, never this PC's dev paths; a dev
+  checkout falls back to D:\R5Rust\... and rebuilds export-map with cargo as before.
 
     pwsh tools\retail_setup.ps1 -ApexIsClosed [-Map mp_rr_canyonlands_staging_mu1] [-Only 1,2,...] [-Rescan]
 #>
@@ -34,8 +37,10 @@ param(
   [string]$Work = 'D:\R5Rust\_work_retail',
   # raw material exports (step 4) land here, then the extractor sorts them into $Out
   [string]$Raw = '',
-  [string]$Rsx = 'D:\R5Rust\tools\rsx-fs\bin\Release\rsx.exe',
-  [string]$Extractor = 'D:\R5Rust\extractor',
+  # default: tools\bin\rsx\rsx.exe, else (dev checkout) D:\R5Rust\tools\rsx-fs\bin\Release\rsx.exe
+  [string]$Rsx = '',
+  # default: tools\bin\extractor, else (dev checkout) D:\R5Rust\extractor
+  [string]$Extractor = '',
   # the extractor's config (game / out / work / raw / groups); install.ps1 writes one per install
   [string]$ExtractorConfig = '',
   [string]$Only = '',
@@ -47,6 +52,16 @@ $Steps = @($Only -split '[,\s]+' | Where-Object { $_ } | ForEach-Object { [int]$
 $readsInstall = $Steps.Count -eq 0 -or ($Steps | Where-Object { $_ -in 1, 3, 4, 8, 9, 10 })
 if ($readsInstall -and -not $ApexIsClosed) { throw 'Steps 1, 3, 4, 8, 9 and 10 read the retail install: close Apex, then run again with -ApexIsClosed (this script never checks the game process).' }
 $repo = Split-Path -Parent $PSScriptRoot
+# a dev checkout has export-map's source; a player's game folder (launcher) has tools\bin from the tools zip instead
+$dev = Test-Path (Join-Path $repo 'tools\export-map\Cargo.toml')
+$bin = Join-Path $repo 'tools\bin'
+function First-Existing([string[]]$paths) { foreach ($p in $paths) { if ($p -and (Test-Path -LiteralPath $p)) { return $p } }; $null }
+if (-not $Rsx) { $Rsx = First-Existing @((Join-Path $bin 'rsx\rsx.exe'), $(if ($dev) { 'D:\R5Rust\tools\rsx-fs\bin\Release\rsx.exe' })) }
+if (-not $Extractor) { $Extractor = First-Existing @((Join-Path $bin 'extractor'), $(if ($dev) { 'D:\R5Rust\extractor' })) }
+if (-not $Extractor) { throw 'extractor not found (tools\bin\extractor: the tools zip)' }
+# the bundled Python first for every `python` below and in child processes; the bundled dxc for the shader scripts
+if (Test-Path (Join-Path $bin 'python\python.exe')) { $env:PATH = (Join-Path $bin 'python') + ';' + $env:PATH }
+if (-not $env:R5_DXC -and (Test-Path (Join-Path $bin 'dxc\dxc.exe'))) { $env:R5_DXC = Join-Path $bin 'dxc\dxc.exe' }
 $mapDir = Join-Path $Out "maps\$Map"
 $emWork = Join-Path $Work 'export-map'
 $mirror = Join-Path $emWork 'mirror\paks\Win64'
@@ -54,7 +69,7 @@ $extractor = $Extractor
 if (-not $Raw) { $Raw = Join-Path (Split-Path -Parent $Work) '_raw_retail' }
 $py = if (Test-Path "$extractor\.venv\Scripts\python.exe") { "$extractor\.venv\Scripts\python.exe" } else { 'python' }
 $env:R5RUST_CONFIG = if ($ExtractorConfig) { $ExtractorConfig } else { Join-Path $extractor 'config.retail.json' }
-if (-not (Test-Path $Rsx)) { throw "RSX not found at $Rsx (build R5Flowstate's fork: D:\R5Rust\tools\rsx-fs, rsx.sln, x64 Release)" }
+if (-not $Rsx -or -not (Test-Path $Rsx)) { throw "RSX not found at '$Rsx' (tools\bin\rsx from the tools zip, or build R5Flowstate's fork: D:\R5Rust\tools\rsx-fs, rsx.sln, x64 Release)" }
 function Want($n) { $Steps.Count -eq 0 -or $Steps -contains $n }
 function Step($n, $what) { Write-Host "`n== $n. $what" -ForegroundColor Cyan }
 # RSX's per-type format: one `--exportsetting <type>=<n>` each (fork numbering: txtr 0 PNG top mip, 4 DDS mipmapped;
@@ -80,13 +95,26 @@ if (Want 1) {
   # the loot's ground models go in the prop library too (step 10 writes the list: install.ps1 runs it first)
   $lootModels = Join-Path $Out 'data\loot\models.txt'
   $env:R5_EXTRA_MODELS = if (Test-Path $lootModels) { $lootModels } else { '' }
-  Push-Location (Join-Path $repo 'tools\export-map')
+  if ($dev) {
+    $emCwd = Join-Path $repo 'tools\export-map'
+    $emExe = Join-Path $emCwd 'target\release\export-map.exe'
+  } else {
+    # the prebuilt exe from the game zip, never cargo. Its model cache goes in the work dir, and no surface table
+    # unless one is given (R5_SURFACEPROPS; the exe's built-in default is a file on the build machine)
+    $emCwd = $emWork
+    $emExe = Join-Path $bin 'export-map\export-map.exe'
+    $env:R5_MAPCACHE = Join-Path $emWork 'mapcache'
+    if (-not $env:R5_SURFACEPROPS) { $env:R5_SURFACEPROPS = Join-Path $Work 'surfaceproperties.rson' }
+  }
+  New-Item -ItemType Directory -Force $emCwd | Out-Null
+  Push-Location $emCwd
   try {
     # rebuild when cargo is there (dev machines); a prebuilt export-map.exe is used as is otherwise
-    if (Get-Command cargo -ErrorAction SilentlyContinue) {
+    if ($dev -and (Get-Command cargo -ErrorAction SilentlyContinue)) {
       cargo build --release 2>&1 | Select-String '^error' | ForEach-Object { throw "export-map build: $_" }
-    } elseif (-not (Test-Path .\target\release\export-map.exe)) { throw 'export-map.exe is missing and cargo is not installed' }
-    & .\target\release\export-map.exe $Map --out $mapDir 2>&1 | Tee-Object -FilePath (Join-Path $Work 'export-map.log') | Select-String '^==|placed|done in|lightmap|error'
+    }
+    if (-not (Test-Path $emExe)) { throw "export-map.exe is missing ($emExe)$(if ($dev) { ' and cargo is not installed' })" }
+    & $emExe $Map --out $mapDir 2>&1 | Tee-Object -FilePath (Join-Path $Work 'export-map.log') | Select-String '^==|placed|done in|lightmap|error'
     if ($LASTEXITCODE -ne 0) { throw "export-map failed: $Work\export-map.log" }
   } finally { Pop-Location }
 }
@@ -107,7 +135,21 @@ $catalog = Join-Path $Work 'catalog.csv'
 if (Want 3) {
   Step 3 'pak scan + shaders (extractor)'
   if ($Rescan -or -not (Test-Path $catalog)) { & $py "$extractor\r5rust.py" scan }
-  if (-not (Test-Path (Join-Path $Out 'shaders\sets'))) { & $py "$extractor\r5rust.py" export shaders; & $py "$extractor\r5rust.py" sort }
+  if (-not (Test-Path (Join-Path $Out 'shaders\sets'))) {
+    # The shader export runs here, not through `r5rust.py export shaders`: the extractor leaves the format to RSX, and
+    # the fork's default for shaders is MSW (shader\*.msw), while retail_uber.py / build_materials.py read the raw
+    # bytecode (shader\<guid>_<n>.fxc = shdr=0). With .msw every material lost its constants and UV routing ("713
+    # without a readable pixel shader"). Old installs kept .fxc from the pre-fork RSX. Same paks as the extractor: the
+    # scan's lists (core + this map) that hold shds/shdr; the sort puts them in shaders\programs + shaders\sets.
+    $shPaks = @(Get-ChildItem (Join-Path $Work 'lists') -Filter 'b_*.csv' | ForEach-Object { Import-Csv $_.FullName } |
+      Where-Object { $_.type -in 'shds', 'shdr' } | ForEach-Object { $_.file_name } | Sort-Object -Unique |
+      ForEach-Object { Join-Path $Game "paks\Win64\$_" } | Where-Object { Test-Path -LiteralPath $_ })
+    if (-not $shPaks.Count) { throw "no shader paks in the scan lists ($Work\lists)" }
+    $dest = [IO.Path]::GetFullPath((Join-Path $Raw 'shaders\core'))
+    Run-Rsx (@('-nogui', '-export', '-exportfullpaths', '--loadwhitelist', 'shds,shdr', '--exporttypes', 'shds,shdr', '--exportthreads', '10',
+        '--exportdir', (Q $dest)) + (Fmt 'shdr=0') + @($shPaks | ForEach-Object { Q $_ })) $dest 'shaders'
+    & $py "$extractor\r5rust.py" sort
+  }
   else { '  shaders present' }
 }
 
@@ -205,9 +247,10 @@ if (Want 10) {
     @('common.rpak', 'common_mp.rpak', 'common_early.rpak' | ForEach-Object { Q (Join-Path $paks $_) })) $tmp 'datatables + weapon settings'
   $wepn = Get-ChildItem $tmp -Recurse -Filter 'mp_weapon_r97.txt' | Select-Object -First 1
   if (-not $wepn) { throw "no weapon settings exported to $tmp" }
-  # icons: apex-content-kit's extraction of retail's ui paks, when it's on this PC
+  # icons: apex-content-kit's extraction of retail's ui paks, when it's on this PC (dev checkouts only)
   $icons = 'C:\Code\apex\apex-content-kit\public\game\icons'
-  & python (Join-Path $repo 'tools\build_loot.py') $tmp $wepn.DirectoryName $Out $icons
+  $icons = @(if ($dev -and (Test-Path $icons)) { $icons })
+  & python (Join-Path $repo 'tools\build_loot.py') $tmp $wepn.DirectoryName $Out @icons
   if ($LASTEXITCODE -ne 0) { throw 'build_loot.py failed' }
 }
 

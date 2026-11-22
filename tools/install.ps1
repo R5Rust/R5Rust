@@ -52,9 +52,16 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 # Bump when a step's output changes in a way old installs should be redone for (the launcher shows "update needed").
-$PipelineVersion = 3
+$PipelineVersion = 4
 $repo = Split-Path -Parent $PSScriptRoot
 $setup = Join-Path $PSScriptRoot 'retail_setup.ps1'
+# A player's game folder (launcher: game zip + tools zip) has tools\bin and no source; a dev checkout has
+# tools\export-map\Cargo.toml and may fall back to this PC's dev tools (D:\R5Rust\..., cargo, the Windows SDK).
+$dev = Test-Path (Join-Path $repo 'tools\export-map\Cargo.toml')
+$bin = Join-Path $repo 'tools\bin'
+# the steps run in this same pwsh (the bundled tools\bin\pwsh when the launcher starts us; no pwsh on PATH needed)
+$pwshExe = Join-Path $PSHOME 'pwsh.exe'
+if (-not (Test-Path $pwshExe)) { $pwshExe = 'pwsh' }
 
 $Steps = @(
   # loot first: the map export puts the loot's ground models in the prop library (models.txt)
@@ -108,7 +115,7 @@ function First-Existing([string[]]$paths) { foreach ($p in $paths) { if ($p -and
 function Find-Dxc {
   $kits = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin\*\x64\dxc.exe' -ErrorAction SilentlyContinue |
     Sort-Object { [version]($_.Directory.Parent.Name) } -Descending | Select-Object -ExpandProperty FullName
-  First-Existing (@($Dxc, $env:R5_DXC, (Join-Path $repo 'tools\bin\dxc\dxc.exe')) + @($kits))
+  First-Existing (@($Dxc, (Join-Path $bin 'dxc\dxc.exe'), $env:R5_DXC) + @($kits))
 }
 
 # The files a stamp remembers: what the steps read from the install. Size + last write only (never opened here).
@@ -192,19 +199,22 @@ try {
   Say "@@apex $Apex"
 
   # tools: the bundled copy (tools\bin) first, then this machine's dev copies
-  $Rsx = First-Existing @($Rsx, (Join-Path $repo 'tools\bin\rsx\rsx.exe'), 'D:\R5Rust\tools\rsx-fs\bin\Release\rsx.exe')
-  $Extractor = First-Existing @($Extractor, (Join-Path $repo 'tools\bin\extractor'), 'D:\R5Rust\extractor')
+  $Rsx = First-Existing @($Rsx, (Join-Path $bin 'rsx\rsx.exe'), $(if ($dev) { 'D:\R5Rust\tools\rsx-fs\bin\Release\rsx.exe' }))
+  $Extractor = First-Existing @($Extractor, (Join-Path $bin 'extractor'), $(if ($dev) { 'D:\R5Rust\extractor' }))
   $dxcExe = Find-Dxc
-  $exportMap = Join-Path $repo 'tools\export-map\target\release\export-map.exe'
-  $cargo = [bool](Get-Command cargo -ErrorAction SilentlyContinue)
+  # export-map: built from source on a dev checkout (cargo), the game zip's prebuilt exe otherwise (never cargo)
+  $exportMap = if ($dev) { Join-Path $repo 'tools\export-map\target\release\export-map.exe' } else { Join-Path $bin 'export-map\export-map.exe' }
+  $cargo = $dev -and [bool](Get-Command cargo -ErrorAction SilentlyContinue)
+  # the bundled Python first on PATH: the steps (and their child processes) call plain `python`
+  if (Test-Path (Join-Path $bin 'python\python.exe')) { $env:PATH = (Join-Path $bin 'python') + ';' + $env:PATH }
   $python = [bool](Get-Command python -ErrorAction SilentlyContinue)
   # objects, not nested @(): pwsh flattens an @() of one-per-line @() rows into a single list
   function Tool($name, $ok, $detail) { [pscustomobject]@{ Name = $name; Ok = [bool]$ok; Detail = $detail } }
   $tools = @(
     (Tool 'RSX (R5Flowstate fork)' $Rsx $(if ($Rsx) { $Rsx } else { 'build github.com/R5Flowstate/rsx (rsx.sln, x64 Release)' }))
-    (Tool 'extractor' $Extractor $(if ($Extractor) { $Extractor } else { 'D:\R5Rust\extractor is missing' }))
+    (Tool 'extractor' $Extractor $(if ($Extractor) { $Extractor } else { 'tools\bin\extractor is missing' }))
     (Tool 'dxc (shader disassembler)' $dxcExe $(if ($dxcExe) { $dxcExe } else { 'install the Windows SDK, or put dxc.exe in tools\bin\dxc' }))
-    (Tool 'export-map' ((Test-Path $exportMap) -or $cargo) $(if (Test-Path $exportMap) { $exportMap } elseif ($cargo) { 'built on first use' } else { 'not built and no cargo' }))
+    (Tool 'export-map' ((Test-Path $exportMap) -or $cargo) $(if (Test-Path $exportMap) { $exportMap } elseif ($cargo) { 'built on first use' } elseif ($dev) { 'not built and no cargo' } else { "$exportMap is missing" }))
     (Tool 'python' $python $(if ($python) { (Get-Command python).Source } else { 'install Python 3.11+' }))
   )
   $missing = @()
@@ -242,7 +252,7 @@ try {
   foreach ($s in $plan) {
     Say "@@step $($s.id)"
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    & pwsh -NoProfile -NonInteractive -File $setup -Only $s.n -ApexIsClosed -Map $Map -Game $Apex -Out $Assets -Work $Work `
+    & $pwshExe -NoProfile -NonInteractive -File $setup -Only $s.n -ApexIsClosed -Map $Map -Game $Apex -Out $Assets -Work $Work `
       -Raw $raw -Rsx $Rsx -Extractor $Extractor -ExtractorConfig $cfgPath 2>&1 | ForEach-Object { Say ("  $_" -replace "`e\[[0-9;]*m", '') }
     $code = $LASTEXITCODE
     if ($code -eq 0) {

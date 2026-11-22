@@ -10,3 +10,5 @@ __pycache__/
 r5rust_console_history.txt
 condump.txt
 /cfg/autoexec.cfg
+/dist/
+/tools/bin/
