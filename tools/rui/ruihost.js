@@ -18,7 +18,7 @@ const DEFAULT_CFG = {
   gcardImages: 'D:/tmp-apex-kit/r5f/gcard_img/uiia/ui_image', // banner frame art: every gcard_frame_*.rpak
   liveCommon: 'D:/tmp-apex-kit/live/common_img/uiia/ui_image', // live Apex common*.rpak images (akimbo Wingman icons, newer than S21)
   liveNew: 'D:/tmp-apex-kit/live/new_img/uiia/ui_image', // live ui.rpak + the newer legends' gcard_frame paks (Axle, Sparrow)
-  uiImages: '%USERPROFILE%/Documents/ApexExtract/ui-images/uiia/ui_image' // live Apex, fallback
+  uiImages: path.join(process.env.USERPROFILE || '', 'Documents/ApexExtract/ui-images/uiia/ui_image') // live Apex, fallback
 }
 const cfg = Object.assign({}, DEFAULT_CFG, fs.existsSync(CFG_FILE) ? JSON.parse(fs.readFileSync(CFG_FILE, 'utf8')) : {})
 

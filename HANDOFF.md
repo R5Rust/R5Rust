@@ -102,12 +102,19 @@ content -- --all`. `content/README.md` + `mods/README.md` explain the format.
 ## GitHub
 
 Private org **github.com/R5Rust**, split like R5Flowstate: `R5Rust` (game), `export-map`, `r5f-probe`, `docs`
-(movement docs for now), `.github-private` (org profile with screenshots). CafeFPS has read access.
+(movement docs for now), `.github-private` (org profile with screenshots), `launcher` (`C:\Code\apps\r5rust-launcher`).
+CafeFPS has read access.
 Publishing: staging clones live in the session scratchpad (`...\scratchpad\gh\<repo>`); if they're gone, re-clone the
-org repos. Copy changed files in; for R5Rust `.md` files rewrite `export-map` -> `export-map`, `r5f-probe`
--> `r5f-probe`, `export-map/build_materials.py` -> `export-map/build_materials.py`; commit; `git push
-https://github.com/R5Rust/<repo>.git HEAD:main`. Last synced: game 72d42e6, r5f-probe 564b567, export-map 8a490c5,
-docs b3f0b8e (= local 68c04d5). The launcher is not in the org yet.
+org repos. Copy the committed files in (`git archive HEAD`, not the working tree); for R5Rust `.md` files rewrite
+`export-map` -> `export-map`, `r5f-probe` -> `r5f-probe`, `export-map/build_materials.py` ->
+`export-map/build_materials.py`; keep the org-only files (export-map's `Cargo.toml`/`Cargo.lock` use git deps on
+R5Flowstate/r5ed instead of local paths, both split repos' `README.md`, R5Rust `docs/img/`); commit; `git push
+https://github.com/R5Rust/<repo>.git HEAD:main`. Map pictures (`docs/img`, `.github-private/profile/img`): headless
+`r5rust.exe --screenshot <dir> --poses <list>` (free camera, no HUD/weapon), poses `range -7400 -800 380 6 45`,
+`town -4400 2200 700 12 200`, `overview -6000 -2000 900 12 110`, JPG q90. The launcher's history was pushed with
+`assets/firing-range.jpg` (a game loadscreen, early commits) filtered out: push from a filtered clone, never the
+local repo directly. Last synced 2026-11-22: game 1469290 (= local a25e1fd), export-map d84a138, r5f-probe 6d00447,
+docs b3f0b8e (unchanged), profile d03493a, launcher 69ef198 (= local b2445cd).
 
 ---
 
